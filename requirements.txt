@@ -1,0 +1,9 @@
+torch>=2.2
+transformers>=4.49
+accelerate>=0.34
+peft>=0.13
+datasets>=2.20
+pillow
+qwen-vl-utils
+huggingface_hub
+tqdm
