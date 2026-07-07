@@ -6,3 +6,4 @@ __pycache__/
 data/processed/ 
 models/ 
 *.log 
+bak/
