@@ -21,11 +21,14 @@ unified schema:
 
 사용법:
   python data/prepare_dataset.py --train_samples 4000 --val_samples 500 --out_dir ./data/processed
+  python data/prepare_dataset.py --train_samples 10000 --val_samples 500 \
+      --platform_quota "web=0.4,mobile=0.3,desktop=0.3"
 """
 
 import argparse
 import json
 import os
+import random
 from pathlib import Path
 
 from datasets import load_dataset
@@ -41,33 +44,81 @@ def save_image(img: Image.Image, out_dir: Path, name: str) -> str:
     return str(path)
 
 
-def prepare_wave_ui(out_root: Path, train_samples: int, val_samples: int):
+def parse_platform_quota(s: str) -> dict:
+    """"web=0.4,mobile=0.3,desktop=0.3" 같은 문자열을 {"web":0.4,...} dict로 변환.
+    비율 합은 1이어야 함 (나머지는 quota에 없는 플랫폼들이 채움)."""
+    quota = {}
+    for pair in s.split(","):
+        k, v = pair.split("=")
+        quota[k.strip().lower()] = float(v)
+    total = sum(quota.values())
+    if total > 1.0 + 1e-6:
+        raise ValueError(f"--platform_quota 비율 합이 1을 넘음 (현재 {total})")
+    return quota
+
+
+def prepare_wave_ui(out_root: Path, train_samples: int, val_samples: int, platform_quota: dict):
     """Wave-UI -> train/val jsonl. bbox는 이미 [x1,y1,x2,y2] 절대좌표.
 
-    주의: wave-ui train split 전체는 63.5k rows (~27GB 추정). train_samples+val_samples만
-    필요하므로 streaming=True로 받아서 그만큼만 다운로드한다 (non-streaming으로 받으면
-    전체를 먼저 로컬에 캐싱한 뒤 일부만 쓰게 되어 디스크/시간 낭비가 큼).
+    이전에는 wave-ui train split 전체(63.5k rows, ~27GB 추정)를 다 받지 않으려고
+    streaming=True로 필요한 만큼만 가져왔음. 하지만 그 방식은 스트림 순서대로만 뽑히기 때문에
+    플랫폼별 쿼터(quota)를 맞출 수가 없어서(예: web이 90%를 차지하는 편중 문제), 여기서는
+    전체를 한 번에 로컬로 받은 뒤 플랫폼별로 버킷에 나눠 담고 quota 비율대로 뽑는 방식으로 바꿨다.
+    다운로드 용량/시간이 늘어나는 대신, train/val의 플랫폼 분포를 직접 통제할 수 있게 된다.
     """
     img_dir = out_root / "images" / "wave_ui"
     img_dir.mkdir(parents=True, exist_ok=True)
 
     n_total = train_samples + val_samples
 
-    ds = load_dataset("agentsea/wave-ui", split="train", streaming=True)
-    ds = ds.shuffle(seed=42, buffer_size=10_000)
-    ds = ds.take(n_total)
+    ds = load_dataset("agentsea/wave-ui", split="train")
+    ds = ds.shuffle(seed=42)
 
-    records = []
-    for i, row in enumerate(tqdm(ds, desc="wave-ui", total=n_total)):
+    # quota에 없는 플랫폼은 전부 "other" 버킷으로 모아서, quota 부족분을 채우는 데 쓴다.
+    buckets = {p: [] for p in platform_quota}
+    buckets["other"] = []
+    # quota보다 넉넉히(1.2배) 모아두면 bbox/이미지 결측으로 걸러지는 샘플이 있어도 여유가 생긴다.
+    needed = {p: int(n_total * r * 1.2) + 1 for p, r in platform_quota.items()}
+
+    for row in tqdm(ds, desc="wave-ui (scan)"):
         bbox = row.get("bbox")
-        resolution = row.get("resolution")
         instruction = row.get("instruction") or row.get("name")
         if not bbox or not instruction or row.get("image") is None:
             continue
-
         x1, y1, x2, y2 = bbox
         if x2 <= x1 or y2 <= y1:
             continue
+
+        platform = (row.get("platform") or "unknown").lower()
+        key = platform if platform in platform_quota else "other"
+        if key != "other" and len(buckets[key]) >= needed[key]:
+            # 이미 이 플랫폼 몫은 충분히 모았으면 스킵 (other는 계속 모음 - 부족분 채우기용)
+            continue
+        buckets[key].append(row)
+
+        if all(len(buckets[p]) >= needed[p] for p in platform_quota) and len(buckets["other"]) >= n_total:
+            break
+
+    selected = []
+    for platform, ratio in platform_quota.items():
+        want = int(n_total * ratio)
+        got = buckets[platform][:want]
+        if len(got) < want:
+            print(f"[warn] platform={platform} 요청 {want}개인데 {len(got)}개만 모여서 부족분은 other로 채움")
+        selected.extend(got)
+
+    shortfall = n_total - len(selected)
+    if shortfall > 0:
+        selected.extend(buckets["other"][:shortfall])
+
+    random.Random(42).shuffle(selected)
+
+    records = []
+    for i, row in enumerate(tqdm(selected, desc="wave-ui (convert)")):
+        bbox = row["bbox"]
+        resolution = row.get("resolution")
+        instruction = (row.get("instruction") or row.get("name")).strip()
+        x1, y1, x2, y2 = bbox
 
         img_path = save_image(row["image"], img_dir, f"wave_{i}")
         w, h = resolution if resolution else row["image"].size
@@ -75,7 +126,7 @@ def prepare_wave_ui(out_root: Path, train_samples: int, val_samples: int):
         records.append({
             "id": f"wave_ui_{i}",
             "image_path": img_path,
-            "instruction": instruction.strip(),
+            "instruction": instruction,
             "bbox": [round(x1, 1), round(y1, 1), round(x2, 1), round(y2, 1)],
             "point": [round((x1 + x2) / 2, 1), round((y1 + y2) / 2, 1)],
             "resolution": [w, h],
@@ -84,8 +135,21 @@ def prepare_wave_ui(out_root: Path, train_samples: int, val_samples: int):
             "source": "wave_ui",
         })
 
-    train_records = records[:train_samples]
-    val_records = records[train_samples:train_samples + val_samples]
+    actual_total = len(records)
+    if actual_total < n_total:
+        # quota를 다 채우지 못해 총량이 부족한 경우, train_samples를 그대로 다 채우고
+        # val_samples를 없애버리면(단순 슬라이싱) val이 통째로 비어버리는 문제가 생긴다.
+        # 부족한 만큼은 val_samples 쪽에서 비례 배분으로 줄여서 val이 항상 확보되게 한다.
+        print(f"[warn] 요청한 총량 {n_total}개 중 {actual_total}개만 모여서 "
+              f"train/val을 비율에 맞게 축소함")
+        val_count = max(1, round(val_samples * actual_total / n_total))
+        train_count = actual_total - val_count
+    else:
+        train_count = train_samples
+        val_count = val_samples
+
+    train_records = records[:train_count]
+    val_records = records[train_count:train_count + val_count]
     return train_records, val_records
 
 
@@ -150,18 +214,63 @@ def main():
     ap.add_argument("--val_samples", type=int, default=500)
     ap.add_argument("--test_samples", type=int, default=None,
                      help="None이면 ScreenSpot-v2 전체(약 1.3k) 사용")
+    ap.add_argument("--platform_quota", type=str, default="web=0.4,mobile=0.3,desktop=0.3",
+                     help="Wave-UI train/val 플랫폼별 샘플링 비율. 콤마로 구분, 합은 1 이하 "
+                          "(나머지는 quota에 없는 플랫폼들로 채움). 예: 'web=0.4,mobile=0.3,desktop=0.3'")
     args = ap.parse_args()
 
     out_root = Path(args.out_dir)
     out_root.mkdir(parents=True, exist_ok=True)
 
-    train_records, val_records = prepare_wave_ui(out_root, args.train_samples, args.val_samples)
+    platform_quota = parse_platform_quota(args.platform_quota)
+    train_records, val_records = prepare_wave_ui(
+        out_root, args.train_samples, args.val_samples, platform_quota
+    )
     write_jsonl(train_records, out_root / "train.jsonl")
     write_jsonl(val_records, out_root / "val.jsonl")
 
     test_records = prepare_screenspot_v2(out_root, args.test_samples)
     write_jsonl(test_records, out_root / "test.jsonl")
 
+import json
+from collections import defaultdict
+from statistics import mean, median
+
+# 데이터 분포 출력
+def stats(path):
+    platform_ratios = defaultdict(list)
+    with open(path, "r", encoding="utf-8") as f:
+        for line in f:
+            rec = json.loads(line)
+
+            bbox = rec["bbox"]
+            width_img, height_img = rec["resolution"]
+            platform = rec.get("platform", "unknown")
+
+            x1, y1, x2, y2 = bbox
+
+            bbox_w = max(0, x2 - x1)
+            bbox_h = max(0, y2 - y1)
+
+            bbox_area = bbox_w * bbox_h
+            image_area = width_img * height_img
+
+            ratio = bbox_area / image_area
+
+            platform_ratios[platform].append(ratio)
+            
+    for platform, ratios in sorted(platform_ratios.items()):
+        ratios_pct = [r * 100 for r in ratios]
+
+        print(f"\n[{platform}]")
+        print(f"n                : {len(ratios)}")
+        print(f"avg bbox ratio   : {mean(ratios_pct):.4f}%")
+        print(f"median bbox ratio: {median(ratios_pct):.4f}%")
+        print(f"min              : {min(ratios_pct):.4f}%")
+        print(f"max              : {max(ratios_pct):.4f}%")
+
 
 if __name__ == "__main__":
-    main()
+    # main()
+    stats("data/processed/train.jsonl")
+    stats("data/processed/val.jsonl")
