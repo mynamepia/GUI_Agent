@@ -178,7 +178,7 @@ def main():
     args = ap.parse_args()
 
     use_cuda = torch.cuda.is_available()
-    device_map = "auto" if use_cuda else None
+    device_map = None
     dtype = torch.bfloat16 if (args.bf16 and use_cuda) else torch.float32
 
     model, processor = load_model_and_processor(
