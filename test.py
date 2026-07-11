@@ -31,6 +31,8 @@ import argparse
 import json
 from pathlib import Path
 
+import torch
+
 from coord_utils import PROMPT_TEMPLATE, load_jsonl
 from evaluation import aggregate_metrics, format_report, score_prediction
 from qwen import DEFAULT_MAX_PIXELS, DEFAULT_MIN_PIXELS, MODEL_ID, generate_text, load_model_and_processor
@@ -100,6 +102,11 @@ def main():
         print(f"[test.py] Loading LoRA adapter from {args.adapter_dir} ...")
         model = PeftModel.from_pretrained(model, args.adapter_dir)
 
+    # load_model_and_processor()는 device_map=None이면 모델을 CPU에 그대로 둔다
+    # (train.py는 Trainer가 알아서 GPU로 옮겨주지만, test.py는 Trainer를 안 쓰므로
+    # 여기서 직접 옮겨야 GPU가 있어도 실제로 GPU 추론이 됨).
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    model.to(device)
     model.eval()
 
     records = _load_records_with_dataset_tag(args.jsonl)
