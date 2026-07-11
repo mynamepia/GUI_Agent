@@ -49,7 +49,7 @@ import json
 import os
 
 import torch
-from peft import LoraConfig, get_peft_model
+from peft import LoraConfig, PeftModel, get_peft_model
 from PIL import Image
 from qwen_vl_utils import process_vision_info
 from torch.utils.data import Dataset
@@ -175,6 +175,12 @@ def main():
                      help="학습 후 generation eval에 쓸 val 샘플 수 제한 (스모크 테스트용)")
     ap.add_argument("--skip_gen_eval", action="store_true",
                      help="학습 후 generation 기반 click accuracy 평가를 건너뜀")
+    ap.add_argument("--init_adapter_dir", default=None,
+                     help="지정하면 새 LoRA를 만들지 않고 이 경로의 기존 LoRA 어댑터를 이어서 학습 "
+                          "(2-stage 학습에서 Stage 2가 Stage 1 결과물을 이어받을 때 사용)")
+    ap.add_argument("--optim", default="adamw_torch",
+                     help="Trainer optimizer 종류. VRAM이 부족하면 'adamw_bnb_8bit'로 바꾸면 "
+                          "optimizer state 메모리를 줄일 수 있음 (bitsandbytes 설치 필요)")
     args = ap.parse_args()
 
     use_cuda = torch.cuda.is_available()
@@ -191,15 +197,21 @@ def main():
     # label masking에서 "앞쪽 prompt_len개 토큰 = 프롬프트"를 가정하므로 오른쪽 패딩 고정.
     processor.tokenizer.padding_side = "right"
 
-    lora_config = LoraConfig(
-        r=args.lora_r,
-        lora_alpha=args.lora_alpha,
-        target_modules=["q_proj", "k_proj", "v_proj", "o_proj"],
-        lora_dropout=0.05,
-        bias="none",
-        task_type="CAUSAL_LM",
-    )
-    model = get_peft_model(model, lora_config)
+    if args.init_adapter_dir:
+        # Stage 2용: Stage 1에서 학습한 LoRA 가중치를 그대로 이어받아서 계속 학습.
+        # get_peft_model()로 새 LoRA를 초기화하면 Stage 1 학습 내용이 날아가 버림.
+        print(f"[train.py] Stage 2: loading existing LoRA adapter from {args.init_adapter_dir} ...")
+        model = PeftModel.from_pretrained(model, args.init_adapter_dir, is_trainable=True)
+    else:
+        lora_config = LoraConfig(
+            r=args.lora_r,
+            lora_alpha=args.lora_alpha,
+            target_modules=["q_proj", "k_proj", "v_proj", "o_proj"],
+            lora_dropout=0.05,
+            bias="none",
+            task_type="CAUSAL_LM",
+        )
+        model = get_peft_model(model, lora_config)
     # PEFT(LoRA) + gradient_checkpointing 조합에서는 입력 임베딩의 requires_grad가 꺼져 있어서
     # 이 호출 없이는 backward에서 "element 0 of tensors does not require grad" 에러가 난다.
     model.enable_input_require_grads()
@@ -227,6 +239,7 @@ def main():
         gradient_checkpointing=True,
         report_to=[],
         remove_unused_columns=False,
+        optim=args.optim,
     )
 
     trainer = Trainer(
