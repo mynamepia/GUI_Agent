@@ -47,10 +47,6 @@ def load_model_and_processor(
         model_id,
         torch_dtype=actual_dtype,
         device_map=device_map if use_cuda else None,
-        # SDPA(Scaled Dot Product Attention)를 명시적으로 지정 - torch 내장이라 별도 설치 없이
-        # attention 연산의 VRAM 사용량을 줄여준다 (Qwen-GUI-3B 논문도 FlashAttention/SDPA로
-        # 메모리 효율화를 함). 지정 안 하면 transformers 버전에 따라 더 무거운 eager로 돌 수 있음.
-        attn_implementation="sdpa" if use_cuda else None,
     )
 
     processor_kwargs = {}
