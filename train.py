@@ -181,6 +181,13 @@ def main():
     ap.add_argument("--optim", default="adamw_torch",
                      help="Trainer optimizer 종류. VRAM이 부족하면 'adamw_bnb_8bit'로 바꾸면 "
                           "optimizer state 메모리를 줄일 수 있음 (bitsandbytes 설치 필요)")
+    ap.add_argument("--resume_from_checkpoint", default=None,
+                     help="Trainer가 저장한 checkpoint-XXX에서 optimizer/lr scheduler/step까지 "
+                          "그대로 이어서 학습을 재개한다 (--init_adapter_dir과 달리 학습이 끊김 없이 "
+                          "이어짐). 'auto' 또는 'true'를 주면 output_dir 안의 최신 체크포인트를 "
+                          "자동으로 찾고, 특정 경로를 주면 그 체크포인트에서 재개한다. 개인 PC에서 "
+                          "학습을 여러 번에 나눠 돌릴 때 사용 - 이 경우 --output_dir을 이전 실행과 "
+                          "동일하게 주고 --num_train_epochs만 최종 목표 값(예: 3)으로 둔다.")
     args = ap.parse_args()
 
     use_cuda = torch.cuda.is_available()
@@ -250,7 +257,10 @@ def main():
         data_collator=build_collate_fn(processor),
     )
 
-    trainer.train()
+    resume = args.resume_from_checkpoint
+    if resume is not None and resume.lower() in ("auto", "true"):
+        resume = True  # Trainer가 output_dir 안의 최신 checkpoint-XXX를 자동으로 찾음
+    trainer.train(resume_from_checkpoint=resume)
     model.save_pretrained(args.output_dir)
     processor.save_pretrained(args.output_dir)
     print(f"[done] LoRA adapter saved to {args.output_dir}")
