@@ -32,6 +32,8 @@ import argparse
 import json
 from collections import defaultdict
 
+from tqdm import tqdm
+
 from coord_utils import PROMPT_TEMPLATE, load_jsonl, norm1000_to_point, parse_point_from_text
 from qwen import generate_text
 
@@ -159,7 +161,7 @@ def run_generation_eval(
     rows = []
     was_training = getattr(model, "training", False)
     model.eval()
-    for rec in records:
+    for rec in tqdm(records, desc="generation eval"):
         prompt = PROMPT_TEMPLATE.format(instruction=rec["instruction"])
         messages = [
             {
