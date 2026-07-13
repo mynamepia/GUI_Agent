@@ -188,6 +188,10 @@ def main():
                           "자동으로 찾고, 특정 경로를 주면 그 체크포인트에서 재개한다. 개인 PC에서 "
                           "학습을 여러 번에 나눠 돌릴 때 사용 - 이 경우 --output_dir을 이전 실행과 "
                           "동일하게 주고 --num_train_epochs만 최종 목표 값(예: 3)으로 둔다.")
+    ap.add_argument("--save_total_limit", type=int, default=5,
+                     help="output_dir에 남겨둘 checkpoint-XXX 최대 개수. 예전엔 2였는데, epoch별로 "
+                          "실험하며 나눠서 이어 돌리는 워크플로우에서 오래된 체크포인트가 의도치 않게 "
+                          "삭제되는 사고가 있어서 기본값을 넉넉하게 올림. 디스크 용량 보면서 조절할 것.")
     args = ap.parse_args()
 
     use_cuda = torch.cuda.is_available()
@@ -241,7 +245,7 @@ def main():
         eval_strategy="steps" if args.max_steps > 0 else "epoch",
         eval_steps=max(1, args.max_steps // 2) if args.max_steps > 0 else None,
         save_strategy="epoch",
-        save_total_limit=2,
+        save_total_limit=args.save_total_limit,
         bf16=args.bf16 and use_cuda,
         gradient_checkpointing=True,
         report_to=[],
@@ -267,17 +271,28 @@ def main():
 
     if not args.skip_gen_eval:
         print("[train.py] running post-training generation eval on val set ...")
+        # global_step을 파일명에 붙여서 실행할 때마다 이전 결과가 덮어써지지 않게 함
+        # (예전엔 고정 파일명이라 재개 학습을 반복할 때마다 이전 epoch의 val_metrics.json이
+        # 그대로 사라지는 문제가 있었음).
+        step_tag = trainer.state.global_step
+        predictions_path = os.path.join(args.output_dir, f"val_predictions_step{step_tag}.jsonl")
+        metrics_path = os.path.join(args.output_dir, f"val_metrics_step{step_tag}.json")
+
         val_metrics = run_generation_eval(
             model,
             processor,
             args.val_jsonl,
             max_new_tokens=args.eval_max_new_tokens,
             limit=args.eval_limit,
-            predictions_out_path=os.path.join(args.output_dir, "val_predictions.jsonl"),
+            predictions_out_path=predictions_path,
         )
         print(format_report(val_metrics, title="val (post-training)"))
+        with open(metrics_path, "w", encoding="utf-8") as f:
+            json.dump(val_metrics, f, ensure_ascii=False, indent=2)
+        # 기존 워크플로우 호환용으로 "최신본"도 고정 이름으로 별도 저장
         with open(os.path.join(args.output_dir, "val_metrics.json"), "w", encoding="utf-8") as f:
             json.dump(val_metrics, f, ensure_ascii=False, indent=2)
+        print(f"[train.py] metrics saved to {metrics_path} (+ val_metrics.json as latest copy)")
 
 
 if __name__ == "__main__":
