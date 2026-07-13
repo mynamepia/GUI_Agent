@@ -50,13 +50,6 @@ def _get_dataset(rec):
     return rec.get("dataset") or rec.get("source") or "unknown"
 
 
-# web 쪽 instruction 중 상당수가 "StaticText, link" / "image" 처럼 실제 라벨 없이
-# accessibility tree의 role만 그대로 옮겨 적은 경우가 있음 (Wave-UI 원본 데이터 이슈).
-# 이런 케이스는 화면에 같은 role의 요소가 여러 개 있으면 애초에 어느 걸 가리키는지
-# 텍스트만으로 특정 불가능해서, 아무리 잘 추론해도 못 맞히는 게 정상인 노이즈에 가깝다.
-# (2026-07 stage2 ep4 분석: web instruction의 74.5%가 이 케이스였고, 이것만 빼면
-#  web/overall acc가 각각 5.17%->17.39%, 18.95%->33.07%로 크게 달라짐 - 학습 문제가
-#  아니라 평가 노이즈였다는 근거)
 _GENERIC_LABELS = {
     "background", "banner", "button", "checkbox", "dropdown", "file", "header",
     "icon", "image", "input", "label", "link", "list item", "menu item",
@@ -68,9 +61,7 @@ _ROLE_WORDS = {
 }
 
 
-def is_uninformative_instruction(instruction: str) -> bool:
-    """instruction이 raw accessibility 라벨만 있고 실제 타겟을 특정할 실질적 정보가
-    없는지 판별. 예: "image", "StaticText, link", "StaticText, link, listitem"."""
+def is_uninformative_instruction(instruction):
     s = (instruction or "").strip()
     low = s.lower()
     if low in _GENERIC_LABELS:
@@ -82,8 +73,7 @@ def is_uninformative_instruction(instruction: str) -> bool:
     return False
 
 
-def score_prediction(rec: dict, pred_text: str) -> dict:
-    """레코드 하나 + 모델 생성 텍스트 하나를 채점해서 결과 dict를 돌려준다."""
+def score_prediction(rec, pred_text):
     resolution = rec["resolution"]
     bbox = rec.get("bbox")
 
@@ -120,8 +110,7 @@ def _accuracy(rows):
     return {"n": n, "accuracy": hits / n, "parse_fail_rate": fails / n}
 
 
-def _aggregate_core(rows: list) -> dict:
-    """aggregate_metrics()의 핵심 로직 (clean subset 재귀 호출용으로 분리)."""
+def _aggregate_core(rows):
     metrics = {"overall": _accuracy(rows)}
 
     by_dataset = defaultdict(list)
@@ -148,16 +137,7 @@ def _aggregate_core(rows: list) -> dict:
     return metrics
 
 
-def aggregate_metrics(rows: list) -> dict:
-    """
-    score_prediction()으로 채점된 row들을 dataset/platform/category 기준으로 묶어서
-    accuracy를 계산. ScreenSpot-v2식 platform x category breakdown도 같이 낸다.
-    해당 필드가 전부 "unknown"이면 (= 메타데이터가 없으면) 그 섹션은 생략한다.
-
-    추가로 "clean" 키에 instruction이 raw accessibility 라벨뿐인(is_uninformative_instruction)
-    노이즈성 샘플을 뺀 재계산 결과를 같이 넣어준다 - web 쪽에 이런 샘플이 많이 몰려있어서
-    (stage2 ep4 기준 74.5%) 이걸 안 빼면 web/overall acc가 실제 실력보다 낮게 보임.
-    """
+def aggregate_metrics(rows):
     metrics = _aggregate_core(rows)
 
     clean_rows = [r for r in rows if not is_uninformative_instruction(r.get("instruction"))]
@@ -168,7 +148,7 @@ def aggregate_metrics(rows: list) -> dict:
     return metrics
 
 
-def format_report(metrics: dict, title: str = "Evaluation") -> str:
+def format_report(metrics, title="Evaluation"):
     lines = [f"=== {title} ==="]
     ov = metrics["overall"]
     lines.append(
@@ -191,12 +171,8 @@ def format_report(metrics: dict, title: str = "Evaluation") -> str:
         clean = metrics["clean"]
         removed = clean.get("_removed_uninformative_n", 0)
         cov = clean["overall"]
-        lines.append(
-            f"-- clean (uninformative instruction {removed}개 제외) --"
-        )
-        lines.append(
-            f"  overall                  acc={cov['accuracy']:.4f}  (n={cov['n']})"
-        )
+        lines.append(f"-- clean (uninformative instruction {removed}개 제외) --")
+        lines.append(f"  overall                  acc={cov['accuracy']:.4f}  (n={cov['n']})")
         if "by_platform" in clean:
             for k, v in clean["by_platform"].items():
                 lines.append(f"  platform/{k:<15} acc={v['accuracy']:.4f}  (n={v['n']})")
@@ -204,19 +180,7 @@ def format_report(metrics: dict, title: str = "Evaluation") -> str:
     return "\n".join(lines)
 
 
-def run_generation_eval(
-    model,
-    processor,
-    jsonl_path: str,
-    max_new_tokens: int = 32,
-    limit: int | None = None,
-    predictions_out_path: str | None = None,
-) -> dict:
-    """
-    jsonl_path의 각 레코드에 대해 model.generate()로 좌표를 뽑고 채점까지 한 번에 수행.
-    train.py(학습 직후 val set 평가), test.py(체크포인트 단독 평가)에서 공통으로 쓰는
-    엔드투엔드 평가 함수. model은 base 모델/PeftModel(LoRA) 둘 다 그대로 지원.
-    """
+def run_generation_eval(model, processor, jsonl_path, max_new_tokens=32, limit=None, predictions_out_path=None):
     records = load_jsonl(jsonl_path)
     if limit is not None:
         records = records[:limit]
@@ -249,33 +213,39 @@ def run_generation_eval(
 
 
 def _cli():
-    """
-    독립 실행용:
-      - --predictions로 이미 뽑아둔 예측 jsonl(score_prediction 필드 포함)을 다시 채점만 하거나
-      - --model_id(+ 선택적으로 --adapter_dir)로 처음부터 추론 + 평가를 돌릴 수 있다.
-    """
     ap = argparse.ArgumentParser()
     ap.add_argument("--jsonl", required=True, help="평가할 데이터셋 jsonl (test/val)")
     ap.add_argument("--model_id", default=None, help="지정하면 이 체크포인트로 새로 추론해서 평가")
     ap.add_argument("--adapter_dir", default=None, help="LoRA adapter 디렉토리 (model_id와 같이 사용)")
-    ap.add_argument("--predictions", default=None,
-                     help="이미 뽑아둔 예측 jsonl (score_prediction과 같은 필드를 가진 파일)")
+    ap.add_argument("--predictions", default=None, help="이미 뽑아둔 예측 jsonl (score_prediction과 같은 필드를 가진 파일)")
     ap.add_argument("--max_new_tokens", type=int, default=32)
     ap.add_argument("--limit", type=int, default=None)
     ap.add_argument("--out", default=None, help="예측 결과를 저장할 jsonl 경로")
+    ap.add_argument("--min_pixels", type=int, default=None, help="지정 안 하면 qwen.py의 DEFAULT_MIN_PIXELS 사용")
+    ap.add_argument("--max_pixels", type=int, default=None, help="지정 안 하면 qwen.py의 DEFAULT_MAX_PIXELS 사용")
     args = ap.parse_args()
 
     if args.predictions:
         rows = load_jsonl(args.predictions)
         metrics = aggregate_metrics(rows)
     elif args.model_id:
-        from qwen import load_model_and_processor
+        from qwen import DEFAULT_MAX_PIXELS, DEFAULT_MIN_PIXELS, load_model_and_processor
 
-        model, processor = load_model_and_processor(model_id=args.model_id)
+        model, processor = load_model_and_processor(
+            model_id=args.model_id,
+            min_pixels=args.min_pixels if args.min_pixels is not None else DEFAULT_MIN_PIXELS,
+            max_pixels=args.max_pixels if args.max_pixels is not None else DEFAULT_MAX_PIXELS,
+        )
         if args.adapter_dir:
             from peft import PeftModel
 
             model = PeftModel.from_pretrained(model, args.adapter_dir)
+
+        import torch
+
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+        model.to(device)
+
         metrics = run_generation_eval(
             model, processor, args.jsonl,
             max_new_tokens=args.max_new_tokens,
