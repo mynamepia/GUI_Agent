@@ -201,6 +201,6 @@ class QwenVLModel:
 
 if __name__ == "__main__":
     # 간단한 동작 확인용 (텍스트만 입력하는 예시)
-    model = QwenVLModel()
+    model = QwenVLModel(load_in_8bit=True)
     response = model.chat("너는 어떤 역할을 하는 에이전트야? 한 문장으로 소개해줘.")
     print("응답:", response)

@@ -50,6 +50,38 @@ def _get_dataset(rec):
     return rec.get("dataset") or rec.get("source") or "unknown"
 
 
+# web 쪽 instruction 중 상당수가 "StaticText, link" / "image" 처럼 실제 라벨 없이
+# accessibility tree의 role만 그대로 옮겨 적은 경우가 있음 (Wave-UI 원본 데이터 이슈).
+# 이런 케이스는 화면에 같은 role의 요소가 여러 개 있으면 애초에 어느 걸 가리키는지
+# 텍스트만으로 특정 불가능해서, 아무리 잘 추론해도 못 맞히는 게 정상인 노이즈에 가깝다.
+# (2026-07 stage2 ep4 분석: web instruction의 74.5%가 이 케이스였고, 이것만 빼면
+#  web/overall acc가 각각 5.17%->17.39%, 18.95%->33.07%로 크게 달라짐 - 학습 문제가
+#  아니라 평가 노이즈였다는 근거)
+_GENERIC_LABELS = {
+    "background", "banner", "button", "checkbox", "dropdown", "file", "header",
+    "icon", "image", "input", "label", "link", "list item", "menu item",
+    "option", "radio button", "section", "tab", "text", "text bubble", "toggle",
+}
+_ROLE_WORDS = {
+    "statictext", "link", "listitem", "button", "image", "menuitem", "group",
+    "text", "icon", "generic",
+}
+
+
+def is_uninformative_instruction(instruction: str) -> bool:
+    """instruction이 raw accessibility 라벨만 있고 실제 타겟을 특정할 실질적 정보가
+    없는지 판별. 예: "image", "StaticText, link", "StaticText, link, listitem"."""
+    s = (instruction or "").strip()
+    low = s.lower()
+    if low in _GENERIC_LABELS:
+        return True
+    if "," in s and "->" not in s and "[" not in s:
+        parts = [p.strip().lower() for p in s.split(",")]
+        if parts and all(p in _ROLE_WORDS for p in parts):
+            return True
+    return False
+
+
 def score_prediction(rec: dict, pred_text: str) -> dict:
     """레코드 하나 + 모델 생성 텍스트 하나를 채점해서 결과 dict를 돌려준다."""
     resolution = rec["resolution"]
@@ -88,12 +120,8 @@ def _accuracy(rows):
     return {"n": n, "accuracy": hits / n, "parse_fail_rate": fails / n}
 
 
-def aggregate_metrics(rows: list) -> dict:
-    """
-    score_prediction()으로 채점된 row들을 dataset/platform/category 기준으로 묶어서
-    accuracy를 계산. ScreenSpot-v2식 platform x category breakdown도 같이 낸다.
-    해당 필드가 전부 "unknown"이면 (= 메타데이터가 없으면) 그 섹션은 생략한다.
-    """
+def _aggregate_core(rows: list) -> dict:
+    """aggregate_metrics()의 핵심 로직 (clean subset 재귀 호출용으로 분리)."""
     metrics = {"overall": _accuracy(rows)}
 
     by_dataset = defaultdict(list)
@@ -120,6 +148,26 @@ def aggregate_metrics(rows: list) -> dict:
     return metrics
 
 
+def aggregate_metrics(rows: list) -> dict:
+    """
+    score_prediction()으로 채점된 row들을 dataset/platform/category 기준으로 묶어서
+    accuracy를 계산. ScreenSpot-v2식 platform x category breakdown도 같이 낸다.
+    해당 필드가 전부 "unknown"이면 (= 메타데이터가 없으면) 그 섹션은 생략한다.
+
+    추가로 "clean" 키에 instruction이 raw accessibility 라벨뿐인(is_uninformative_instruction)
+    노이즈성 샘플을 뺀 재계산 결과를 같이 넣어준다 - web 쪽에 이런 샘플이 많이 몰려있어서
+    (stage2 ep4 기준 74.5%) 이걸 안 빼면 web/overall acc가 실제 실력보다 낮게 보임.
+    """
+    metrics = _aggregate_core(rows)
+
+    clean_rows = [r for r in rows if not is_uninformative_instruction(r.get("instruction"))]
+    if len(clean_rows) != len(rows):
+        metrics["clean"] = _aggregate_core(clean_rows)
+        metrics["clean"]["_removed_uninformative_n"] = len(rows) - len(clean_rows)
+
+    return metrics
+
+
 def format_report(metrics: dict, title: str = "Evaluation") -> str:
     lines = [f"=== {title} ==="]
     ov = metrics["overall"]
@@ -138,6 +186,21 @@ def format_report(metrics: dict, title: str = "Evaluation") -> str:
     _section("by platform", "by_platform")
     _section("by category", "by_category")
     _section("by platform x category", "by_platform_category")
+
+    if "clean" in metrics:
+        clean = metrics["clean"]
+        removed = clean.get("_removed_uninformative_n", 0)
+        cov = clean["overall"]
+        lines.append(
+            f"-- clean (uninformative instruction {removed}개 제외) --"
+        )
+        lines.append(
+            f"  overall                  acc={cov['accuracy']:.4f}  (n={cov['n']})"
+        )
+        if "by_platform" in clean:
+            for k, v in clean["by_platform"].items():
+                lines.append(f"  platform/{k:<15} acc={v['accuracy']:.4f}  (n={v['n']})")
+
     return "\n".join(lines)
 
 
