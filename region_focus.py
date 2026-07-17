@@ -23,8 +23,9 @@ region_focus.py
        리사이즈해버려 좌표가 조용히 어긋나는 버그가 생긴다. smart_resize로 미리
        맞추고 그 배율만큼 zoom_x/zoom_y를 보정해서 이 문제를 없앴다.
 
-필요 패키지: qwen.py, gui_grounding.py와 동일 (torch, transformers, qwen-vl-utils,
-pillow, opencv-python, numpy)
+필요 패키지: qwen.py, gui_grounding.py와 동일 (torch, transformers, qwen-vl-utils, pillow)
+(주: 아래 numpy는 plot_points_on_image의 ndarray 입력 지원에 실제로 쓰이고 있음.
+opencv-python은 원래 임포트돼 있었으나 본 파일 어디서도 실제로 쓰이지 않아 제거함.)
 """
 
 import os
@@ -32,9 +33,7 @@ import re
 import io
 import math
 import time
-import base64
 import numpy as np
-import cv2
 from PIL import Image, ImageDraw, ImageColor
 from transformers.models.qwen2_vl.image_processing_qwen2_vl_fast import smart_resize
 from qwen_vl_utils import process_vision_info
@@ -676,6 +675,10 @@ def ground_with_regionfocus(
     베이스라인 Qwen25VLModel.ground_with_regionfocus()의 로컬 모델 버전.
     1) 초기 grounding (gui_grounding.ground) -> 2) 판단 -> 3) 틀렸으면 region_focus로
     재탐색 -> 4) crop/zoom 4가지 비율로 정밀화 -> 5) 후보 종합, 순서 그대로.
+
+    반환 스키마는 gui_grounding.ground()와 동일하게 "result" 키("positive"/"wrong_format")를
+    항상 포함하도록 통일했다 (기존엔 RegionFocus 경로를 타면 이 키가 빠져서, 두 grounding
+    경로를 같은 인터페이스로 다루는 상위 코드에서 KeyError가 날 수 있었음).
     """
     debug_dir = f"./debug/{task_id}" if task_id else "./debug"
     if debug:
@@ -794,7 +797,8 @@ def ground_with_regionfocus(
         if initial_result["point"]:
             return initial_result
         return {
-            "point": region_points[0],
+            "result": "wrong_format",
+            "point": None,
             "bbox": None,
             "raw_response": "no valid points found from zoomed regions",
         }
@@ -812,6 +816,7 @@ def ground_with_regionfocus(
     _log(f"총 소요시간 {time.time() - overall_start:.1f}초")
 
     return {
+        "result": "positive",
         "point": [best_point[0] / original_image.width, best_point[1] / original_image.height],
         "bbox": None,
         "regionfocus_applied": True,
@@ -822,7 +827,44 @@ def ground_with_regionfocus(
     }
 
 
-if __name__ == "__main__":
-    model = QwenVLModel()
-    result = ground_with_regionfocus(model, "Open 버튼을 클릭", "/srv/project/data/processed/images/screenspot_v2/ss_0.jpg", debug=True, task_id="demo")
+def _cli():
+    """
+    로컬 실행/디버깅용 CLI.
+    --adapter_dir을 지정하면 base 모델 위에 LoRA 어댑터(train.py 체크포인트)를 얹어서
+    돌린다 - 안 주면 파인튜닝 안 된 base Qwen2.5-VL로 동작하니 주의.
+    """
+    import argparse
+
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--image", required=True, help="스크린샷 이미지 경로")
+    ap.add_argument("--instruction", required=True, help="grounding할 지시문")
+    ap.add_argument("--model_id", default=None, help="베이스 모델 id (기본값: qwen.py의 MODEL_ID)")
+    ap.add_argument("--adapter_dir", default=None,
+                    help="LoRA 어댑터 디렉토리 (train.py --output_dir로 저장된 checkpoint-XXX 폴더)")
+    ap.add_argument("--min_pixels", type=int, default=DEFAULT_MIN_PIXELS)
+    ap.add_argument("--max_pixels", type=int, default=DEFAULT_MAX_PIXELS)
+    ap.add_argument("--load_in_8bit", action="store_true")
+    ap.add_argument("--debug", action="store_true", help="./debug/<task_id>에 중간 산출물 저장")
+    ap.add_argument("--task_id", default="demo")
+    args = ap.parse_args()
+
+    model_kwargs = dict(
+        min_pixels=args.min_pixels,
+        max_pixels=args.max_pixels,
+        adapter_dir=args.adapter_dir,
+        load_in_8bit=args.load_in_8bit,
+    )
+    if args.model_id:
+        model_kwargs["model_id"] = args.model_id
+
+    model = QwenVLModel(**model_kwargs)
+    result = ground_with_regionfocus(
+        model, args.instruction, args.image,
+        debug=args.debug, task_id=args.task_id,
+        min_pixels=args.min_pixels, max_pixels=args.max_pixels,
+    )
     print(result)
+
+
+if __name__ == "__main__":
+    _cli()

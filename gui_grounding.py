@@ -268,8 +268,41 @@ def ground(
         return {"result": "wrong_format", "point": None, "raw_response": raw_response}
 
 
-if __name__ == "__main__":
-    # 간단한 동작 확인용
-    model = QwenVLModel(load_in_8bit=True)
-    result = ground(model, "로그인 버튼을 클릭", "path/to/screenshot.png")
+def _cli():
+    """
+    로컬 실행/디버깅용 CLI.
+    --adapter_dir을 지정하면 base 모델 위에 LoRA 어댑터(train.py 체크포인트)를 얹어서
+    돌린다 - 안 주면 파인튜닝 안 된 base Qwen2.5-VL로 동작하니 주의.
+    """
+    import argparse
+
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--image", required=True, help="스크린샷 이미지 경로")
+    ap.add_argument("--instruction", required=True, help="grounding할 지시문")
+    ap.add_argument("--model_id", default=None, help="베이스 모델 id (기본값: qwen.py의 MODEL_ID)")
+    ap.add_argument("--adapter_dir", default=None,
+                    help="LoRA 어댑터 디렉토리 (train.py --output_dir로 저장된 checkpoint-XXX 폴더)")
+    ap.add_argument("--min_pixels", type=int, default=DEFAULT_MIN_PIXELS)
+    ap.add_argument("--max_pixels", type=int, default=DEFAULT_MAX_PIXELS)
+    ap.add_argument("--load_in_8bit", action="store_true")
+    args = ap.parse_args()
+
+    model_kwargs = dict(
+        min_pixels=args.min_pixels,
+        max_pixels=args.max_pixels,
+        adapter_dir=args.adapter_dir,
+        load_in_8bit=args.load_in_8bit,
+    )
+    if args.model_id:
+        model_kwargs["model_id"] = args.model_id
+
+    model = QwenVLModel(**model_kwargs)
+    result = ground(
+        model, args.instruction, args.image,
+        min_pixels=args.min_pixels, max_pixels=args.max_pixels,
+    )
     print(result)
+
+
+if __name__ == "__main__":
+    _cli()
