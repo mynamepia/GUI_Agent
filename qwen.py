@@ -25,11 +25,7 @@ MODEL_ID = "Qwen/Qwen2.5-VL-3B-Instruct"
 # 상한을 안 걸어두면 고해상도 스크린샷 한 장이 수천 토큰이 될 수 있음.
 # CPU/저사양 환경(미니PC 등)에서는 min_pixels/max_pixels로 반드시 상한을 걸어두는 게 안전하다.
 DEFAULT_MIN_PIXELS = 256 * 28 * 28
-<<<<<<< HEAD
-DEFAULT_MAX_PIXELS = 384 * 28 * 28
-=======
-DEFAULT_MAX_PIXELS = 640 * 28 * 28
->>>>>>> 8cb0e9febd9dd7fee7b32c36008dc5848918c3d0
+DEFAULT_MAX_PIXELS = 384 * 28 * 28 # 640 * 28 * 28
 
 
 def load_model_and_processor(
