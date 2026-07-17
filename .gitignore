@@ -8,3 +8,4 @@ models/
 *.log 
 bak/
 result/
+debug/
