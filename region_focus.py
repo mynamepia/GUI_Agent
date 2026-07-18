@@ -23,6 +23,18 @@ region_focus.py
        리사이즈해버려 좌표가 조용히 어긋나는 버그가 생긴다. smart_resize로 미리
        맞추고 그 배율만큼 zoom_x/zoom_y를 보정해서 이 문제를 없앴다.
 
+[디버그 로깅: --debug_image / --debug_text]
+둘을 분리해뒀다:
+    - debug_image: crop/zoom/판단 과정에서 생기는 중간 "이미지"들을
+      ./debug/<task_id>/*.png 로 저장 (기존 --debug와 동일한 이미지들).
+    - debug_text : 각 단계(judge_inference/region_focus/next_action_regionfocus/
+      aggregation)에서 모델에 실제로 들어간 프롬프트 원문 + 응답 원문을
+      ./debug/<task_id>/prompt_<step>.txt 로 저장 (gui_grounding.dump_prompt_debug 사용).
+      judge_inference처럼 프롬프팅/파싱 로직 자체가 의심될 때, 실제로 모델한테 뭐가
+      들어갔고 뭐가 나왔는지 눈으로 직접 확인하기 위한 용도.
+둘 다 독립적으로 켤 수 있다 (이미지만 보고 싶으면 --debug_image만, 프롬프트만 보고
+싶으면 --debug_text만).
+
 필요 패키지: qwen.py, gui_grounding.py와 동일 (torch, transformers, qwen-vl-utils, pillow)
 (주: 아래 numpy는 plot_points_on_image의 ndarray 입력 지원에 실제로 쓰이고 있음.
 opencv-python은 원래 임포트돼 있었으나 본 파일 어디서도 실제로 쓰이지 않아 제거함.)
@@ -31,6 +43,7 @@ opencv-python은 원래 임포트돼 있었으나 본 파일 어디서도 실제
 import os
 import re
 import io
+import json
 import math
 import time
 import numpy as np
@@ -44,6 +57,7 @@ from gui_grounding import (
     build_grounding_messages,
     parse_tool_call,
     ground as local_ground,
+    dump_prompt_debug,
 )
 
 
@@ -192,7 +206,7 @@ def calculate_crop_region(
     viewport_height=720,
     ratio_x=0.5,
     ratio_y=0.5,
-    debug=False,
+    debug_image=False,
     task_id=None,
     index=None,
 ):
@@ -234,7 +248,7 @@ def calculate_crop_region(
     right = min(viewport_width, right)
     bottom = min(viewport_height, bottom)
 
-    if debug:
+    if debug_image:
         debug_dir = f"./debug/{task_id}" if task_id else "./debug"
         os.makedirs(debug_dir, exist_ok=True)
         debug_img = img.copy()
@@ -264,7 +278,7 @@ def calculate_crop_region(
     return left, top, right - left, bottom - top
 
 
-def crop_and_upsample(bbox, image, debug=False, task_id=None, index=None, keep_aspect_ratio=True):
+def crop_and_upsample(bbox, image, debug_image=False, task_id=None, index=None, keep_aspect_ratio=True):
     img = image if isinstance(image, Image.Image) else Image.fromarray(image)
     img_width, img_height = img.size
 
@@ -276,7 +290,7 @@ def crop_and_upsample(bbox, image, debug=False, task_id=None, index=None, keep_a
 
     cropped = img.crop((left, top, left + w, top + h))
 
-    if debug:
+    if debug_image:
         debug_dir = f"./debug/{task_id}" if task_id else "./debug"
         os.makedirs(debug_dir, exist_ok=True)
         crop_filename = f"crop_{index}.png" if index is not None else "crop.png"
@@ -285,6 +299,10 @@ def crop_and_upsample(bbox, image, debug=False, task_id=None, index=None, keep_a
     viewport_width = img_width
     viewport_height = img_height
 
+    # 주의(vestigial): keep_aspect_ratio=False 분기는 현재 코드베이스 어디서도 호출되지
+    # 않는다 (ground_with_regionfocus는 항상 keep_aspect_ratio=True로 호출) - 사실상
+    # 도달 불가능한 죽은 분기. 삭제하진 않고 표시만 해둠 - 나중에 letterbox 없이 강제로
+    # viewport 크기에 맞추는 모드가 필요해지면 그대로 쓸 수 있음.
     if not keep_aspect_ratio:
         upsampled = cropped.resize((viewport_width, viewport_height), Image.Resampling.LANCZOS)
         zoom_x = viewport_width / w
@@ -300,13 +318,18 @@ def crop_and_upsample(bbox, image, debug=False, task_id=None, index=None, keep_a
         new_h = round(h * zoom_factor)
         upsampled = cropped.resize((new_w, new_h), Image.Resampling.LANCZOS)
 
+        # 주의(vestigial): offset_w/offset_h는 "letterbox 패딩된 캔버스 중앙에 배치했을 때의
+        # 여백"을 가정하고 계산한 값인데, 실제로 반환하는 upsampled 이미지는 패딩 없이
+        # new_w x new_h 그대로라 이 여백 자체가 존재하지 않는다. next_action_regionfocus()가
+        # 이 두 값을 파라미터로 받긴 하지만 실제로는 안 씀 (좌표 역투영은 zoom_x/zoom_y와
+        # left/top만으로 충분히 정확함) - 계산/전달 자체는 안전하니 굳이 지우지 않고 남겨둠.
         offset_w = float(viewport_width - new_w) / 2
         offset_h = float(viewport_height - new_h) / 2
 
         zoom_x = zoom_factor
         zoom_y = zoom_factor
 
-    if debug:
+    if debug_image:
         upsampled_filename = f"upsampled_{index}.png" if index is not None else "upsampled.png"
         upsampled.save(os.path.join(debug_dir, upsampled_filename))
 
@@ -335,7 +358,9 @@ def _generate_with_sampling(
 
     step_name을 넘기면 이 호출 하나가 끝나는 데 걸린 시간을 찍어준다 - RegionFocus는
     generate()를 여러 번 순차 호출하는 구조라, 어느 단계에서 오래 걸리는지 눈으로
-    보려고 넣었다.
+    보려고 넣었다. (프롬프트/응답 원문을 파일로 남기는 --debug_text 로깅은 이 함수를
+    호출하는 쪽(judge_inference 등)에서 dump_prompt_debug()로 별도 처리한다 - 이
+    함수는 순수 생성만 담당하도록 분리해뒀다.)
     """
     model, processor = qwen_model.model, qwen_model.processor
 
@@ -378,28 +403,72 @@ def _generate_with_sampling(
 # ---------------------------------------------------------------------------
 # RegionFocus 알고리즘 본체
 # ---------------------------------------------------------------------------
-def judge_inference(qwen_model, instruction, image, point, debug=False, task_id=None):
-    """초기 grounding 결과(point)가 instruction에 정확히 맞는지 모델에게 YES/NO로 판단시킨다."""
+def _parse_judge_verdict(response: str):
+    """
+    judge_inference 응답에서 {"reason": "...", "ans": "YES/NO"} JSON을 파싱한다.
+    모델이 JSON 앞뒤에 군더더기 텍스트를 붙이는 경우까지 커버하려고, 응답 전체에서
+    {...} 블록만 정규식으로 뽑아 json.loads를 시도한다.
+
+    JSON 파싱에 실패하면(모델이 포맷을 안 지켰을 때) 예전 방식(대문자 변환 후
+    YES/NO 부분 문자열 탐색)으로 폴백한다 - 폴백은 임시 안전망일 뿐이고, 정상적으로는
+    위 JSON 포맷 강제로 거의 항상 성공해야 한다.
+
+    Returns: (ans: "YES"|"NO"|None, reason: str|None) - 완전히 파싱 실패하면 (None, None).
+    """
+    match = re.search(r"\{.*\}", response, re.DOTALL)
+    if match:
+        try:
+            obj = json.loads(match.group(0))
+            ans = str(obj.get("ans", "")).strip().upper()
+            if ans in ("YES", "NO"):
+                return ans, obj.get("reason")
+        except (json.JSONDecodeError, AttributeError):
+            pass
+
+    # 폴백: JSON 강제가 실패했을 때만 쓰는 예전 substring 방식.
+    upper = response.upper()
+    has_yes = "YES" in upper or "CORRECT" in upper
+    has_no = "NO" in upper or "INCORRECT" in upper
+    if has_yes and not has_no:
+        return "YES", None
+    if has_no:
+        return "NO", None
+    return None, None
+
+
+def judge_inference(
+    qwen_model, instruction, image, point,
+    debug_image=False, debug_text=False, debug_mode="always", task_id=None,
+):
+    """
+    초기 grounding 결과(point)가 instruction에 정확히 맞는지 모델에게 YES/NO로 판단시킨다.
+
+    debug_mode:
+        "always"(기본)   - 판정 결과와 무관하게 항상 디버그 저장.
+        "incorrect"      - judge가 "오답"으로 판단한 샘플만 디버그 저장 (정답으로 조기 종료된
+                           샘플은 안 남겨서 ./debug 용량/개수를 줄인다). 나중에 judge가
+                           YES/NO/NEUTRAL 3분류로 바뀌면 NEUTRAL도 여기 포함시킬 예정.
+    """
     pil_image = image.copy() if isinstance(image, Image.Image) else Image.fromarray(image).copy()
 
     highlighted_image = plot_points_on_image(
         pil_image, [point], colors=[(255, 0, 255, 128)], markers=["star"], sizes=[12]
     )
 
-    debug_dir = f"./debug/{task_id}" if task_id else "./debug"
-    if debug:
-        os.makedirs(debug_dir, exist_ok=True)
-        highlighted_image.save(os.path.join(debug_dir, "initial_point_highlighted.png"))
-
+    # (2026-07 업데이트) 기존엔 자유 텍스트로 설명부터 시키고 "YES"/"NO" 부분 문자열을
+    # 응답 전체에서 찾는 방식이었는데, --debug_text로 실제 응답을 까보니 진짜 문제는
+    # (idx1/idx11 사례) judge 자신의 시각 인식/의미 해석 오류였지 파싱 버그는 아니었음 -
+    # 그래도 파싱 자체를 견고하게 만들어두는 게 안전해서, JSON 강제 포맷으로 교체함.
+    # reason을 ans보다 먼저 쓰게 해서 결론부터 내리고 사후 정당화하는 대신 판단 근거를
+    # 먼저 풀어놓게 유도한다(다만 idx1처럼 순수 시각 오인식은 이 순서 변경으로도 안 고쳐질 수 있음).
+    # NEUTRAL은 일단 제외하고 YES/NO 이분법만 유지 (요청에 따름).
     judge_prompt = (
-        f'Given the instruction: "{instruction}", I highlighted a pink star on the image, '
-        f"Is this pink star position correct and precise for the instruction? "
-        f"Sometimes, the point might cover the target, which is correct, and you need to "
-        f"distinguish this scenario. "
-        f"Answer YES if it accurately identifies the element mentioned in the instruction. "
-        f"Answer NO if it's incorrect or imprecise. "
-        f"Thoughts: Please explain your reasoning and be specific about why the point is "
-        f"correct or incorrect."
+        f'Instruction: "{instruction}"\n'
+        f"A pink star marks a candidate click point (it may partially cover the target - "
+        f"that still counts as correct).\n\n"
+        f'Reply with ONLY this JSON: {{"reason": "<short reason>", "ans": "YES/NO"}}\n'
+        f"Think through the reason first, then decide: YES = star is on the correct element. "
+        f"NO = clearly wrong or far."
     )
 
     # judge는 좌표가 아니라 자유 텍스트 판단이라 tool 스키마(system 메시지) 없이 질의한다.
@@ -417,17 +486,27 @@ def judge_inference(qwen_model, instruction, image, point, debug=False, task_id=
         qwen_model, messages, max_new_tokens=256, temperature=0.0, step_name="judge_inference"
     )
 
-    upper = response.upper()
-    is_correct = ("YES" in upper or "CORRECT" in upper or "정확" in response or "정밀" in response) and not (
-        "NO" in upper or "INCORRECT" in upper or "부정확" in response or "부정밀" in response
-    )
+    ans, parsed_reason = _parse_judge_verdict(response)
+    if ans is None:
+        # JSON도 실패하고 폴백(substring)도 YES/NO를 못 찾은 완전 파싱 실패 케이스 -
+        # 안전하게 "오답"으로 처리해서 RegionFocus가 재탐색하도록 한다 (조용히 넘어가지 않음).
+        is_correct = False
+    else:
+        is_correct = ans == "YES"
 
-    if debug:
-        with open(os.path.join(debug_dir, "judgment_response.txt"), "w") as f:
-            f.write(f"Instruction: {instruction}\n\n")
-            f.write(f"Point: {point}\n\n")
-            f.write(f"Judgment: {'CORRECT' if is_correct else 'INCORRECT'}\n\n")
-            f.write(f"Response:\n{response}")
+    # debug_mode="incorrect"면 이 시점(판정 완료 후)에 판단해서 오답 샘플만 저장한다.
+    should_dump = debug_mode == "always" or (debug_mode == "incorrect" and not is_correct)
+
+    if debug_image and should_dump:
+        debug_dir = f"./debug/{task_id}" if task_id else "./debug"
+        os.makedirs(debug_dir, exist_ok=True)
+        highlighted_image.save(os.path.join(debug_dir, "initial_point_highlighted.png"))
+
+    if debug_text and should_dump:
+        extra = f"Point: {point}\nParsed ans: {ans}\nJudgment: {'CORRECT' if is_correct else 'INCORRECT'}"
+        if parsed_reason:
+            extra += f"\nParsed reason: {parsed_reason}"
+        dump_prompt_debug(messages, response, task_id=task_id, step_name="judge_inference", extra=extra)
 
     return is_correct, response
 
@@ -438,7 +517,7 @@ def region_focus(
     image,
     temperature=0.0,
     top_p=1.0,
-    debug=False,
+    debug_text=False,
     task_id=None,
     min_pixels=DEFAULT_MIN_PIXELS,
     max_pixels=DEFAULT_MAX_PIXELS,
@@ -467,6 +546,11 @@ def region_focus(
         step_name=f"region_focus(temp={temperature})",
     )
 
+    if debug_text:
+        dump_prompt_debug(
+            messages, response, task_id=task_id, step_name=f"region_focus_temp{temperature}",
+        )
+
     tool_call = parse_tool_call(response)
     if tool_call is None:
         return None, response
@@ -486,12 +570,13 @@ def next_action_regionfocus(
     top,
     zoom_x,
     zoom_y,
-    offset_w,
-    offset_h,
+    offset_w,  # vestigial: crop_and_upsample() 참고 - 실제로 아래 로직에서 안 씀
+    offset_h,  # vestigial: 위와 동일
     w,
     h,
     original_image,
-    debug=False,
+    debug_image=False,
+    debug_text=False,
     task_id=None,
     index=None,
     temperature=0.0,
@@ -499,7 +584,12 @@ def next_action_regionfocus(
     min_pixels=DEFAULT_MIN_PIXELS,
     max_pixels=DEFAULT_MAX_PIXELS,
 ):
-    """확대(crop+upsample)된 영역 위에서 다시 좌표를 찍고, 원본 이미지 좌표로 역투영한다."""
+    """
+    확대(crop+upsample)된 영역 위에서 다시 좌표를 찍고, 원본 이미지 좌표로 역투영한다.
+
+    offset_w/offset_h 파라미터는 받기만 하고 실제로 안 쓴다 - crop_and_upsample()의
+    같은 이름 변수 주석 참고 (letterbox 패딩이 없는 구조라 애초에 불필요한 값).
+    """
     raw_zoomed_img = Image.open(io.BytesIO(zoomed_img_bytes))
 
     # crop_and_upsample이 만든 이미지는 28의 배수/설정된 pixel 범위에 안 맞을 수 있다.
@@ -530,6 +620,11 @@ def next_action_regionfocus(
         top_p=top_p,
         step_name=f"next_action_regionfocus(idx={index})",
     )
+
+    if debug_text:
+        dump_prompt_debug(
+            messages, response, task_id=task_id, step_name="next_action_regionfocus", index=index,
+        )
 
     tool_call = parse_tool_call(response)
     if tool_call is None:
@@ -565,7 +660,7 @@ def next_action_regionfocus(
 
     projected_point = (round(x_orig), round(y_orig))
 
-    if debug:
+    if debug_image:
         debug_dir = f"./debug/{task_id}" if task_id else "./debug"
         os.makedirs(debug_dir, exist_ok=True)
 
@@ -588,7 +683,9 @@ def next_action_regionfocus(
     return projected_point, response
 
 
-def next_action_regionfocus_aggregation(qwen_model, instruction, image, points, debug=False, task_id=None):
+def next_action_regionfocus_aggregation(
+    qwen_model, instruction, image, points, debug_image=False, debug_text=False, task_id=None
+):
     """여러 후보 좌표 중 instruction에 가장 잘 맞는 것을 모델에게 고르게 한다."""
     if not points:
         return None, "No points to aggregate"
@@ -613,7 +710,7 @@ def next_action_regionfocus_aggregation(qwen_model, instruction, image, points, 
     )
 
     debug_dir = f"./debug/{task_id}" if task_id else "./debug"
-    if debug:
+    if debug_image:
         os.makedirs(debug_dir, exist_ok=True)
         aggregated_image.save(os.path.join(debug_dir, "RegionFocus_aggregated.png"))
 
@@ -643,16 +740,19 @@ def next_action_regionfocus_aggregation(qwen_model, instruction, image, points, 
         qwen_model, messages, max_new_tokens=256, temperature=0.0, step_name="aggregation"
     )
 
-    if debug:
-        with open(os.path.join(debug_dir, "aggregation_response.txt"), "w") as f:
-            f.write(f"Instruction: {instruction}\n\nResponse:\n{response}")
-
     match = re.search(r"Selected point:\s*(\d+)", response)
+
+    if debug_text:
+        dump_prompt_debug(
+            messages, response, task_id=task_id, step_name="aggregation",
+            extra=f"Parsed selection: {match.group(1) if match else '(파싱 실패 - 1번으로 fallback)'}",
+        )
+
     if match:
         selected_idx = int(match.group(1)) - 1
         if 0 <= selected_idx < len(points):
             selected_point = points[selected_idx]
-            if debug:
+            if debug_image:
                 final_image = plot_points_on_image(
                     vis_image, [selected_point], colors=[(0, 255, 0)], markers=["star"], sizes=[20]
                 )
@@ -666,7 +766,9 @@ def ground_with_regionfocus(
     qwen_model: QwenVLModel,
     instruction: str,
     image,
-    debug: bool = False,
+    debug_image: bool = False,
+    debug_text: bool = False,
+    debug_mode: str = "always",
     task_id=None,
     min_pixels: int = DEFAULT_MIN_PIXELS,
     max_pixels: int = DEFAULT_MAX_PIXELS,
@@ -679,9 +781,15 @@ def ground_with_regionfocus(
     반환 스키마는 gui_grounding.ground()와 동일하게 "result" 키("positive"/"wrong_format")를
     항상 포함하도록 통일했다 (기존엔 RegionFocus 경로를 타면 이 키가 빠져서, 두 grounding
     경로를 같은 인터페이스로 다루는 상위 코드에서 KeyError가 날 수 있었음).
+
+    debug_image / debug_text: 각각 독립적으로 켤 수 있음 (자세한 설명은 파일 상단 참고).
+    debug_mode: "always"(기본) / "incorrect" - judge_inference의 판정 게이팅 참고
+    (judge_inference 함수 docstring). 단, Step 1(초기 grounding)의 프롬프트 텍스트 덤프는
+    judge 판정 전에 실행되는 단계라 debug_mode와 무관하게 debug_text가 켜져 있으면 항상
+    저장된다 (파일 하나짜리라 용량 부담이 거의 없어서 이 부분만 예외로 뒀다).
     """
     debug_dir = f"./debug/{task_id}" if task_id else "./debug"
-    if debug:
+    if debug_image or debug_text:
         os.makedirs(debug_dir, exist_ok=True)
 
     overall_start = time.time()
@@ -694,7 +802,8 @@ def ground_with_regionfocus(
     # Step 1: 초기 grounding (local_ground와 동일한 smart_resize 기준으로 원본 크기 재계산)
     _log("Step 1/5: 초기 grounding 시작")
     initial_result = local_ground(
-        qwen_model, instruction, pil_image, min_pixels=min_pixels, max_pixels=max_pixels
+        qwen_model, instruction, pil_image, min_pixels=min_pixels, max_pixels=max_pixels,
+        debug_text=debug_text, task_id=task_id,
     )
     resized_height, resized_width = smart_resize(
         pil_image.height, pil_image.width, min_pixels=min_pixels, max_pixels=max_pixels
@@ -710,7 +819,8 @@ def ground_with_regionfocus(
         ]
         _log("Step 2/5: 초기 grounding 판단(judge_inference) 시작")
         is_correct, judge_response = judge_inference(
-            qwen_model, instruction, original_image, point_px, debug=debug, task_id=task_id
+            qwen_model, instruction, original_image, point_px,
+            debug_image=debug_image, debug_text=debug_text, debug_mode=debug_mode, task_id=task_id,
         )
         _log(f"Step 2/5 완료 - {'정답, 여기서 종료' if is_correct else '오답, RegionFocus 진행'}")
         if is_correct:
@@ -731,7 +841,7 @@ def ground_with_regionfocus(
             original_image,
             temperature=temp,
             top_p=0.90,
-            debug=debug,
+            debug_text=debug_text,
             task_id=task_id,
             min_pixels=min_pixels,
             max_pixels=max_pixels,
@@ -755,14 +865,15 @@ def ground_with_regionfocus(
         left, top, w, h = calculate_crop_region(
             [round(point[0] * original_image.width), round(point[1] * original_image.height)],
             original_image,
-            debug=debug,
+            debug_image=debug_image,
             task_id=task_id,
             index=i,
             ratio_x=ratio[0],
             ratio_y=ratio[1],
         )
         zoomed_bytes, zoom_x, zoom_y, offset_w, offset_h = crop_and_upsample(
-            (left, top, w, h), original_image, keep_aspect_ratio=True, debug=debug, task_id=task_id, index=i
+            (left, top, w, h), original_image, keep_aspect_ratio=True,
+            debug_image=debug_image, task_id=task_id, index=i,
         )
         action_point, action_response = next_action_regionfocus(
             qwen_model,
@@ -777,7 +888,8 @@ def ground_with_regionfocus(
             w,
             h,
             original_image,
-            debug=debug,
+            debug_image=debug_image,
+            debug_text=debug_text,
             task_id=task_id,
             index=i,
             temperature=0.0,
@@ -808,7 +920,8 @@ def ground_with_regionfocus(
     final_points = [p for p, _ in zoomed_results]
     if len(final_points) > 1:
         best_point, agg_response = next_action_regionfocus_aggregation(
-            qwen_model, instruction, original_image, final_points, debug=debug, task_id=task_id
+            qwen_model, instruction, original_image, final_points,
+            debug_image=debug_image, debug_text=debug_text, task_id=task_id,
         )
     else:
         best_point, agg_response = zoomed_results[0]
@@ -844,7 +957,13 @@ def _cli():
     ap.add_argument("--min_pixels", type=int, default=DEFAULT_MIN_PIXELS)
     ap.add_argument("--max_pixels", type=int, default=DEFAULT_MAX_PIXELS)
     ap.add_argument("--load_in_8bit", action="store_true")
-    ap.add_argument("--debug", action="store_true", help="./debug/<task_id>에 중간 산출물 저장")
+    ap.add_argument("--debug_image", action="store_true",
+                    help="crop/zoom/판단 과정의 중간 이미지들을 ./debug/<task_id>/*.png로 저장")
+    ap.add_argument("--debug_text", action="store_true",
+                    help="각 단계에 실제로 들어간 프롬프트+응답 원문을 ./debug/<task_id>/prompt_*.txt로 저장")
+    ap.add_argument("--debug_mode", choices=["always", "incorrect"], default="always",
+                    help="always: 판정과 무관하게 항상 저장 / incorrect: judge가 오답으로 판단한 "
+                         "샘플만 저장 (정답 조기종료 샘플은 스킵)")
     ap.add_argument("--task_id", default="demo")
     args = ap.parse_args()
 
@@ -860,8 +979,8 @@ def _cli():
     model = QwenVLModel(**model_kwargs)
     result = ground_with_regionfocus(
         model, args.instruction, args.image,
-        debug=args.debug, task_id=args.task_id,
-        min_pixels=args.min_pixels, max_pixels=args.max_pixels,
+        debug_image=args.debug_image, debug_text=args.debug_text, debug_mode=args.debug_mode,
+        task_id=args.task_id, min_pixels=args.min_pixels, max_pixels=args.max_pixels,
     )
     print(result)
 
