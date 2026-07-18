@@ -463,14 +463,13 @@ def judge_inference(
     # 먼저 풀어놓게 유도한다(다만 idx1처럼 순수 시각 오인식은 이 순서 변경으로도 안 고쳐질 수 있음).
     # NEUTRAL은 일단 제외하고 YES/NO 이분법만 유지 (요청에 따름).
     judge_prompt = (
-        f'Instruction: "{instruction}"\n'
-        f"A pink star marks a candidate click point (it may partially cover the target - "
-        f"that still counts as correct).\n\n"
-        f'Reply with ONLY this JSON: {{"reason": "<short reason>", "ans": "YES/NO"}}\n'
-        f"Think through the reason first, then decide. Be strict: the star must precisely "
-        f"match the correct element. If there is any real doubt, or the star seems close but "
-        f"not exactly on the target, answer NO."
-    )
+            f'Instruction: "{instruction}"\n'
+            f"I highlighted a pink star on the image. Is this pink star position correct and "
+            f"precise for the instruction? Sometimes the point may cover the target, which still "
+            f"counts as correct - you need to distinguish this from a genuinely wrong location.\n\n"
+            f'Reply with ONLY this JSON: {{"reason": "<short reason>", "ans": "YES/NO"}}\n'
+            f"Think through the reason first, then decide. If there is any real doubt, answer NO."
+        )
 
     # judge는 좌표가 아니라 자유 텍스트 판단이라 tool 스키마(system 메시지) 없이 질의한다.
     messages = [
