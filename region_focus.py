@@ -467,8 +467,9 @@ def judge_inference(
         f"A pink star marks a candidate click point (it may partially cover the target - "
         f"that still counts as correct).\n\n"
         f'Reply with ONLY this JSON: {{"reason": "<short reason>", "ans": "YES/NO"}}\n'
-        f"Think through the reason first, then decide: YES = star is on the correct element. "
-        f"NO = clearly wrong or far."
+        f"Think through the reason first, then decide. Be strict: the star must precisely "
+        f"match the correct element. If there is any real doubt, or the star seems close but "
+        f"not exactly on the target, answer NO."
     )
 
     # judge는 좌표가 아니라 자유 텍스트 판단이라 tool 스키마(system 메시지) 없이 질의한다.
