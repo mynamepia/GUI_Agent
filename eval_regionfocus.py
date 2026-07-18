@@ -154,7 +154,13 @@ def main():
     ap.add_argument("--limit", type=int, default=None, help="스모크 테스트용 샘플 수 제한")
     ap.add_argument("--no_regionfocus", action="store_true",
                     help="RegionFocus 없이 plain grounding(gui_grounding.ground)만으로 평가 (baseline 비교용)")
-    ap.add_argument("--debug", action="store_true", help="region_focus.py의 디버그 이미지 저장(./debug/<id>) 활성화")
+    ap.add_argument("--debug_image", action="store_true",
+                    help="region_focus.py의 중간 이미지 저장(./debug/<id>/*.png) 활성화")
+    ap.add_argument("--debug_text", action="store_true",
+                    help="각 단계에 실제로 들어간 프롬프트+응답 원문을 ./debug/<id>/prompt_*.txt로 저장")
+    ap.add_argument("--debug_mode", choices=["always", "incorrect"], default="always",
+                    help="always: 판정과 무관하게 항상 저장 / incorrect: judge가 오답으로 판단한 "
+                         "샘플만 저장 (정답 조기종료 샘플은 스킵, RegionFocus 모드에서만 의미 있음)")
     ap.add_argument("--out", default=None, help="샘플별 결과(process_log, elapsed_sec 포함)를 저장할 jsonl 경로")
     ap.add_argument("--metrics_out", default=None, help="집계된 지표를 저장할 json 경로")
     ap.add_argument("--quiet", action="store_true", help="샘플별 hit/miss 한 줄 로그 끄기")
@@ -213,11 +219,13 @@ def main():
                     result = local_ground(
                         model, rec["instruction"], rec["image_path"],
                         min_pixels=args.min_pixels, max_pixels=args.max_pixels,
+                        debug_text=args.debug_text, task_id=task_id,
                     )
                 else:
                     result = ground_with_regionfocus(
                         model, rec["instruction"], rec["image_path"],
-                        debug=args.debug, task_id=task_id,
+                        debug_image=args.debug_image, debug_text=args.debug_text,
+                        debug_mode=args.debug_mode, task_id=task_id,
                         min_pixels=args.min_pixels, max_pixels=args.max_pixels,
                     )
             elapsed = time.time() - t0
