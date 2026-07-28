@@ -307,16 +307,6 @@ def ground(
 
     try:
         x, y = tool_call["arguments"]["coordinate"]
-        # (e) 모델이 가끔 display_width_px/display_height_px 범위를 살짝 벗어난 좌표를
-        #     내놓는 경우가 있다 (특히 gt target이 화면 가장자리에 붙어있는 경우, windows
-        #     플랫폼의 닫기 버튼/작업표시줄 등에서 관측됨). clamp 없이 그대로 나누면
-        #     point_norm이 [0,1]을 벗어나(e.g. y=1.29) calculate_crop_region의 강제
-        #     edge-clamping, judge_inference의 별 마커 캔버스 밖 배치 등으로 하류에
-        #     전파되어 예측 불가능한 부작용을 낳는다. 여기서 원본 모델 오차는 그대로
-        #     남기되(=클램프는 안전망일 뿐 근본적인 grounding 정확도 개선이 아니다),
-        #     좌표계 자체는 항상 유효한 [0,1] 범위로 보장한다.
-        x = max(0, min(x, resized_width - 1))
-        y = max(0, min(y, resized_height - 1))
         point_norm = [x / resized_width, y / resized_height]
         return {"result": "positive", "point": point_norm, "raw_response": raw_response}
     except (KeyError, TypeError, ValueError):

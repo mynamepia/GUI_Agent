@@ -1,0 +1,46 @@
+{
+  "ratio": 0.3,
+  "use": "median",
+  "n_images_total": 459,
+  "n_skipped": 0,
+  "global_min_crop_px": 230,
+  "global_stats": {
+    "n": 459,
+    "short_side_min": 540,
+    "short_side_p25": 720,
+    "short_side_median": 768,
+    "short_side_p75": 1080,
+    "short_side_max": 2100
+  },
+  "per_platform_min_crop_px": {
+    "web": 216,
+    "mobile": 243,
+    "desktop": 324
+  },
+  "per_platform_stats": {
+    "web": {
+      "n": 271,
+      "short_side_min": 720,
+      "short_side_p25": 720,
+      "short_side_median": 720,
+      "short_side_p75": 768,
+      "short_side_max": 1440
+    },
+    "mobile": {
+      "n": 119,
+      "short_side_min": 810,
+      "short_side_p25": 810,
+      "short_side_median": 810,
+      "short_side_p75": 1080,
+      "short_side_max": 1640
+    },
+    "desktop": {
+      "n": 69,
+      "short_side_min": 540,
+      "short_side_p25": 1080,
+      "short_side_median": 1080,
+      "short_side_p75": 1800,
+      "short_side_max": 2100
+    }
+  }
+}

@@ -59,7 +59,8 @@ from gui_grounding import (
     ground as local_ground,
     dump_prompt_debug,
 )
-
+# 1) 상단 import에 추가
+from judge_zoom_crop import crop_and_zoom_for_judge
 
 # ---------------------------------------------------------------------------
 # 순수 유틸 (모델 호출 없음) - 베이스라인에서 거의 그대로 포팅
@@ -435,24 +436,43 @@ def _parse_judge_verdict(response: str):
         return "NO", None
     return None, None
 
+"""
+judge_inference용 crop + zoom 전처리 함수.
+
+배경 (2026-07):
+    ZoomClick(arXiv:2512.05941, github.com/Princeton-AI2-Lab/ZoomClick)의 zoom 파라미터를
+    참고해서 judge에게 넘기기 전 point 주변을 crop+zoom한다.
+
+    - shrink 방식: 논문 ablation(Table 6)에서 한 번에 1/4로 자르는 것보다 1/2을 두 번
+      적용하는 two-step(1/2+1/2)이 항상 더 좋았음 (62.1% -> 63.9%). 그래서 in_ratio=0.5,
+      in_depth=2를 기본값으로 둠.
+    - 최소 crop 크기(m): 논문 본문/표에는 수치가 명시돼 있지 않았음. 다만 공식 github의
+      grounding/eval_sspro_zoomclick.py 실행 예시(README)에 --in_min_crop 768 로
+      하드코딩되어 있는 걸 확인함. 단, 이 768px는 ScreenSpot-Pro(2560~3840px대 고해상도
+      스크린샷)에 맞춰진 절대 픽셀값이라, 해상도가 낮은 일반 데스크톱/모바일 스크린샷에
+      그대로 쓰면 "거의 안 잘리거나(이미지가 768px보다 작을 때)" "지나치게 넓게 남는" 문제가
+      생길 수 있음. 그래서 여기서는 768을 상한으로 참고하되, 원본 이미지의 짧은 변에 대한
+      비율(min_crop_ratio)로 한 번 더 clamp해서 해상도가 달라져도 상대적으로 일관된 zoom이
+      되도록 함. (이 비율 값 자체는 논문에 없고, 762px가 ScreenSpot-Pro 이미지들의 짧은 변
+      대비 대략 25~35% 수준이었다는 점에서 역산해 잡은 값 - 직접 벤치마크로 튜닝 권장)
+"""
 
 def judge_inference(
     qwen_model, instruction, image, point,
     debug_image=False, debug_text=False, debug_mode="always", task_id=None,
+    use_zoom=True, min_crop_px=768   # <- 추가 (evaluation.py가 JSON에서 값 넣어줌)
 ):
-    """
-    초기 grounding 결과(point)가 instruction에 정확히 맞는지 모델에게 YES/NO로 판단시킨다.
-
-    debug_mode:
-        "always"(기본)   - 판정 결과와 무관하게 항상 디버그 저장.
-        "incorrect"      - judge가 "오답"으로 판단한 샘플만 디버그 저장 (정답으로 조기 종료된
-                           샘플은 안 남겨서 ./debug 용량/개수를 줄인다). 나중에 judge가
-                           YES/NO/NEUTRAL 3분류로 바뀌면 NEUTRAL도 여기 포함시킬 예정.
-    """
     pil_image = image.copy() if isinstance(image, Image.Image) else Image.fromarray(image).copy()
 
+    if use_zoom:
+        pil_image, _, point_for_star = crop_and_zoom_for_judge(
+            pil_image, point, in_min_crop_px=min_crop_px
+        )
+    else:
+        point_for_star = point
+
     highlighted_image = plot_points_on_image(
-        pil_image, [point], colors=[(255, 0, 255, 128)], markers=["star"], sizes=[12]
+        pil_image, [point_for_star], colors=[(255, 0, 255, 128)], markers=["star"], sizes=[12]
     )
 
     # (2026-07 업데이트) 기존엔 자유 텍스트로 설명부터 시키고 "YES"/"NO" 부분 문자열을
@@ -558,6 +578,16 @@ def region_focus(
 
     try:
         x, y = tool_call["arguments"]["coordinate"]
+        # 모델이 가끔 img_width/img_height 범위를 살짝 벗어난 좌표를 내놓는 경우가 있다
+        # (특히 gt target이 화면 가장자리에 붙어있는 경우, windows 플랫폼의 닫기 버튼/
+        # 작업표시줄 등에서 관측됨). clamp 없이 그대로 나누면 반환되는 정규화 좌표가
+        # [0,1]을 벗어나(e.g. y=1.29) calculate_crop_region의 강제 edge-clamping,
+        # judge_inference의 별 마커 캔버스 밖 배치 등으로 하류에 전파되어 예측 불가능한
+        # 부작용을 낳는다. 여기서 원본 모델 오차는 그대로 남기되(=클램프는 안전망일 뿐
+        # 근본적인 grounding 정확도 개선이 아니다), 좌표계 자체는 항상 유효한 [0,1]
+        # 범위로 보장한다.
+        x = max(0, min(x, img_width - 1))
+        y = max(0, min(y, img_height - 1))
         return [x / img_width, y / img_height], response
     except (KeyError, TypeError, ValueError):
         return None, response
@@ -764,15 +794,10 @@ def next_action_regionfocus_aggregation(
 
 
 def ground_with_regionfocus(
-    qwen_model: QwenVLModel,
-    instruction: str,
-    image,
-    debug_image: bool = False,
-    debug_text: bool = False,
-    debug_mode: str = "always",
-    task_id=None,
-    min_pixels: int = DEFAULT_MIN_PIXELS,
-    max_pixels: int = DEFAULT_MAX_PIXELS,
+    qwen_model, instruction, image,
+    debug_image=False, debug_text=False, debug_mode="always", task_id=None,
+    min_pixels=DEFAULT_MIN_PIXELS, max_pixels=DEFAULT_MAX_PIXELS,
+    min_crop_px=768,   # <- 추가
 ) -> dict:
     """
     베이스라인 Qwen25VLModel.ground_with_regionfocus()의 로컬 모델 버전.
@@ -822,6 +847,7 @@ def ground_with_regionfocus(
         is_correct, judge_response = judge_inference(
             qwen_model, instruction, original_image, point_px,
             debug_image=debug_image, debug_text=debug_text, debug_mode=debug_mode, task_id=task_id,
+            min_crop_px=min_crop_px
         )
         _log(f"Step 2/5 완료 - {'정답, 여기서 종료' if is_correct else '오답, RegionFocus 진행'}")
         if is_correct:

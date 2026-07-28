@@ -15,7 +15,7 @@ load_model_and_processor()를 그대로 가져다 써서, 두 파일이 항상 �
 """
 
 import torch
-torch.set_num_threads(12)
+torch.set_num_threads(6)
 from transformers import Qwen2_5_VLForConditionalGeneration, AutoProcessor
 from qwen_vl_utils import process_vision_info
 
