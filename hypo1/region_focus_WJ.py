@@ -796,6 +796,9 @@ def ground_with_regionfocus(
     debug_image=False, debug_text=False, debug_mode="always", task_id=None,
     min_pixels=DEFAULT_MIN_PIXELS, max_pixels=DEFAULT_MAX_PIXELS,
     min_crop_px=768,   # <- 추가
+    use_zoom=True,      # <- 추가 (2026-08): False면 judge_inference가 ZoomClick crop/zoom
+                        # 전처리 없이 원본 crop 없는 이미지로 판정 - "순수 RegionFocus"
+                        # (가설1 이전 baseline과 동일 조건)를 이 파일 하나로 재현하기 위함.
 ) -> dict:
     """
     베이스라인 Qwen25VLModel.ground_with_regionfocus()의 로컬 모델 버전.
@@ -811,6 +814,11 @@ def ground_with_regionfocus(
     (judge_inference 함수 docstring). 단, Step 1(초기 grounding)의 프롬프트 텍스트 덤프는
     judge 판정 전에 실행되는 단계라 debug_mode와 무관하게 debug_text가 켜져 있으면 항상
     저장된다 (파일 하나짜리라 용량 부담이 거의 없어서 이 부분만 예외로 뒀다).
+
+    use_zoom=False로 호출하면 judge_inference의 crop/zoom 전처리(가설1, ZoomClick식)를
+    끄고 "순수 RegionFocus"(judge가 원본 이미지 그대로 보고 판정)로 동작한다 -
+    LoRA eval / RegionFocus eval / RegionFocus+가설1 eval 세 가지를 전부 이 한 파일로
+    돌리기 위한 스위치.
     """
     debug_dir = f"./debug/{task_id}" if task_id else "./debug"
     if debug_image or debug_text:
@@ -845,7 +853,7 @@ def ground_with_regionfocus(
         is_correct, judge_response = judge_inference(
             qwen_model, instruction, original_image, point_px,
             debug_image=debug_image, debug_text=debug_text, debug_mode=debug_mode, task_id=task_id,
-            min_crop_px=min_crop_px
+            use_zoom=use_zoom, min_crop_px=min_crop_px
         )
         _log(f"Step 2/5 완료 - {'정답, 여기서 종료' if is_correct else '오답, RegionFocus 진행'}")
         if is_correct:

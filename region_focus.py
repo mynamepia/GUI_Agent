@@ -2,12 +2,12 @@
 region_focus.py
 
 베이스라인 논문(Qwen25VLModel)의 RegionFocus 파이프라인을 로컬 Qwen2.5-VL 모델
-(qwen.py의 QwenVLModel)로 재현한 모듈.
+(qwen.py의 QwenVLModel)로 재현한 모듈. (순수 RegionFocus - ZoomClick 전처리 없음.
+zoom 버전은 hypo1/region_focus_WJ.py 참고.)
 
 원본은 OpenAI 호환 서빙 엔드포인트(_call_endpoint, vLLM 등)를 통해 추론했지만,
-여기서는 gui_grounding.py에서 만든 로컬 function-calling 파이프라인
-(ComputerUseTool / build_grounding_messages / parse_tool_call)을 그대로 재사용해서
-같은 알고리즘(초기 grounding -> 판단 -> crop/zoom 반복 -> 후보 종합)을 로컬 모델로 돌린다.
+여기서는 gui_grounding.py에서 만든 로컬 파이프라인으로 같은 알고리즘(초기 grounding ->
+판단 -> crop/zoom 반복 -> 후보 종합)을 로컬 모델로 돌린다.
 
 원본과 다르게 의도적으로 바꾼 부분 2가지:
     1) judge_inference / next_action_regionfocus_aggregation에는 원본이 실수로(혹은
@@ -22,6 +22,17 @@ region_focus.py
        범위를 벗어나기 쉽고, 그러면 processor가 내부에서 우리가 모르는 크기로 또
        리사이즈해버려 좌표가 조용히 어긋나는 버그가 생긴다. smart_resize로 미리
        맞추고 그 배율만큼 zoom_x/zoom_y를 보정해서 이 문제를 없앴다.
+
+[2026-08 수정] initial grounding(local_ground)과 별개로, region_focus()/
+next_action_regionfocus() 역시 좌표를 직접 이 LoRA(checkpoint-4130)에게 묻는
+호출인데, 지금까지 gui_grounding.ComputerUseTool/build_grounding_messages/
+parse_tool_call(Hermes tool-calling 포맷)을 썼다. 이 LoRA는 train.py가 학습시킬 때
+쓴 "system 메시지 없음 + PROMPT_TEMPLATE + (x,y) 텍스트" 포맷만 알고 tool-call
+포맷은 학습에서 본 적이 없어서, 이 두 함수도 gui_grounding.build_point_prompt_messages()
++ coord_utils.parse_point_from_text()로 바꿨다. judge_inference/
+next_action_regionfocus_aggregation은 원래도 system 메시지 없는 자유 텍스트 질의라
+이번 수정 대상이 아니다(위 1번 항목 그대로 유지). (hypo1/region_focus_WJ.py에
+적용한 것과 동일한 수정 - 두 파일 다 이 픽스가 들어가 있어야 함.)
 
 [디버그 로깅: --debug_image / --debug_text]
 둘을 분리해뒀다:
@@ -53,14 +64,11 @@ from qwen_vl_utils import process_vision_info
 
 from qwen import QwenVLModel, DEFAULT_MIN_PIXELS, DEFAULT_MAX_PIXELS
 from gui_grounding import (
-    ComputerUseTool,
-    build_grounding_messages,
-    parse_tool_call,
+    build_point_prompt_messages,
     ground as local_ground,
     dump_prompt_debug,
 )
-# 1) 상단 import에 추가
-from judge_zoom_crop import crop_and_zoom_for_judge
+from coord_utils import parse_point_from_text
 
 # ---------------------------------------------------------------------------
 # 순수 유틸 (모델 호출 없음) - 베이스라인에서 거의 그대로 포팅
@@ -436,43 +444,16 @@ def _parse_judge_verdict(response: str):
         return "NO", None
     return None, None
 
-"""
-judge_inference용 crop + zoom 전처리 함수.
-
-배경 (2026-07):
-    ZoomClick(arXiv:2512.05941, github.com/Princeton-AI2-Lab/ZoomClick)의 zoom 파라미터를
-    참고해서 judge에게 넘기기 전 point 주변을 crop+zoom한다.
-
-    - shrink 방식: 논문 ablation(Table 6)에서 한 번에 1/4로 자르는 것보다 1/2을 두 번
-      적용하는 two-step(1/2+1/2)이 항상 더 좋았음 (62.1% -> 63.9%). 그래서 in_ratio=0.5,
-      in_depth=2를 기본값으로 둠.
-    - 최소 crop 크기(m): 논문 본문/표에는 수치가 명시돼 있지 않았음. 다만 공식 github의
-      grounding/eval_sspro_zoomclick.py 실행 예시(README)에 --in_min_crop 768 로
-      하드코딩되어 있는 걸 확인함. 단, 이 768px는 ScreenSpot-Pro(2560~3840px대 고해상도
-      스크린샷)에 맞춰진 절대 픽셀값이라, 해상도가 낮은 일반 데스크톱/모바일 스크린샷에
-      그대로 쓰면 "거의 안 잘리거나(이미지가 768px보다 작을 때)" "지나치게 넓게 남는" 문제가
-      생길 수 있음. 그래서 여기서는 768을 상한으로 참고하되, 원본 이미지의 짧은 변에 대한
-      비율(min_crop_ratio)로 한 번 더 clamp해서 해상도가 달라져도 상대적으로 일관된 zoom이
-      되도록 함. (이 비율 값 자체는 논문에 없고, 762px가 ScreenSpot-Pro 이미지들의 짧은 변
-      대비 대략 25~35% 수준이었다는 점에서 역산해 잡은 값 - 직접 벤치마크로 튜닝 권장)
-"""
 
 def judge_inference(
     qwen_model, instruction, image, point,
     debug_image=False, debug_text=False, debug_mode="always", task_id=None,
-    use_zoom=True, min_crop_px=768   # <- 추가 (evaluation.py가 JSON에서 값 넣어줌)
 ):
+    """순수 RegionFocus judge - crop/zoom 전처리 없이 원본 이미지 그대로 별을 찍어서 판정한다."""
     pil_image = image.copy() if isinstance(image, Image.Image) else Image.fromarray(image).copy()
 
-    if use_zoom:
-        pil_image, _, point_for_star = crop_and_zoom_for_judge(
-            pil_image, point, in_min_crop_px=min_crop_px
-        )
-    else:
-        point_for_star = point
-
     highlighted_image = plot_points_on_image(
-        pil_image, [point_for_star], colors=[(255, 0, 255, 128)], markers=["star"], sizes=[12]
+        pil_image, [point], colors=[(255, 0, 255, 128)], markers=["star"], sizes=[12]
     )
 
     # (2026-07 업데이트) 기존엔 자유 텍스트로 설명부터 시키고 "YES"/"NO" 부분 문자열을
@@ -546,17 +527,15 @@ def region_focus(
     """
     initial grounding이 틀렸다고 판단됐을 때, 다른 temperature로 다시 좌표 후보를 뽑는다.
     image는 이미 smart_resize로 정렬된 상태(= ground_with_regionfocus의 original_image)라고 가정.
+
+    [2026-08 수정] Hermes tool-calling 포맷(ComputerUseTool/build_grounding_messages/
+    parse_tool_call) 대신, 이 LoRA가 실제로 학습받은 포맷
+    (gui_grounding.build_point_prompt_messages + coord_utils.parse_point_from_text)으로
+    묻는다. 자세한 이유는 파일 상단 docstring 참고.
     """
     pil_image = image.copy() if isinstance(image, Image.Image) else Image.fromarray(image).copy()
-    img_width, img_height = pil_image.size
 
-    tool = ComputerUseTool(display_width_px=img_width, display_height_px=img_height)
-    prompt_text = (
-        f'Given the instruction: "{instruction}", locate the most relevant coordinates in '
-        f"the image that best matches the instruction, by calling the computer_use function "
-        f"with a left_click action."
-    )
-    messages = build_grounding_messages(instruction, pil_image, tool, prompt_text=prompt_text)
+    messages = build_point_prompt_messages(instruction, pil_image)
 
     response = _generate_with_sampling(
         qwen_model,
@@ -572,25 +551,19 @@ def region_focus(
             messages, response, task_id=task_id, step_name=f"region_focus_temp{temperature}",
         )
 
-    tool_call = parse_tool_call(response)
-    if tool_call is None:
+    norm_point = parse_point_from_text(response)
+    if norm_point is None:
         return None, response
 
-    try:
-        x, y = tool_call["arguments"]["coordinate"]
-        # 모델이 가끔 img_width/img_height 범위를 살짝 벗어난 좌표를 내놓는 경우가 있다
-        # (특히 gt target이 화면 가장자리에 붙어있는 경우, windows 플랫폼의 닫기 버튼/
-        # 작업표시줄 등에서 관측됨). clamp 없이 그대로 나누면 반환되는 정규화 좌표가
-        # [0,1]을 벗어나(e.g. y=1.29) calculate_crop_region의 강제 edge-clamping,
-        # judge_inference의 별 마커 캔버스 밖 배치 등으로 하류에 전파되어 예측 불가능한
-        # 부작용을 낳는다. 여기서 원본 모델 오차는 그대로 남기되(=클램프는 안전망일 뿐
-        # 근본적인 grounding 정확도 개선이 아니다), 좌표계 자체는 항상 유효한 [0,1]
-        # 범위로 보장한다.
-        x = max(0, min(x, img_width - 1))
-        y = max(0, min(y, img_height - 1))
-        return [x / img_width, y / img_height], response
-    except (KeyError, TypeError, ValueError):
-        return None, response
+    nx, ny = norm_point
+    # 0~1000 상대좌표는 해상도 무관이라 nx/1000, ny/1000이 곧바로 pil_image 기준 0~1
+    # 정규화 좌표다 (gui_grounding.ground()와 동일한 근거). 모델이 가끔 범위를 살짝
+    # 벗어난 값을 내놓는 경우가 있어(특히 gt target이 화면 가장자리에 붙어있을 때),
+    # 하류의 calculate_crop_region 강제 edge-clamping 등으로 예측 불가능하게 전파되지
+    # 않도록 여기서 [0,1]로 방어적으로 클램프한다(원본 모델 오차 자체를 고치는 건 아님).
+    x_norm = max(0.0, min(1.0, nx / 1000))
+    y_norm = max(0.0, min(1.0, ny / 1000))
+    return [x_norm, y_norm], response
 
 
 def next_action_regionfocus(
@@ -635,13 +608,10 @@ def next_action_regionfocus(
     zoom_x = zoom_x * extra_zoom_x
     zoom_y = zoom_y * extra_zoom_y
 
-    tool = ComputerUseTool(display_width_px=resized_w, display_height_px=resized_h)
-    prompt_text = (
-        f"For this zoomed-in screenshot, identify the precise point that best matches "
-        f'the instruction: "{instruction}", by calling the computer_use function with a '
-        f"left_click action."
-    )
-    messages = build_grounding_messages(instruction, zoomed_img, tool, prompt_text=prompt_text)
+    # [2026-08 수정] Hermes tool-calling 포맷 대신 이 LoRA가 학습받은 포맷
+    # (build_point_prompt_messages + parse_point_from_text)으로 묻는다.
+    # 자세한 이유는 파일 상단 docstring 참고.
+    messages = build_point_prompt_messages(instruction, zoomed_img)
 
     response = _generate_with_sampling(
         qwen_model,
@@ -657,17 +627,17 @@ def next_action_regionfocus(
             messages, response, task_id=task_id, step_name="next_action_regionfocus", index=index,
         )
 
-    tool_call = parse_tool_call(response)
-    if tool_call is None:
+    norm_point = parse_point_from_text(response)
+    if norm_point is None:
         return None, response
 
-    try:
-        click_point = tool_call["arguments"]["coordinate"]
-    except (KeyError, TypeError, ValueError):
-        return None, response
-
-    x_upsampled, y_upsampled = click_point
-    x_upsampled, y_upsampled = round(x_upsampled), round(y_upsampled)
+    nx, ny = norm_point
+    # 여기서부터는 zoom_x/zoom_y로 원본 이미지 좌표계에 역투영해야 해서 실제 픽셀좌표가
+    # 필요하다. 0~1000 상대좌표를 모델이 실제로 본 이미지(zoomed_img, resized_w x
+    # resized_h) 기준 픽셀좌표로 변환한다 - 기존 tool-call 방식이 픽셀좌표를 직접
+    # 받던 것과 동일한 스케일로 맞추는 것 뿐, 역투영 로직 자체는 그대로다.
+    x_upsampled = round(nx / 1000 * resized_w)
+    y_upsampled = round(ny / 1000 * resized_h)
 
     zoomed_width_calc = w * zoom_x
     zoomed_height_calc = h * zoom_y
@@ -797,10 +767,9 @@ def ground_with_regionfocus(
     qwen_model, instruction, image,
     debug_image=False, debug_text=False, debug_mode="always", task_id=None,
     min_pixels=DEFAULT_MIN_PIXELS, max_pixels=DEFAULT_MAX_PIXELS,
-    min_crop_px=768,   # <- 추가
 ) -> dict:
     """
-    베이스라인 Qwen25VLModel.ground_with_regionfocus()의 로컬 모델 버전.
+    베이스라인 Qwen25VLModel.ground_with_regionfocus()의 로컬 모델 버전 (순수, zoom 없음).
     1) 초기 grounding (gui_grounding.ground) -> 2) 판단 -> 3) 틀렸으면 region_focus로
     재탐색 -> 4) crop/zoom 4가지 비율로 정밀화 -> 5) 후보 종합, 순서 그대로.
 
@@ -847,7 +816,6 @@ def ground_with_regionfocus(
         is_correct, judge_response = judge_inference(
             qwen_model, instruction, original_image, point_px,
             debug_image=debug_image, debug_text=debug_text, debug_mode=debug_mode, task_id=task_id,
-            min_crop_px=min_crop_px
         )
         _log(f"Step 2/5 완료 - {'정답, 여기서 종료' if is_correct else '오답, RegionFocus 진행'}")
         if is_correct:

@@ -198,7 +198,10 @@ def main():
     ap.add_argument("--load_in_8bit", action="store_true")
     ap.add_argument("--limit", type=int, default=None, help="스모크 테스트용 샘플 수 제한")
     ap.add_argument("--no_regionfocus", action="store_true",
-                    help="RegionFocus 없이 plain grounding(gui_grounding.ground)만으로 평가 (baseline 비교용)")
+                    help="RegionFocus 없이 plain grounding(gui_grounding.ground)만으로 평가 (baseline 비교용, LoRA eval)")
+    ap.add_argument("--no_zoom", action="store_true",
+                    help="RegionFocus는 쓰되 judge_inference의 ZoomClick crop/zoom 전처리(가설1)는 끔 "
+                         "(= '순수 RegionFocus' eval). --no_regionfocus와 같이 쓰면 무시됨(애초에 judge를 안 씀).")
     ap.add_argument("--debug_image", action="store_true",
                     help="region_focus.py의 중간 이미지 저장(./debug/<id>/*.png) 활성화")
     ap.add_argument("--debug_text", action="store_true",
@@ -236,7 +239,12 @@ def main():
     records = load_jsonl(args.jsonl)
     if args.limit is not None:
         records = records[: args.limit]
-    mode = "plain grounding" if args.no_regionfocus else "RegionFocus"
+    if args.no_regionfocus:
+        mode = "plain grounding (LoRA eval)"
+    elif args.no_zoom:
+        mode = "RegionFocus (no zoom, pure)"
+    else:
+        mode = "RegionFocus+ZoomClick (가설1)"
 
     # --- resume: 기존 --out에서 이미 끝난 샘플의 idx를 읽어온다 ---
     existing_rows = _load_existing_rows(args.out) if args.resume else []
@@ -280,6 +288,7 @@ def main():
                         debug_image=args.debug_image, debug_text=args.debug_text,
                         debug_mode=args.debug_mode, task_id=task_id,
                         min_pixels=args.min_pixels, max_pixels=args.max_pixels,
+                        use_zoom=not args.no_zoom,
                     )
                     if min_crop_px is not None:
                         # None을 명시적으로 넘기면 region_focus.py의 기본값(int)을 덮어써서
