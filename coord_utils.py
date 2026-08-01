@@ -1,3 +1,10 @@
+"""
+순수 파이썬 유틸 (torch 불필요).
+evaluation.py, dataset_prep.py, test.py, data_utils.py가 공용으로 사용.
+평가만 하고 싶을 때(torch 설치 없이) evaluation.py가 무겁게 안 돌아가도록
+Dataset(torch 필요) 클래스는 data_utils.py로 분리해뒀다.
+"""
+
 import json
 import re
 
@@ -13,12 +20,23 @@ POINT_RE = re.compile(r"\(?\s*(\d+(?:\.\d+)?)\s*,\s*(\d+(?:\.\d+)?)\s*\)?")
 
 
 def load_jsonl(path: str):
+    """
+    jsonl을 읽어서 dict 리스트로 반환.
+
+    image_path는 윈도우(gpu-work)에서 데이터셋을 만들 때 "\\" 구분자로 박혀서 저장되는데,
+    리눅스/맥에서는 "\\"가 경로 구분자가 아니라 그냥 파일명 문자로 취급돼서 파일을 못 찾는
+    문제가 있었음(FileNotFoundError). "/"는 윈도우에서도 정상 동작하는 경로 구분자라서,
+    여기서 항상 "/"로 정규화해두면 어느 OS에서 읽어도 안전하다.
+    """
     records = []
     with open(path, "r", encoding="utf-8") as f:
         for line in f:
             line = line.strip()
             if line:
-                records.append(json.loads(line))
+                rec = json.loads(line)
+                if isinstance(rec.get("image_path"), str):
+                    rec["image_path"] = rec["image_path"].replace("\\", "/")
+                records.append(rec)
     return records
 
 
