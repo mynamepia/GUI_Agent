@@ -22,6 +22,18 @@ qwen_agent 라이브러리 없이, GUI grounding에 필요한 function-calling �
     맞춰 필드명을 검증/수정하는 걸 추천한다.
 
 필요 패키지: qwen.py와 동일 (torch, transformers, qwen-vl-utils, pillow)
+
+[2026-08 수정] ComputerUseTool/build_grounding_messages/parse_tool_call(Hermes
+tool-calling 포맷)은 이 LoRA(checkpoint-4130, train.py 학습)가 실제로 학습받은
+포맷이 아니라는 게 확인됐다. train.py/evaluation.py는 system 메시지 없이
+coord_utils.PROMPT_TEMPLATE 하나로 묻고 "(x,y)"(0~1000 정규화) 텍스트로 답을
+받도록 학습/평가하는데, 여기서는 그와 다른 tool-call JSON 포맷으로 물어보고
+있었다 - 즉 LoRA가 한 번도 본 적 없는 입력 구조로 grounding을 시킨 셈이었다.
+그래서 실제로 이 LoRA에게 좌표를 묻는 ground()는 build_point_prompt_messages()
++ parse_point_from_text() 조합(학습 포맷 그대로)으로 바꿨다. ComputerUseTool 등
+기존 tool-calling 유틸리티는 지우지 않고 남겨뒀다 - 나중에 tool-calling을 실제로
+지원하는 다른 백본으로 바꿀 일이 생기면 그대로 쓸 수 있지만, 지금 이 LoRA 기반
+grounding 파이프라인에서는 쓰지 않는다.
 """
 
 import json
@@ -33,6 +45,7 @@ from PIL import Image
 from transformers.models.qwen2_vl.image_processing_qwen2_vl_fast import smart_resize
 
 from qwen import QwenVLModel, DEFAULT_MIN_PIXELS, DEFAULT_MAX_PIXELS
+from coord_utils import PROMPT_TEMPLATE, parse_point_from_text
 
 
 # ---------------------------------------------------------------------------
@@ -185,6 +198,36 @@ def build_grounding_messages(
 
 
 # ---------------------------------------------------------------------------
+# 2-b) 학습 포맷 그대로 묻는 프롬프트 빌더
+#      (이 LoRA에게 실제로 좌표를 물어보는 모든 호출은 이걸 써야 한다)
+# ---------------------------------------------------------------------------
+def build_point_prompt_messages(instruction: str, image) -> list:
+    """
+    train.py가 LoRA를 학습시킬 때 쓴 것과 완전히 동일한 messages를 만든다
+    (evaluation.py의 run_generation_eval과 100% 동일한 구조):
+        - system 메시지 없음
+        - user 메시지 하나: 이미지 + PROMPT_TEMPLATE.format(instruction=instruction)
+    모델은 "(x,y)"(0~1000 정규화 정수) 텍스트로 답하도록 학습되어 있다
+    (coord_utils.parse_point_from_text로 파싱).
+
+    ground(), region_focus_WJ.py의 region_focus()/next_action_regionfocus() 등
+    이 LoRA에게 실제로 좌표를 물어보는 모든 호출은 build_grounding_messages()
+    (Hermes tool-calling 포맷) 대신 반드시 이 함수를 써야 한다 - LoRA는 tool-call
+    포맷을 학습에서 한 번도 보지 못했다.
+    """
+    prompt_text = PROMPT_TEMPLATE.format(instruction=instruction)
+    return [
+        {
+            "role": "user",
+            "content": [
+                {"type": "image", "image": image},
+                {"type": "text", "text": prompt_text},
+            ],
+        }
+    ]
+
+
+# ---------------------------------------------------------------------------
 # 3) <tool_call> 파서 (베이스라인의 fragile split() 방식 대체)
 # ---------------------------------------------------------------------------
 _TOOL_CALL_RE = re.compile(r"<tool_call>\s*(\{.*?\})\s*</tool_call>", re.DOTALL)
@@ -255,11 +298,20 @@ def ground(
     min_pixels: int = DEFAULT_MIN_PIXELS,
     max_pixels: int = DEFAULT_MAX_PIXELS,
     max_new_tokens: int = 128,
+    temperature: float = 0.0,
     debug_text: bool = False,
     task_id=None,
 ) -> dict:
     """
     GUI 스크린샷 위에서 instruction에 해당하는 지점을 찾는다.
+
+    [2026-08 수정] 프롬프트/파싱/좌표변환을 train.py가 LoRA를 학습시킬 때 쓴 포맷
+    (evaluation.py + coord_utils.py)과 완전히 동일하게 맞췄다: system 메시지 없이
+    build_point_prompt_messages()(PROMPT_TEMPLATE)로 묻고, parse_point_from_text()로
+    "(x,y)"(0~1000 정규화) 텍스트를 파싱한다. 예전 버전은 Hermes 스타일 tool-calling
+    시스템 프롬프트(ComputerUseTool/build_grounding_messages/parse_tool_call)를 썼는데,
+    LoRA는 이 포맷을 학습에서 한 번도 보지 못했다 - grounding 정확도 저하의 원인 중
+    하나로 지목되어 여기서 통일했다.
 
     Returns:
         {
@@ -270,57 +322,48 @@ def ground(
     """
     pil_image = Image.open(image) if isinstance(image, str) else image
 
-    # (a) smart_resize로 "모델이 실제로 보게 될 크기"를 우리가 직접 고정한다.
-    #     이 크기를 알아야 모델이 뱉는 픽셀 좌표를 원본 이미지 좌표로 되돌릴 수 있다.
+    # smart_resize는 여전히 필요하다 - 모델에 넣을 이미지의 토큰 예산(min/max_pixels)을
+    # 우리가 직접 통제하기 위함일 뿐, 아래 좌표 변환에는 이제 이 크기가 전혀 쓰이지
+    # 않는다. 모델이 답하는 "(x,y)"는 0~1000 상대좌표라 해상도 무관이라서, nx/1000,
+    # ny/1000이 곧바로 원본 이미지 기준 0~1 정규화 좌표가 된다
+    # (coord_utils.norm1000_to_point가 하는 일과 동치 - w,h가 그대로 나눠지고 곱해져서
+    # 사라짐).
     resized_height, resized_width = smart_resize(
         pil_image.height, pil_image.width,
         min_pixels=min_pixels, max_pixels=max_pixels,
     )
     resized_image = pil_image.resize((resized_width, resized_height))
 
-    # (b) 액션 스키마 + function-calling 시스템 프롬프트로 messages 구성
-    tool = ComputerUseTool(display_width_px=resized_width, display_height_px=resized_height)
-    messages = build_grounding_messages(instruction, resized_image, tool)
+    # 학습 포맷 그대로: system 메시지 없이 PROMPT_TEMPLATE 하나로 질의
+    messages = build_point_prompt_messages(instruction, resized_image)
 
-    # (c) processor에 그대로 넘긴다. processor 내부에서도 (min_pixels, max_pixels)
-    #     기준으로 smart_resize를 다시 돌리는데, smart_resize는 이미 28의 배수이고
-    #     면적이 [min_pixels, max_pixels] 안에 있는 크기를 넣으면 그대로 반환하는
-    #     멱등 함수라서 여기서 이미지가 또 리사이즈되지 않는다.
-    #     (구버전 코드는 processor.image_processor.min_pixels/max_pixels를 직접
-    #     덮어쓰려 했는데, transformers 버전에 따라 그 속성이 없어서 AttributeError가
-    #     났음 - 애초에 불필요한 작업이라 제거함)
-    #
-    #     주의: 이 함수를 호출할 때 넘기는 min_pixels/max_pixels는 QwenVLModel을
-    #     만들 때 썼던 값과 반드시 같아야 한다. 다르면 processor가 우리 계산과
-    #     다른 크기로 다시 리사이즈해버려서 좌표가 어긋난다.
+    # processor에 그대로 넘긴다. processor 내부에서도 (min_pixels, max_pixels) 기준으로
+    # smart_resize를 다시 돌리는데, smart_resize는 이미 28의 배수이고 면적이
+    # [min_pixels, max_pixels] 안에 있는 크기를 넣으면 그대로 반환하는 멱등 함수라서
+    # 여기서 이미지가 또 리사이즈되지 않는다.
     _t0 = time.time()
-    raw_response = qwen_model.generate(messages, max_new_tokens=max_new_tokens)
+    raw_response = qwen_model.generate(
+        messages, max_new_tokens=max_new_tokens, temperature=temperature,
+    )
     print(f"[ground] generate() 완료 - {time.time() - _t0:.1f}초")
 
     if debug_text:
         dump_prompt_debug(messages, raw_response, task_id=task_id, step_name="ground")
 
-    # (d) tool_call 파싱 + 좌표 정규화
-    tool_call = parse_tool_call(raw_response)
-    if tool_call is None:
+    # "(x,y)"(0~1000 정규화) 파싱
+    norm_point = parse_point_from_text(raw_response)
+    if norm_point is None:
         return {"result": "wrong_format", "point": None, "raw_response": raw_response}
 
-    try:
-        x, y = tool_call["arguments"]["coordinate"]
-        # (e) 모델이 가끔 display_width_px/display_height_px 범위를 살짝 벗어난 좌표를
-        #     내놓는 경우가 있다 (특히 gt target이 화면 가장자리에 붙어있는 경우, windows
-        #     플랫폼의 닫기 버튼/작업표시줄 등에서 관측됨). clamp 없이 그대로 나누면
-        #     point_norm이 [0,1]을 벗어나(e.g. y=1.29) calculate_crop_region의 강제
-        #     edge-clamping, judge_inference의 별 마커 캔버스 밖 배치 등으로 하류에
-        #     전파되어 예측 불가능한 부작용을 낳는다. 여기서 원본 모델 오차는 그대로
-        #     남기되(=클램프는 안전망일 뿐 근본적인 grounding 정확도 개선이 아니다),
-        #     좌표계 자체는 항상 유효한 [0,1] 범위로 보장한다.
-        x = max(0, min(x, resized_width - 1))
-        y = max(0, min(y, resized_height - 1))
-        point_norm = [x / resized_width, y / resized_height]
-        return {"result": "positive", "point": point_norm, "raw_response": raw_response}
-    except (KeyError, TypeError, ValueError):
-        return {"result": "wrong_format", "point": None, "raw_response": raw_response}
+    nx, ny = norm_point
+    # coord_utils.parse_point_from_text/norm1000_to_point는 범위를 클램프하지 않는다
+    # (evaluation.py도 그대로 둬서, 범위를 벗어나면 bbox hit-test에서 자연히 miss
+    # 처리됨). 다만 이 point는 RegionFocus의 crop 계산 등 하류 로직에서 그대로 픽셀
+    # 연산에 쓰이므로, 여기서만 방어적으로 [0,1]로 클램프해둔다 - 학습/평가 스펙의
+    # 일부가 아니라 이 함수를 쓰는 하류 코드를 위한 안전장치일 뿐이다.
+    x_norm = max(0.0, min(1.0, nx / 1000))
+    y_norm = max(0.0, min(1.0, ny / 1000))
+    return {"result": "positive", "point": [x_norm, y_norm], "raw_response": raw_response}
 
 
 def _cli():
@@ -340,6 +383,8 @@ def _cli():
     ap.add_argument("--min_pixels", type=int, default=DEFAULT_MIN_PIXELS)
     ap.add_argument("--max_pixels", type=int, default=DEFAULT_MAX_PIXELS)
     ap.add_argument("--load_in_8bit", action="store_true")
+    ap.add_argument("--temperature", type=float, default=0.0,
+                    help="샘플링 온도 (기본값 0.0 = greedy decoding)")
     ap.add_argument("--debug_text", action="store_true",
                     help="실제 프롬프트+응답을 ./debug/<task_id>/에 텍스트로 저장")
     ap.add_argument("--task_id", default="demo")
@@ -358,6 +403,7 @@ def _cli():
     result = ground(
         model, args.instruction, args.image,
         min_pixels=args.min_pixels, max_pixels=args.max_pixels,
+        temperature=args.temperature,
         debug_text=args.debug_text, task_id=args.task_id,
     )
     print(result)

@@ -113,12 +113,24 @@ def load_model_and_processor(
     return model, processor
 
 
-def generate_text(model, processor, messages: list, max_new_tokens: int = 512) -> str:
+def generate_text(
+    model, processor, messages: list, max_new_tokens: int = 512,
+    temperature: float = 0.0, top_p: float = 1.0,
+) -> str:
     """
     이미 로드된 model/processor로 messages(Qwen 챗 템플릿 포맷)에 대한 답변 텍스트 하나를 생성.
     QwenVLModel.generate()와 evaluation.py의 배치 추론(test.py, train.py 사후 평가)에서
     똑같은 로직을 공유하려고 분리해뒀다. model은 base 모델이든 PeftModel(LoRA 어댑터를 얹은
     상태)이든 상관없이 그대로 동작한다 (PeftModel도 .generate()를 그대로 지원).
+
+    temperature<=0(기본값)이면 greedy decoding(do_sample=False)으로 고정한다.
+    temperature>0이면 do_sample=True로 전환하고 그 값과 top_p로 샘플링한다
+    (region_focus_WJ.py가 RegionFocus 재탐색에서 여러 후보를 뽑을 때 씀).
+
+    [2026-08 수정] 예전 버전은 max_new_tokens만 넘겨서, 샘플링 여부가 체크포인트의
+    generation_config.json 기본값에 그대로 맡겨져 있었다. 그 기본값이 do_sample=True인
+    체크포인트라면 evaluation.py 평가가 실행할 때마다 다른 결과를 내는 비결정적 상태였다는
+    뜻이라, 여기서 명시적으로 do_sample을 지정해 재현 가능하게 고쳤다.
     """
     text = processor.apply_chat_template(
         messages, tokenize=False, add_generation_prompt=True
@@ -133,7 +145,13 @@ def generate_text(model, processor, messages: list, max_new_tokens: int = 512) -
         return_tensors="pt",
     ).to(model.device)
 
-    generated_ids = model.generate(**inputs, max_new_tokens=max_new_tokens)
+    gen_kwargs = dict(max_new_tokens=max_new_tokens)
+    if temperature and temperature > 0:
+        gen_kwargs.update(do_sample=True, temperature=temperature, top_p=top_p)
+    else:
+        gen_kwargs.update(do_sample=False)
+
+    generated_ids = model.generate(**inputs, **gen_kwargs)
     generated_ids_trimmed = [
         out_ids[len(in_ids):]
         for in_ids, out_ids in zip(inputs.input_ids, generated_ids)
@@ -187,7 +205,10 @@ class QwenVLModel:
 
         print("[qwen.py] Model loaded.")
 
-    def generate(self, messages: list, max_new_tokens: int = 512) -> str:
+    def generate(
+        self, messages: list, max_new_tokens: int = 512,
+        temperature: float = 0.0, top_p: float = 1.0,
+    ) -> str:
         """
         messages: Qwen 채팅 템플릿 형식의 메시지 리스트.
         예시:
@@ -200,10 +221,19 @@ class QwenVLModel:
                     ],
                 }
             ]
-        """
-        return generate_text(self.model, self.processor, messages, max_new_tokens=max_new_tokens)
 
-    def chat(self, text: str, image_path: str | None = None, max_new_tokens: int = 512) -> str:
+        temperature/top_p는 generate_text()로 그대로 전달된다 (기본 temperature=0.0 =
+        greedy decoding). 자세한 설명은 generate_text() docstring 참고.
+        """
+        return generate_text(
+            self.model, self.processor, messages,
+            max_new_tokens=max_new_tokens, temperature=temperature, top_p=top_p,
+        )
+
+    def chat(
+        self, text: str, image_path: str | None = None, max_new_tokens: int = 512,
+        temperature: float = 0.0, top_p: float = 1.0,
+    ) -> str:
         """텍스트(+선택적 이미지)를 받아 답변을 반환하는 간단한 헬퍼."""
         content = []
         if image_path:
@@ -211,7 +241,9 @@ class QwenVLModel:
         content.append({"type": "text", "text": text})
 
         messages = [{"role": "user", "content": content}]
-        return self.generate(messages, max_new_tokens=max_new_tokens)
+        return self.generate(
+            messages, max_new_tokens=max_new_tokens, temperature=temperature, top_p=top_p,
+        )
 
 
 if __name__ == "__main__":
