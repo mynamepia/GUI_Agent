@@ -16,12 +16,22 @@ generate_verifier_data.py가 만드는 데이터는 gt_center(항상 label=1)를
 전부가 label=1이라 오히려 반대로 쏠릴 수도 있음) - 그래서 자동으로 pos_weight를
 계산해서 BCEWithLogitsLoss에 넣는다(--pos_weight로 수동 지정도 가능).
 
-사용법 (hypo1과 동일하게 PYTHONPATH=..로 상위 모듈 재사용):
+[2026-08 수정: VRAM OOM 버그 픽스]
+processor를 min_pixels/max_pixels 상한 없이 로드하고 있었다 - qwen.py는 항상 이 상한
+(DEFAULT_MAX_PIXELS=640*28*28)을 걸어서 이미지 한 장이 비주얼 토큰 몇천 개로 불어나는
+걸 막는데, 여기는 AutoProcessor.from_pretrained(model_id)만 불러서 기본값(훨씬 큰
+해상도 허용)을 그대로 쓰고 있었다 - VRAM 16GB+공유램까지 끌어 쓰다 죽는 원인이었을
+가능성이 높음. qwen.py와 동일한 기본값으로 상한을 걸도록 고쳤고, 그래도 부족하면
+--gradient_checkpointing을 켜거나 --batch_size를 낮출 것(1까지 낮춰도 됨 - 배치를
+줄이는 대신 필요하면 나중에 gradient accumulation을 추가하는 것도 방법).
+
+사용법 (verifier/가 vlm_agent/ 밑에 있든 나란히 있든 sys.path 자동탐지로 알아서 찾음 -
+PYTHONPATH 수동 설정 불필요):
   cd vlm_agent/verifier
-  PYTHONPATH=.. python train_verifier.py \
-      --jsonl verifier_train_raw.jsonl \
+  python train_verifier.py \
+      --jsonl verifier_train.jsonl --val_jsonl verifier_val.jsonl \
       --output_dir ./checkpoints/verifier-v1 \
-      --epochs 2 --batch_size 4
+      --epochs 2 --batch_size 1 --gradient_checkpointing
 """
 
 import argparse
@@ -49,6 +59,7 @@ from transformers import AutoProcessor
 from coord_utils import load_jsonl
 from data import build_verifier_messages
 from model import MODEL_ID, QwenVerifier
+from qwen import DEFAULT_MIN_PIXELS, DEFAULT_MAX_PIXELS
 
 
 def _resolve_image_path(image_path):
@@ -155,15 +166,36 @@ def main():
     ap.add_argument("--lora_alpha", type=int, default=32)
     ap.add_argument("--pos_weight", type=float, default=None,
                      help="positive class 가중치(불균형 보정). 기본값은 n_neg/n_pos로 자동 계산")
+    ap.add_argument("--min_pixels", type=int, default=DEFAULT_MIN_PIXELS,
+                     help="qwen.py와 동일한 기본 상한을 씀 - 이걸 안 걸면 processor가 "
+                          "기본값(훨씬 큰 해상도)을 그대로 써서 이미지 한 장이 비주얼 토큰 "
+                          "수천 개로 불어나 VRAM이 크게 튈 수 있음.")
+    ap.add_argument("--max_pixels", type=int, default=DEFAULT_MAX_PIXELS)
+    ap.add_argument("--gradient_checkpointing", action="store_true",
+                     help="VRAM이 부족할 때 켤 것 - 역전파에 필요한 중간 activation을 저장해두지 "
+                          "않고 필요할 때 다시 계산해서 메모리를 크게 아끼는 대신 조금 느려짐.")
+    ap.add_argument("--grad_accum", type=int, default=1,
+                     help="train.py와 동일한 목적 - --batch_size를 낮춰서 VRAM을 아끼는 대신, "
+                          "이 값만큼 스텝을 모아서 한 번에 optimizer.step()을 밟아 실질적인 "
+                          "배치 크기(batch_size * grad_accum)를 흉내낸다. 예: --batch_size 1 "
+                          "--grad_accum 4 면 메모리는 배치 1개만큼만 쓰면서 배치 4개를 모은 것과 "
+                          "같은 효과의 업데이트를 함.")
     ap.add_argument("--log_every", type=int, default=20)
     args = ap.parse_args()
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
 
-    processor = AutoProcessor.from_pretrained(args.model_id)
+    processor = AutoProcessor.from_pretrained(
+        args.model_id, min_pixels=args.min_pixels, max_pixels=args.max_pixels,
+    )
     model = QwenVerifier(
         model_id=args.model_id, lora_r=args.lora_r, lora_alpha=args.lora_alpha,
     ).to(device)
+    if args.gradient_checkpointing:
+        model.backbone.gradient_checkpointing_enable()
+        # gradient checkpointing은 KV 캐시(디코딩 가속용)와 같이 못 씀 - 우리는 generate()를
+        # 안 쓰고 forward 한 번만 하는 분류기라 use_cache를 꺼도 아무 영향 없음.
+        model.backbone.config.use_cache = False
     model.backbone.print_trainable_parameters()
 
     train_ds = VerifierDataset(args.jsonl)
@@ -187,6 +219,7 @@ def main():
     optimizer = torch.optim.AdamW([p for p in model.parameters() if p.requires_grad], lr=args.lr)
 
     model.train()
+    optimizer.zero_grad()
     for epoch in range(args.epochs):
         total_loss = 0.0
         for step, batch in enumerate(train_loader):
@@ -198,13 +231,23 @@ def main():
                 pixel_values=batch["pixel_values"],
                 image_grid_thw=batch["image_grid_thw"],
             )
-            loss = criterion(logits, labels_t)
-            optimizer.zero_grad()
+            # grad_accum>1이면 grad_accum번의 loss 평균을 낸 것과 같은 크기가 되도록
+            # 미리 나눠준다 (안 그러면 accum 스텝 수만큼 그래디언트가 커짐).
+            loss = criterion(logits, labels_t) / args.grad_accum
             loss.backward()
-            optimizer.step()
-            total_loss += loss.item()
+            # optimizer.step()은 grad_accum 스텝마다 한 번만 - 그 사이엔 그래디언트가
+            # 계속 누적(accumulate)된다 (zero_grad를 안 부르니까). 마지막 배치가
+            # grad_accum으로 안 나눠떨어지고 끝나도 아래 for문 밖에서 한 번 더 처리한다.
+            if (step + 1) % args.grad_accum == 0:
+                optimizer.step()
+                optimizer.zero_grad()
+            total_loss += loss.item() * args.grad_accum
             if step % args.log_every == 0:
-                print(f"[epoch {epoch}] step {step}/{len(train_loader)} loss={loss.item():.4f}")
+                print(f"[epoch {epoch}] step {step}/{len(train_loader)} loss={loss.item() * args.grad_accum:.4f}")
+        # 이 epoch이 grad_accum으로 안 나눠떨어지는 스텝 수로 끝났으면 남은 그래디언트를 마저 반영.
+        if len(train_loader) % args.grad_accum != 0:
+            optimizer.step()
+            optimizer.zero_grad()
         avg_loss = total_loss / max(len(train_loader), 1)
         msg = f"[epoch {epoch}] 평균 loss={avg_loss:.4f}"
         if val_loader is not None:
