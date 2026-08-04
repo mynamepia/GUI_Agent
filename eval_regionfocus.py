@@ -62,6 +62,8 @@ from evaluation import aggregate_metrics, format_report
 from qwen import QwenVLModel, DEFAULT_MIN_PIXELS, DEFAULT_MAX_PIXELS
 from region_focus import ground_with_regionfocus
 from gui_grounding import ground as local_ground
+from gui_grounding import ground_toolcall_norm1000 as local_ground_toolcall_norm1000
+from gui_grounding import ground_toolcall_pixel as local_ground_toolcall_pixel
 
 
 def _get_category(rec):
@@ -161,6 +163,18 @@ def main():
     ap.add_argument("--debug_mode", choices=["always", "incorrect"], default="always",
                     help="always: 판정과 무관하게 항상 저장 / incorrect: judge가 오답으로 판단한 "
                          "샘플만 저장 (정답 조기종료 샘플은 스킵, RegionFocus 모드에서만 의미 있음)")
+    ap.add_argument("--step4_format", choices=["point_text", "toolcall_norm1000", "toolcall_pixel"],
+                    default="point_text",
+                    help="Step4(crop/zoom 후 좌표 재추출)의 좌표 요청 방식. point_text: 기본(학습 "
+                         "포맷 그대로) / toolcall_norm1000: tool-call schema 유지 + coordinate만 "
+                         "0~1000 정규화 / toolcall_pixel: old 프롬프트 100% 그대로(raw pixel). "
+                         "--no_regionfocus와 같이 쓰면 무시됨(Step4 자체를 안 씀).")
+    ap.add_argument("--step1_format", choices=["point_text", "toolcall_norm1000", "toolcall_pixel"],
+                    default="point_text",
+                    help="Step1(초기 grounding)의 좌표 요청 방식. point_text: 기본(학습 포맷 그대로) "
+                         "/ toolcall_norm1000: tool-call schema + 0~1000 정규화 / toolcall_pixel: "
+                         "old 프롬프트 100% 그대로(raw pixel). "
+                         "--no_regionfocus여도 Step1은 항상 이 값을 따름(plain grounding 모드에도 적용).")
     ap.add_argument("--out", default=None, help="샘플별 결과(process_log, elapsed_sec 포함)를 저장할 jsonl 경로")
     ap.add_argument("--metrics_out", default=None, help="집계된 지표를 저장할 json 경로")
     ap.add_argument("--quiet", action="store_true", help="샘플별 hit/miss 한 줄 로그 끄기")
@@ -185,7 +199,12 @@ def main():
     records = load_jsonl(args.jsonl)
     if args.limit is not None:
         records = records[: args.limit]
-    mode = "plain grounding" if args.no_regionfocus else "RegionFocus"
+    step1_tag = f" step1={args.step1_format}" if args.step1_format != "point_text" else ""
+    step4_tag = f" step4={args.step4_format}" if args.step4_format != "point_text" else ""
+    if args.no_regionfocus:
+        mode = f"plain grounding{step1_tag}"
+    else:
+        mode = f"RegionFocus{step1_tag}{step4_tag}"
 
     # --- resume: 기존 --out에서 이미 끝난 샘플의 idx를 읽어온다 ---
     existing_rows = _load_existing_rows(args.out) if args.resume else []
@@ -216,7 +235,12 @@ def main():
             t0 = time.time()
             with contextlib.redirect_stdout(tee):
                 if args.no_regionfocus:
-                    result = local_ground(
+                    ground_fn = {
+                        "point_text": local_ground,
+                        "toolcall_norm1000": local_ground_toolcall_norm1000,
+                        "toolcall_pixel": local_ground_toolcall_pixel,
+                    }[args.step1_format]
+                    result = ground_fn(
                         model, rec["instruction"], rec["image_path"],
                         min_pixels=args.min_pixels, max_pixels=args.max_pixels,
                         debug_text=args.debug_text, task_id=task_id,
@@ -227,6 +251,7 @@ def main():
                         debug_image=args.debug_image, debug_text=args.debug_text,
                         debug_mode=args.debug_mode, task_id=task_id,
                         min_pixels=args.min_pixels, max_pixels=args.max_pixels,
+                        step4_format=args.step4_format, step1_format=args.step1_format,
                     )
             elapsed = time.time() - t0
             total_elapsed += elapsed
