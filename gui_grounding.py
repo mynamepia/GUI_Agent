@@ -64,21 +64,48 @@ class ComputerUseTool:
 
     name = "computer_use"
 
-    def __init__(self, display_width_px: int, display_height_px: int):
+    def __init__(self, display_width_px: int, display_height_px: int, coord_mode: str = "pixel"):
+        """
+        coord_mode: "pixel"(기본, 원본 tool-call 방식) | "norm1000"(Step4 ablation
+        옵션C용 - tool-call schema/파싱 구조는 그대로 두고 coordinate 값의 스케일만
+        0~1000 정규화로 바꾼 하이브리드. region_focus.py의
+        next_action_regionfocus_toolcall_norm1000()에서 씀.
+        """
         self.display_width_px = display_width_px
         self.display_height_px = display_height_px
+        assert coord_mode in ("pixel", "norm1000"), f"unknown coord_mode: {coord_mode}"
+        self.coord_mode = coord_mode
 
     @property
     def function(self) -> dict:
         """function-calling 스키마 (JSON Schema 형식의 dict)."""
-        return {
-            "name": self.name,
-            "description": (
+        if self.coord_mode == "norm1000":
+            description = (
+                "Use a mouse and keyboard to interact with a GUI screenshot.\n"
+                "* Coordinates are given as integers from 0 to 1000, representing the "
+                "relative position in the screenshot (0,0 = top-left corner, 1000,1000 = "
+                "bottom-right corner), independent of the screenshot's actual pixel resolution."
+            )
+            coordinate_desc = (
+                "[x, y], where x and y are integers from 0 to 1000 representing the relative "
+                "position in the screenshot (0,0 = top-left, 1000,1000 = bottom-right), NOT "
+                "pixels. Required for left_click, double_click, right_click, left_click_drag, "
+                "mouse_move, scroll."
+            )
+        else:
+            description = (
                 "Use a mouse and keyboard to interact with a GUI screenshot.\n"
                 f"* The screenshot's resolution is {self.display_width_px}x{self.display_height_px} pixels.\n"
                 "* Coordinates are given in pixels, measured from the top-left corner "
                 "of the screenshot (0,0)."
-            ),
+            )
+            coordinate_desc = (
+                "[x, y] 픽셀 좌표. left_click, double_click, right_click, "
+                "left_click_drag, mouse_move, scroll 액션에 필요."
+            )
+        return {
+            "name": self.name,
+            "description": description,
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -100,10 +127,7 @@ class ComputerUseTool:
                     },
                     "coordinate": {
                         "type": "array",
-                        "description": (
-                            "[x, y] 픽셀 좌표. left_click, double_click, right_click, "
-                            "left_click_drag, mouse_move, scroll 액션에 필요."
-                        ),
+                        "description": coordinate_desc,
                     },
                     "text": {
                         "type": "string",
@@ -364,6 +388,135 @@ def ground(
     x_norm = max(0.0, min(1.0, nx / 1000))
     y_norm = max(0.0, min(1.0, ny / 1000))
     return {"result": "positive", "point": [x_norm, y_norm], "raw_response": raw_response}
+
+
+def ground_toolcall_norm1000(
+    qwen_model: QwenVLModel,
+    instruction: str,
+    image,
+    min_pixels: int = DEFAULT_MIN_PIXELS,
+    max_pixels: int = DEFAULT_MAX_PIXELS,
+    max_new_tokens: int = 128,
+    temperature: float = 0.0,
+    debug_text: bool = False,
+    task_id=None,
+) -> dict:
+    """
+    [Step1 ablation] ground()와 역할/반환 스키마는 완전히 동일(원본 이미지 기준 0~1
+    정규화 좌표를 돌려줌)하지만, 좌표를 묻는 방식만 old RegionFocus가 쓰던
+    tool-call(computer_use function-calling) 스키마로 바꾸고, coordinate 값 자체는
+    old(raw pixel)가 아니라 0~1000 정규화로 받는다.
+
+    region_focus.py의 next_action_regionfocus_toolcall_norm1000()(Step4 ablation
+    옵션C)과 짝을 이루는 Step1용 버전 - Step4만 old 스키마로 바꿨을 때는 오히려 결과가
+    baseline보다 나빠졌는데(28.07%(B) 대비 25.71%), Step1까지 같이 old 스키마로
+    바꾸면 뭔가 달라지는지 보기 위한 실험용 함수. (단, old의 Step1은 do_sample을
+    명시 안 해서 비결정적 샘플링이었는데 이 함수는 여전히 temperature<=0이면
+    do_sample=False로 고정이라, "스키마+좌표 스케일"만 old를 재현하고 "샘플링
+    비결정성"까지 재현하진 않는다 - 완전한 old 재현은 아님.)
+
+    Returns: ground()와 동일한 스키마.
+        {
+            "result": "positive" | "wrong_format",
+            "point": [x_norm, y_norm] | None,
+            "raw_response": str,
+        }
+    """
+    pil_image = Image.open(image) if isinstance(image, str) else image
+
+    resized_height, resized_width = smart_resize(
+        pil_image.height, pil_image.width,
+        min_pixels=min_pixels, max_pixels=max_pixels,
+    )
+    resized_image = pil_image.resize((resized_width, resized_height))
+
+    tool = ComputerUseTool(resized_width, resized_height, coord_mode="norm1000")
+    prompt_text = (
+        f'Output the most relevant point in the image corresponding to '
+        f'the instruction "{instruction}" with grounding, by calling the '
+        f'computer_use function with a left_click action.'
+    )
+    messages = build_grounding_messages(instruction, resized_image, tool, prompt_text=prompt_text)
+
+    _t0 = time.time()
+    raw_response = qwen_model.generate(
+        messages, max_new_tokens=max_new_tokens, temperature=temperature,
+    )
+    print(f"[ground_toolcall_norm1000] generate() 완료 - {time.time() - _t0:.1f}초")
+
+    if debug_text:
+        dump_prompt_debug(messages, raw_response, task_id=task_id, step_name="ground_toolcall_norm1000")
+
+    tool_call = parse_tool_call(raw_response)
+    if not tool_call:
+        return {"result": "wrong_format", "point": None, "raw_response": raw_response}
+    coord = (tool_call.get("arguments") or {}).get("coordinate")
+    if not isinstance(coord, (list, tuple)) or len(coord) != 2:
+        return {"result": "wrong_format", "point": None, "raw_response": raw_response}
+    try:
+        nx, ny = float(coord[0]), float(coord[1])
+    except (TypeError, ValueError):
+        return {"result": "wrong_format", "point": None, "raw_response": raw_response}
+
+    x_norm = max(0.0, min(1.0, nx / 1000))
+    y_norm = max(0.0, min(1.0, ny / 1000))
+    return {"result": "positive", "point": [x_norm, y_norm], "raw_response": raw_response}
+
+
+def ground_toolcall_pixel(
+    qwen_model: QwenVLModel,
+    instruction: str,
+    image,
+    min_pixels: int = DEFAULT_MIN_PIXELS,
+    max_pixels: int = DEFAULT_MAX_PIXELS,
+    max_new_tokens: int = 128,
+    temperature: float = 0.0,
+    debug_text: bool = False,
+    task_id=None,
+) -> dict:
+    """
+    [Step1 - old 프롬프트 그대로] bak/gui_grounding.py의 원래(수정 전) ground()를
+    그대로 이식한 버전. tool-call 스키마도, coordinate description("픽셀 좌표")도,
+    파싱 후 좌표 변환(0~1000 변환 없이 raw pixel을 그대로 resized_width/height로
+    나눔)도 old와 100% 동일하다 - 유일한 차이는 qwen_model.generate()가 이제
+    qwen.py의 고정된 do_sample=False를 타서 결정적이라는 점뿐(old는 이 부분이
+    버그로 비결정적이었음).
+
+    "old 스키마+old 좌표표현" 조합을 재현해서, do_sample 비결정성만 뺀 순수 old
+    프롬프트가 37.81%에 가까운 RegionFocus 우위를 재현하는지 보기 위한 컨트롤 실험용.
+
+    Returns: ground()와 동일한 스키마.
+    """
+    pil_image = Image.open(image) if isinstance(image, str) else image
+
+    resized_height, resized_width = smart_resize(
+        pil_image.height, pil_image.width,
+        min_pixels=min_pixels, max_pixels=max_pixels,
+    )
+    resized_image = pil_image.resize((resized_width, resized_height))
+
+    tool = ComputerUseTool(display_width_px=resized_width, display_height_px=resized_height)
+    messages = build_grounding_messages(instruction, resized_image, tool)
+
+    _t0 = time.time()
+    raw_response = qwen_model.generate(
+        messages, max_new_tokens=max_new_tokens, temperature=temperature,
+    )
+    print(f"[ground_toolcall_pixel] generate() 완료 - {time.time() - _t0:.1f}초")
+
+    if debug_text:
+        dump_prompt_debug(messages, raw_response, task_id=task_id, step_name="ground_toolcall_pixel")
+
+    tool_call = parse_tool_call(raw_response)
+    if tool_call is None:
+        return {"result": "wrong_format", "point": None, "raw_response": raw_response}
+
+    try:
+        x, y = tool_call["arguments"]["coordinate"]
+        point_norm = [x / resized_width, y / resized_height]
+        return {"result": "positive", "point": point_norm, "raw_response": raw_response}
+    except (KeyError, TypeError, ValueError):
+        return {"result": "wrong_format", "point": None, "raw_response": raw_response}
 
 
 def _cli():

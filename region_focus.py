@@ -66,9 +66,31 @@ from qwen import QwenVLModel, DEFAULT_MIN_PIXELS, DEFAULT_MAX_PIXELS
 from gui_grounding import (
     build_point_prompt_messages,
     ground as local_ground,
+    ground_toolcall_norm1000 as local_ground_toolcall_norm1000,
+    ground_toolcall_pixel as local_ground_toolcall_pixel,
     dump_prompt_debug,
+    ComputerUseTool,
+    build_grounding_messages,
+    parse_tool_call,
 )
 from coord_utils import parse_point_from_text
+
+# [2026-08 Step1/Step4 ablation] ComputerUseTool/build_grounding_messages/parse_tool_call은
+# 원래 이 LoRA가 학습받지 못한 old tool-call 포맷이라 gui_grounding.ground()/
+# region_focus()/next_action_regionfocus()에서는 안 쓰기로 했지만(파일 상단
+# docstring 참고), old 포맷이 new 포맷보다 훨씬 컸던 RegionFocus uplift
+# (27.99%->37.81% vs 27.91%->28.07%)가 "tool-call schema 구조" 때문인지
+# "raw pixel 좌표" 때문인지 분리해서 보기 위해, 아래 실험용 함수들에서만 예외적으로
+# 다시 끌어다 쓴다.
+# [결과1] Step4만 old 스키마+0~1000으로 바꾼 조합("toolcall_norm1000")은 오히려
+# baseline보다 나빠짐 (28.07%(B) -> 25.71%) - "스키마 자체"가 old 우위의 원인은
+# 아니라는 뜻.
+# [결과2] Step1까지 같이 "toolcall_norm1000"으로 바꾸면 더 나빠짐 (-> 22~24%대) -
+# 초기 grounding 자체가 tool-call+0~1000 조합에서 더 못 찾음.
+# [진행중] "toolcall_pixel" = old 프롬프트를 좌표 description/변환까지 100% 그대로
+# 재현(0~1000 변환 없음, description도 "픽셀"로 원복)한 컨트롤 실험 - do_sample만
+# 고정(결정적)이고 나머지는 old와 완전히 동일. old의 37.81%가 raw pixel 표현 때문인지,
+# 아니면 old의 비결정적 샘플링 노이즈였는지 마지막으로 가려보기 위함.
 
 # ---------------------------------------------------------------------------
 # 순수 유틸 (모델 호출 없음) - 베이스라인에서 거의 그대로 포팅
@@ -684,6 +706,267 @@ def next_action_regionfocus(
     return projected_point, response
 
 
+def next_action_regionfocus_toolcall_norm1000(
+    qwen_model,
+    instruction,
+    zoomed_img_bytes,
+    left,
+    top,
+    zoom_x,
+    zoom_y,
+    offset_w,  # vestigial: crop_and_upsample() 참고 - 실제로 아래 로직에서 안 씀
+    offset_h,  # vestigial: 위와 동일
+    w,
+    h,
+    original_image,
+    debug_image=False,
+    debug_text=False,
+    task_id=None,
+    index=None,
+    temperature=0.0,
+    top_p=1.0,
+    min_pixels=DEFAULT_MIN_PIXELS,
+    max_pixels=DEFAULT_MAX_PIXELS,
+):
+    """
+    [Step4 ablation 옵션C] next_action_regionfocus()와 역할/위치는 완전히 동일
+    (crop+upsample된 이미지 위에서 좌표를 다시 찍고 원본 이미지 좌표로 역투영)하지만,
+    좌표를 묻는 방식만 old RegionFocus가 쓰던 tool-call(computer_use function-calling)
+    스키마로 바꾸고, 그 coordinate 값 자체는 old(raw pixel)가 아니라 new와 동일한
+    0~1000 정규화로 받는다.
+
+    3-way ablation:
+        A(old)     = tool-call schema + raw pixel coordinate  (region_focus_JH.py 등 옛 코드)
+        B(new,기본) = point-text(build_point_prompt_messages) + 0~1000 정규화 (next_action_regionfocus)
+        C(이 함수)  = tool-call schema + 0~1000 정규화 좌표
+
+    old(A)가 new(B)보다 Step4에서 훨씬 큰 RegionFocus uplift(27.99%->37.81% vs
+    27.91%->28.07%)를 보였던 게 "tool-call schema 구조" 때문인지 "raw pixel 좌표
+    표현" 때문인지 분리하기 위한 실험용 함수. C가 B와 비슷하면 schema는 무관하고
+    좌표 표현(0~1000 vs raw pixel)이 원인, C가 A와 비슷하면 schema 자체가 원인이라는
+    뜻이 된다.
+    """
+    raw_zoomed_img = Image.open(io.BytesIO(zoomed_img_bytes))
+
+    resized_h, resized_w = smart_resize(
+        raw_zoomed_img.height, raw_zoomed_img.width, min_pixels=min_pixels, max_pixels=max_pixels
+    )
+    zoomed_img = raw_zoomed_img.resize((resized_w, resized_h))
+    extra_zoom_x = resized_w / raw_zoomed_img.width
+    extra_zoom_y = resized_h / raw_zoomed_img.height
+    zoom_x = zoom_x * extra_zoom_x
+    zoom_y = zoom_y * extra_zoom_y
+
+    tool = ComputerUseTool(resized_w, resized_h, coord_mode="norm1000")
+    prompt_text = (
+        f'For this zoomed-in screenshot, identify the precise point that best matches the '
+        f'instruction: "{instruction}", by calling the computer_use function with a '
+        f'left_click action.'
+    )
+    messages = build_grounding_messages(instruction, zoomed_img, tool, prompt_text=prompt_text)
+
+    response = _generate_with_sampling(
+        qwen_model,
+        messages,
+        max_new_tokens=128,
+        temperature=temperature,
+        top_p=top_p,
+        step_name=f"next_action_regionfocus_toolcall_norm1000(idx={index})",
+    )
+
+    if debug_text:
+        dump_prompt_debug(
+            messages, response, task_id=task_id,
+            step_name="next_action_regionfocus_toolcall_norm1000", index=index,
+        )
+
+    tool_call = parse_tool_call(response)
+    if not tool_call:
+        return None, response
+    coord = (tool_call.get("arguments") or {}).get("coordinate")
+    if not isinstance(coord, (list, tuple)) or len(coord) != 2:
+        return None, response
+    try:
+        nx, ny = float(coord[0]), float(coord[1])
+    except (TypeError, ValueError):
+        return None, response
+
+    # 여기서부터는 next_action_regionfocus()와 동일한 역투영 로직 - 차이는 오직
+    # "0~1000 정규화 좌표를 모델이 실제로 본 이미지(resized_w x resized_h) 기준
+    # 픽셀좌표로 변환"하는 첫 두 줄뿐 (old raw-pixel 버전은 이 변환 없이 coordinate를
+    # 그대로 픽셀좌표로 씀).
+    x_upsampled = round(nx / 1000 * resized_w)
+    y_upsampled = round(ny / 1000 * resized_h)
+
+    zoomed_width_calc = w * zoom_x
+    zoomed_height_calc = h * zoom_y
+
+    if 0 <= x_upsampled < zoomed_width_calc and 0 <= y_upsampled < zoomed_height_calc:
+        x_orig = left + (x_upsampled / zoom_x)
+        y_orig = top + (y_upsampled / zoom_y)
+    else:
+        clamped_x = max(0, min(zoomed_width_calc - 1, x_upsampled))
+        clamped_y = max(0, min(zoomed_height_calc - 1, y_upsampled))
+        x_orig = left + (clamped_x / zoom_x)
+        y_orig = top + (clamped_y / zoom_y)
+
+    if isinstance(original_image, Image.Image):
+        img_width, img_height = original_image.size
+    else:
+        img_height, img_width = original_image.shape[:2]
+
+    x_orig = max(0, min(x_orig, img_width - 1))
+    y_orig = max(0, min(y_orig, img_height - 1))
+
+    projected_point = (round(x_orig), round(y_orig))
+
+    if debug_image:
+        debug_dir = f"./debug/{task_id}" if task_id else "./debug"
+        os.makedirs(debug_dir, exist_ok=True)
+
+        original_pil = (
+            original_image.copy()
+            if isinstance(original_image, Image.Image)
+            else Image.fromarray(original_image).copy()
+        )
+
+        zoomed_debug = plot_points_on_image(
+            zoomed_img, [(x_upsampled, y_upsampled)], colors=[(255, 0, 255)], markers=["star"], sizes=[15]
+        )
+        original_debug = plot_points_on_image(
+            original_pil, [projected_point], colors=[(255, 0, 255)], markers=["star"], sizes=[15]
+        )
+
+        zoomed_debug.save(os.path.join(debug_dir, f"RegionFocus_upsampled_{index}.png"))
+        original_debug.save(os.path.join(debug_dir, f"RegionFocus_unprojected_{index}.png"))
+
+    return projected_point, response
+
+
+def next_action_regionfocus_toolcall_pixel(
+    qwen_model,
+    instruction,
+    zoomed_img_bytes,
+    left,
+    top,
+    zoom_x,
+    zoom_y,
+    offset_w,  # vestigial: crop_and_upsample() 참고 - 실제로 아래 로직에서 안 씀
+    offset_h,  # vestigial: 위와 동일
+    w,
+    h,
+    original_image,
+    debug_image=False,
+    debug_text=False,
+    task_id=None,
+    index=None,
+    temperature=0.0,
+    top_p=1.0,
+    min_pixels=DEFAULT_MIN_PIXELS,
+    max_pixels=DEFAULT_MAX_PIXELS,
+):
+    """
+    [Step4 - old 프롬프트 그대로] bak/region_focus.py의 원래(수정 전)
+    next_action_regionfocus()를 그대로 이식한 버전. tool-call 스키마, coordinate
+    description("픽셀 좌표"), 좌표 처리(0~1000 변환 없이 tool_call의 coordinate를
+    그대로 x_upsampled/y_upsampled로 사용) 전부 old와 100% 동일. 유일한 차이는
+    _generate_with_sampling()이 원래도 명시적 do_sample 제어를 갖고 있었으므로
+    (이 부분은 old/new 모두 동일 - Step1과 달리 Step4는 애초에 결정성 버그가 없었음)
+    실질적으로 old의 next_action_regionfocus()와 완전히 동일한 함수다.
+
+    ground_toolcall_pixel()(Step1)과 짝을 이뤄 "old 스키마+old 좌표표현" 조합을
+    양쪽 step 모두에서 재현하기 위한 컨트롤 실험용.
+    """
+    raw_zoomed_img = Image.open(io.BytesIO(zoomed_img_bytes))
+
+    resized_h, resized_w = smart_resize(
+        raw_zoomed_img.height, raw_zoomed_img.width, min_pixels=min_pixels, max_pixels=max_pixels
+    )
+    zoomed_img = raw_zoomed_img.resize((resized_w, resized_h))
+    extra_zoom_x = resized_w / raw_zoomed_img.width
+    extra_zoom_y = resized_h / raw_zoomed_img.height
+    zoom_x = zoom_x * extra_zoom_x
+    zoom_y = zoom_y * extra_zoom_y
+
+    tool = ComputerUseTool(display_width_px=resized_w, display_height_px=resized_h)
+    prompt_text = (
+        f"For this zoomed-in screenshot, identify the precise point that best matches "
+        f'the instruction: "{instruction}", by calling the computer_use function with a '
+        f"left_click action."
+    )
+    messages = build_grounding_messages(instruction, zoomed_img, tool, prompt_text=prompt_text)
+
+    response = _generate_with_sampling(
+        qwen_model,
+        messages,
+        max_new_tokens=128,
+        temperature=temperature,
+        top_p=top_p,
+        step_name=f"next_action_regionfocus_toolcall_pixel(idx={index})",
+    )
+
+    if debug_text:
+        dump_prompt_debug(
+            messages, response, task_id=task_id, step_name="next_action_regionfocus_toolcall_pixel", index=index,
+        )
+
+    tool_call = parse_tool_call(response)
+    if tool_call is None:
+        return None, response
+
+    try:
+        click_point = tool_call["arguments"]["coordinate"]
+    except (KeyError, TypeError, ValueError):
+        return None, response
+
+    x_upsampled, y_upsampled = click_point
+    x_upsampled, y_upsampled = round(x_upsampled), round(y_upsampled)
+
+    zoomed_width_calc = w * zoom_x
+    zoomed_height_calc = h * zoom_y
+
+    if 0 <= x_upsampled < zoomed_width_calc and 0 <= y_upsampled < zoomed_height_calc:
+        x_orig = left + (x_upsampled / zoom_x)
+        y_orig = top + (y_upsampled / zoom_y)
+    else:
+        clamped_x = max(0, min(zoomed_width_calc - 1, x_upsampled))
+        clamped_y = max(0, min(zoomed_height_calc - 1, y_upsampled))
+        x_orig = left + (clamped_x / zoom_x)
+        y_orig = top + (clamped_y / zoom_y)
+
+    if isinstance(original_image, Image.Image):
+        img_width, img_height = original_image.size
+    else:
+        img_height, img_width = original_image.shape[:2]
+
+    x_orig = max(0, min(x_orig, img_width - 1))
+    y_orig = max(0, min(y_orig, img_height - 1))
+
+    projected_point = (round(x_orig), round(y_orig))
+
+    if debug_image:
+        debug_dir = f"./debug/{task_id}" if task_id else "./debug"
+        os.makedirs(debug_dir, exist_ok=True)
+
+        original_pil = (
+            original_image.copy()
+            if isinstance(original_image, Image.Image)
+            else Image.fromarray(original_image).copy()
+        )
+
+        zoomed_debug = plot_points_on_image(
+            zoomed_img, [(x_upsampled, y_upsampled)], colors=[(255, 0, 255)], markers=["star"], sizes=[15]
+        )
+        original_debug = plot_points_on_image(
+            original_pil, [projected_point], colors=[(255, 0, 255)], markers=["star"], sizes=[15]
+        )
+
+        zoomed_debug.save(os.path.join(debug_dir, f"RegionFocus_upsampled_{index}.png"))
+        original_debug.save(os.path.join(debug_dir, f"RegionFocus_unprojected_{index}.png"))
+
+    return projected_point, response
+
+
 def next_action_regionfocus_aggregation(
     qwen_model, instruction, image, points, debug_image=False, debug_text=False, task_id=None
 ):
@@ -767,6 +1050,8 @@ def ground_with_regionfocus(
     qwen_model, instruction, image,
     debug_image=False, debug_text=False, debug_mode="always", task_id=None,
     min_pixels=DEFAULT_MIN_PIXELS, max_pixels=DEFAULT_MAX_PIXELS,
+    step4_format="point_text",
+    step1_format="point_text",
 ) -> dict:
     """
     베이스라인 Qwen25VLModel.ground_with_regionfocus()의 로컬 모델 버전 (순수, zoom 없음).
@@ -782,7 +1067,21 @@ def ground_with_regionfocus(
     (judge_inference 함수 docstring). 단, Step 1(초기 grounding)의 프롬프트 텍스트 덤프는
     judge 판정 전에 실행되는 단계라 debug_mode와 무관하게 debug_text가 켜져 있으면 항상
     저장된다 (파일 하나짜리라 용량 부담이 거의 없어서 이 부분만 예외로 뒀다).
+
+    step4_format / step1_format: "point_text"(기본) | "toolcall_norm1000" | "toolcall_pixel".
+    각각 Step4(crop/zoom 후 좌표 재추출) / Step1(초기 grounding)에서만 쓰는 좌표
+    요청 방식을 바꾼다. 나머지 step(2/3/5)은 이 값들과 무관하게 항상 기존 방식
+    (자유 텍스트 판정/point_text) 그대로.
+        point_text        : 기본, LoRA 학습 포맷 그대로.
+        toolcall_norm1000 : old tool-call schema + 0~1000 정규화 좌표 (schema만 old화).
+        toolcall_pixel     : old 프롬프트 100% 그대로(description도 raw pixel, 좌표
+                              변환도 0~1000 없이 그대로) - do_sample만 결정적으로 고정.
+    자세한 설명은 next_action_regionfocus_toolcall_norm1000()/_toolcall_pixel(),
+    ground_toolcall_norm1000()/_toolcall_pixel() docstring 참고.
     """
+    _valid_formats = ("point_text", "toolcall_norm1000", "toolcall_pixel")
+    assert step4_format in _valid_formats, f"unknown step4_format: {step4_format}"
+    assert step1_format in _valid_formats, f"unknown step1_format: {step1_format}"
     debug_dir = f"./debug/{task_id}" if task_id else "./debug"
     if debug_image or debug_text:
         os.makedirs(debug_dir, exist_ok=True)
@@ -796,7 +1095,12 @@ def ground_with_regionfocus(
 
     # Step 1: 초기 grounding (local_ground와 동일한 smart_resize 기준으로 원본 크기 재계산)
     _log("Step 1/5: 초기 grounding 시작")
-    initial_result = local_ground(
+    step1_fn = {
+        "point_text": local_ground,
+        "toolcall_norm1000": local_ground_toolcall_norm1000,
+        "toolcall_pixel": local_ground_toolcall_pixel,
+    }[step1_format]
+    initial_result = step1_fn(
         qwen_model, instruction, pil_image, min_pixels=min_pixels, max_pixels=max_pixels,
         debug_text=debug_text, task_id=task_id,
     )
@@ -870,7 +1174,12 @@ def ground_with_regionfocus(
             (left, top, w, h), original_image, keep_aspect_ratio=True,
             debug_image=debug_image, task_id=task_id, index=i,
         )
-        action_point, action_response = next_action_regionfocus(
+        step4_fn = {
+            "point_text": next_action_regionfocus,
+            "toolcall_norm1000": next_action_regionfocus_toolcall_norm1000,
+            "toolcall_pixel": next_action_regionfocus_toolcall_pixel,
+        }[step4_format]
+        action_point, action_response = step4_fn(
             qwen_model,
             instruction,
             zoomed_bytes,
@@ -959,6 +1268,15 @@ def _cli():
     ap.add_argument("--debug_mode", choices=["always", "incorrect"], default="always",
                     help="always: 판정과 무관하게 항상 저장 / incorrect: judge가 오답으로 판단한 "
                          "샘플만 저장 (정답 조기종료 샘플은 스킵)")
+    ap.add_argument("--step4_format", choices=["point_text", "toolcall_norm1000", "toolcall_pixel"],
+                    default="point_text",
+                    help="point_text: 기본(학습 포맷 그대로) / toolcall_norm1000: old tool-call "
+                         "schema + 0~1000 정규화 좌표 / toolcall_pixel: old 프롬프트 그대로(raw pixel)")
+    ap.add_argument("--step1_format", choices=["point_text", "toolcall_norm1000", "toolcall_pixel"],
+                    default="point_text",
+                    help="point_text: 기본(학습 포맷 그대로) / toolcall_norm1000: old tool-call "
+                         "schema + 0~1000 정규화 좌표 / toolcall_pixel: old 프롬프트 그대로(raw pixel). "
+                         "--step4_format과 독립적으로 켤 수 있음")
     ap.add_argument("--task_id", default="demo")
     args = ap.parse_args()
 
@@ -976,6 +1294,7 @@ def _cli():
         model, args.instruction, args.image,
         debug_image=args.debug_image, debug_text=args.debug_text, debug_mode=args.debug_mode,
         task_id=args.task_id, min_pixels=args.min_pixels, max_pixels=args.max_pixels,
+        step4_format=args.step4_format, step1_format=args.step1_format,
     )
     print(result)
 
