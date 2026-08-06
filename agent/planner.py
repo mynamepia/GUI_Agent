@@ -1,0 +1,597 @@
+"""
+planner.py
+
+에이전트가 "다음에 뭘 할지" 결정하는 planner. base Qwen2.5-VL(grounding LoRA 없음)을
+ReAct 스타일로 프롬프팅해서, 태스크 지시문 + 현재 스크린샷 + 지금까지의 행동 히스토리를
+보고 다음 액션을 JSON으로 뽑는다.
+
+[grounding LoRA와 이 planner의 관계 - 중요]
+이 파일은 "어디를 클릭할지 좌표"를 내놓지 않는다. 클릭류 액션은 target_description(자연어로
+뭘 클릭할지 설명)만 내놓고, 그 설명을 실제 픽셀 좌표로 바꾸는 건
+gui_grounding.ground_with_regionfocus()(grounding LoRA 담당)의 몫이다. 이 파일 혼자로는
+바로 실행 가능한 액션이 안 나온다 - target_description을 grounding에 넘겨서 좌표를 받아온
+다음, env_webvoyager.WebVoyagerEnv.execute_action()이 기대하는 형태(coordinate 필드)로
+합치는 건 agent_loop.py의 몫(다음 단계, 아직 없음).
+
+[모델 로딩 방식]
+지금은 base 모델(LoRA 없음)로만 planning한다 - grounding LoRA는 이 planning 프롬프트
+포맷(JSON, target_description 등)을 학습에서 본 적이 없어서 오히려 방해가 될 수 있음.
+LoRA 어댑터 스왑(planning ↔ grounding)으로 하나의 backbone만 로드해서 쓰는 통합은
+agent_loop.py 단계에서 처리하기로 함(verifier/model.py 문서에 적어둔 멀티 어댑터
+스왑 계획과 같은 방향).
+
+[테스트 대상: WebVoyager]
+MiniWob(utterance/fields로 태스크가 구조화돼 나옴)이 아니라 WebVoyager(자유 텍스트
+지시문, 실제 사이트)를 기준으로 프롬프트를 짰다 - few-shot 예시도 웹 탐색 시나리오로
+만들었다. 소형 모델(3B) planning은 순수 프롬프팅만으론 약할 수 있다는 게 문헌에서
+반복적으로 확인되는 부분이라(UI-TARS/Lumos/Agent Distillation 등 참고), 실제로 돌려보고
+실패 패턴을 구체적으로 기록해두는 게 중요함 - 안 되면 다음 단계는 Lumos/Agent
+Distillation처럼 별도 planner LoRA를 소규모 trajectory로 파인튜닝하는 것.
+
+[출력 스키마 - gui_grounding.ComputerUseTool과 다름, "좌표" 대신 "자연어 타겟 설명"]
+{
+  "reasoning": "<왜 이 액션을 골랐는지 - action보다 먼저 쓰게 강제해서, 결론부터 내리고
+                사후정당화하는 대신 근거를 먼저 풀게 유도함. region_focus.judge_inference()의
+                reason-then-ans 트릭과 동일한 원칙>",
+  "action": "left_click" | "double_click" | "right_click" | "type" | "key" | "scroll" | "wait" | "terminate",
+  "target_description": "<click류일 때만 - 화면에서 뭘 클릭할지 자연어 설명. 좌표 아님!>",
+  "text": "<type/key/scroll일 때만 - 입력할 텍스트 / 키 이름 / 스크롤 방향("up"|"down")>",
+  "status": "success" | "failure",   # terminate일 때만
+  "answer": "<질문형 태스크의 최종 답변, 있으면>"  # terminate일 때만
+}
+
+[self-consistency 관련 메모]
+plan_next_action()은 temperature 파라미터를 받지만 내부에서 여러 번 샘플링하지는 않는다
+(region_focus()가 temperature를 받되 재시도는 호출부가 담당하는 것과 같은 설계). 나중에
+Agent Distillation 논문에서 언급된 "여러 번 샘플링 + 다수결"로 소형 모델의 노이즈를
+완화하고 싶으면, agent_loop.py 쪽에서 이 함수를 여러 번 호출해서 다수결을 취하면 된다.
+
+[plan_with_reflection() - 실행 전 planner<->reflection 비평 루프]
+관찰된 실패(할루시네이션으로 인한 조기 termination)에 대응하려고 추가. WorldGUI-Agent
+논문의 Planner-Critic/Pre-Action Validation 구조, Self-Refine/Reflexion류의 반복적
+자기비판 원리를 실행 "전" 단계에 적용한 것. 설계 원칙 두 가지:
+  1. reflection도 반드시 이미지를 봐야 함 - 이번 실패가 "화면 상태에 대한 잘못된 주장"이라서,
+     텍스트(reasoning)만 보는 reflection은 애초에 그 주장이 맞는지 검증할 방법이 없음.
+  2. 다만 같은 모델/같은 vision encoder가 같은 이미지를 다시 봐도 똑같이 잘못 읽을 위험
+     (Self-Correction Mirage)이 있어서, 두 가지로 완화함: (a) reflection이 planner의 주장을
+     그대로 확인하는 게 아니라 이미지를 보고 독립적으로 "지금 뭐가 보이는지"부터 먼저 서술하게
+     강제(_REFLECTION_SYSTEM_PROMPT의 observation 필드) 한 뒤에 그걸 candidate plan과
+     대조시킴, (b) reflection 호출의 temperature를 planner보다 높게 줘서 동일한 샘플링
+     경로를 그대로 반복할 확률을 낮춤.
+승인 안 되면 critique를 planner에게 다시 넣어서(revision_context) 재시도, max_iterations
+번 반복해도 승인이 안 나면 마지막 후보를 그대로 반환하되 `_reflection_approved: False`로
+플래그만 남김(무한루프 방지 + 조용히 막지 않고 호출부가 판단하게 하는 기존 폴백 원칙과 동일).
+max_iterations 기본값은 2("1차 시도 + 반려시 1번만 수정 재시도") - agent_loop.py에서 스텝마다
+이 루프를 그대로 쓸 예정이라 여기서 기본값을 정해두되 인자로 override 가능하게 열어둠.
+
+[reflection 프롬프트 강화 - 1차 버전에서 빠졌던 것들]
+1차 버전은 "모순이 있으면 반려"라는 수동적 비교 위주였고, terminate/click에만 명시적
+반려 기준이 있었음. 강화하면서 추가한 것: (1) type/key/scroll에도 액션별 반려 기준 추가,
+(2) click 기준을 "화면에 그럴듯하게 존재"에서 "정확히 하나로 식별 가능"으로 강화,
+(3) history를 보고 "방금 실패한 것과 같은 액션 반복"을 반려 신호로 체크하도록 추가,
+(4) "이 액션이 틀렸을 이유를 최소 하나 찾아보라"(possible_failure_reason 필드)는 능동적
+devil's-advocate 프레이밍 추가 - "reasoning이 그럴듯해 보이면 통과"가 아니라 "스크린샷만이
+증거"라는 원칙을 시스템 프롬프트 서두에 명시.
+"""
+
+from __future__ import annotations  # 아래 QwenVLModel 타입 힌트를 lazy하게 만들어 런타임 임포트 회피
+
+import json
+import re
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    # 실행에는 필요 없고 타입 힌트용 - qwen.py(torch/transformers 등 무거운 의존성)를
+    # 이 selftest 경로에서까지 강제로 임포트하지 않기 위해 TYPE_CHECKING 가드로 묶어둠.
+    from qwen import QwenVLModel
+
+_ACTIONS = ("left_click", "double_click", "right_click", "type", "key", "scroll", "wait", "terminate")
+
+_FEWSHOT = """
+Example:
+Task: "Find the price of the cheapest flight from Seoul to Tokyo next Monday on Google Flights."
+History:
+  Step 1: left_click on "the departure city input box" -> typed "Seoul"
+  Step 2: left_click on "the destination city input box" -> typed "Tokyo"
+Current screenshot shows a search results page with a list of flights and prices.
+{"reasoning": "The search results are visible and I can see the lowest price listed at the top of the sorted list.", "action": "terminate", "status": "success", "answer": "The cheapest flight is $210."}
+""".strip()
+
+_SYSTEM_PROMPT = f"""You are a web browsing agent. You are given an overall task, the current
+screenshot of the browser, and a history of actions you have already taken. Decide the single
+next action to make progress toward completing the task.
+
+Available actions: {", ".join(_ACTIONS)}
+- left_click / double_click / right_click: needs "target_description" (a short natural-language
+  description of the UI element to interact with, NOT coordinates - e.g. "the search button" or
+  "the first result link").
+- type: needs "text" (the string to type into the currently focused input).
+- key: needs "text" (a key name, e.g. "Enter", "Tab", "Escape").
+- scroll: needs "text" ("up" or "down").
+- wait: no extra fields needed (use sparingly, only if the page seems to be loading).
+- terminate: use this when the task is complete or you are stuck. Needs "status" ("success" or
+  "failure") and, if the task asked a question, "answer" with your final answer text.
+
+{_FEWSHOT}
+
+Reply with ONLY a single JSON object with these fields (omit fields that don't apply to your
+chosen action): {{"reasoning": "...", "action": "...", "target_description": "...", "text": "...",
+"status": "...", "answer": "..."}}
+Think through your reasoning first, then decide the action - write "reasoning" before "action" in
+your JSON.
+"""
+
+_REFLECTION_SYSTEM_PROMPT = """You are a skeptical, adversarial reviewer checking another agent's
+proposed next action before it is executed on a real website. Default to assuming the proposer is
+wrong until your own inspection of the screenshot convinces you otherwise - do not give it the
+benefit of the doubt just because its reasoning sounds coherent. Coherent-sounding reasoning is not
+evidence; only the screenshot is evidence.
+
+You are given the overall task, the current screenshot, the action history so far, and the
+proposed action (with its stated reasoning).
+
+Your job, in order:
+1. Independently describe what you actually observe in the screenshot that is relevant to the
+   task - do this BEFORE looking at whether the proposed action agrees with it. Do not simply
+   restate the proposer's reasoning; look at the image yourself and name concrete elements you
+   actually see (not vague descriptions like "the page looks fine").
+2. Before judging, actively try to find at least one concrete reason the proposed action could be
+   wrong. State it even if you end up approving anyway - if you genuinely cannot find any plausible
+   failure reason after looking, say so explicitly rather than skipping this step.
+3. Check the action history for repetition: if the proposed action is the same as, or very similar
+   to (same target/text/key), an action already attempted recently, treat this as a strong signal
+   to reject - repeating an action that didn't already finish the task rarely produces a different
+   result the second time.
+4. Apply these action-specific checks:
+   - terminate: reject unless your own observation clearly and independently confirms the claimed
+     status/answer. A plausible-sounding claim by itself is not enough - you must be able to point
+     to something specific you see that confirms it.
+   - left_click / double_click / right_click: reject unless target_description maps to exactly one
+     clearly identifiable element in your observation. If it's ambiguous (could match more than one
+     element) or you cannot locate it at all, reject.
+   - type: reject unless your observation shows a text input area that is actually focused/active
+     and appropriate for this text.
+   - key: reject if the key press assumes a UI state (a focused field, an open menu, etc.) that is
+     not visible in your observation.
+   - scroll: reject if the content the reasoning is looking for already appears fully visible in
+     the current screenshot, or if the scroll direction doesn't match where the reasoning says that
+     content should be.
+   - wait: approve only if there is a visible sign of loading/transition (spinner, blank or
+     partially-rendered page); reject if the page already looks fully loaded and static.
+
+When in doubt, reject - a false rejection just costs one extra planning step, but a false approval
+executes a wrong action on a real website.
+
+Reply with ONLY a single JSON object: {"observation": "<what you see, written before judging>",
+"possible_failure_reason": "<at least one concrete reason this action could be wrong, even if you
+approve anyway>", "approved": true or false, "critique": "<if not approved, a specific, actionable
+reason the proposer can use to revise - otherwise empty string>"}
+"""
+
+
+def _format_history(history_actions, max_items=8):
+    """
+    과거 액션들을 텍스트로 요약. 컨텍스트/연산량을 아끼려고 과거 스크린샷은 다시 안 넣고
+    텍스트 요약만 준다 - 3B 모델 + 16GB 환경에서 매 스텝마다 이미지를 계속 누적해서
+    프롬프트에 넣으면 금방 무거워짐. 최근 max_items개만 남기고 그 이전은 생략 문구로 처리.
+    """
+    if not history_actions:
+        return "(no actions taken yet)"
+    shown = history_actions[-max_items:]
+    lines = []
+    if len(history_actions) > max_items:
+        lines.append(f"...({len(history_actions) - max_items}개 이전 스텝 생략)")
+    start_idx = len(history_actions) - len(shown) + 1
+    for i, a in enumerate(shown, start=start_idx):
+        act = a.get("action")
+        if act in ("left_click", "double_click", "right_click"):
+            desc = f'{act} on "{a.get("target_description", "?")}"'
+        elif act == "type":
+            desc = f'type "{a.get("text", "")}"'
+        elif act == "key":
+            desc = f'press key "{a.get("text", "")}"'
+        elif act == "scroll":
+            desc = f'scroll {a.get("text", "down")}'
+        elif act == "wait":
+            desc = "wait"
+        else:
+            desc = str(act)
+        lines.append(f"Step {i}: {desc}")
+    return "\n".join(lines)
+
+
+def _parse_planner_action(response_text: str):
+    """
+    region_focus._parse_judge_verdict()와 같은 원칙: JSON 우선 파싱, action이 알려진
+    값이 아니거나 파싱 자체가 실패하면 안전한 기본값(terminate/failure)으로 폴백해서
+    조용히 잘못된 액션이 실행되는 걸 막는다.
+    """
+    match = re.search(r"\{.*\}", response_text, re.DOTALL)
+    if match:
+        try:
+            obj = json.loads(match.group(0))
+            if obj.get("action") in _ACTIONS:
+                return obj
+        except (json.JSONDecodeError, AttributeError):
+            pass
+    return {
+        "reasoning": "(파싱 실패 또는 알 수 없는 action - 안전하게 종료 처리)",
+        "action": "terminate",
+        "status": "failure",
+        "answer": None,
+        "_parse_failed": True,
+        "_raw_response": response_text,
+    }
+
+
+def _format_candidate_plan(plan: dict) -> str:
+    """reflection 프롬프트에 넣을 후보 plan 요약. plan_next_action()의 출력 스키마를 그대로 받는다."""
+    parts = [f'action: {plan.get("action")}']
+    if plan.get("target_description"):
+        parts.append(f'target_description: "{plan.get("target_description")}"')
+    if plan.get("text") is not None and plan.get("text") != "":
+        parts.append(f'text: "{plan.get("text")}"')
+    if plan.get("action") == "terminate":
+        parts.append(f'status: {plan.get("status")}')
+        if plan.get("answer"):
+            parts.append(f'answer: "{plan.get("answer")}"')
+    parts.append(f'reasoning given by proposer: "{plan.get("reasoning", "")}"')
+    return "\n".join(parts)
+
+
+def _parse_reflection_verdict(response_text: str) -> dict:
+    """
+    _parse_planner_action()과 같은 원칙(JSON 우선, 실패시 안전한 기본값)이되, 여기서는
+    "안전한 기본값"이 approved=False임 - 파싱이 안 되거나 애매하면 일단 반려시키고
+    재시도 한 번을 더 태우는 게, 애매한 걸 그냥 승인해서 실행해버리는 것보다 안전함.
+    """
+    match = re.search(r"\{.*\}", response_text, re.DOTALL)
+    if match:
+        try:
+            obj = json.loads(match.group(0))
+            if isinstance(obj.get("approved"), bool):
+                obj.setdefault("observation", "")
+                obj.setdefault("possible_failure_reason", "")
+                obj.setdefault("critique", "")
+                return obj
+        except (json.JSONDecodeError, AttributeError):
+            pass
+    return {
+        "observation": "",
+        "possible_failure_reason": "",
+        "approved": False,
+        "critique": "(reflection 응답 파싱 실패 - 안전하게 반려 처리)",
+        "_parse_failed": True,
+        "_raw_response": response_text,
+    }
+
+
+def plan_next_action(
+    qwen_model: QwenVLModel,
+    task_instruction: str,
+    screenshot,
+    history_actions: list | None = None,
+    max_new_tokens: int = 300,
+    temperature: float = 0.0,
+    revision_context: dict | None = None,
+) -> dict:
+    """
+    다음 액션을 결정한다.
+
+    Args:
+        qwen_model: base 모델(LoRA 없음) 인스턴스. agent_loop.py가 나중에 어댑터를
+            스왑해서 넘길 수도 있지만, 지금은 항상 base로만 씀.
+        task_instruction: 전체 태스크 지시문 (WebVoyager의 "ques" 필드).
+        screenshot: 현재 화면 (PIL.Image).
+        history_actions: 지금까지 이 함수가 반환했던 action dict들의 리스트(호출부가 누적).
+        revision_context: plan_with_reflection()이 반려된 후보를 재시도시킬 때만 씀.
+            {"previous_plan": <이전 후보 dict>, "critique": "<reflection이 준 반려 사유>"}
+            형태. None이면(기본) 첫 시도와 동일하게 동작.
+
+    Returns: 파일 상단 docstring의 출력 스키마를 따르는 dict. 파싱 실패시 안전하게
+        {"action": "terminate", "status": "failure", ...}를 반환한다.
+    """
+    history_text = _format_history(history_actions or [])
+    user_text = (
+        f'Task: "{task_instruction}"\n\n'
+        f"History:\n{history_text}\n\n"
+        "The attached image is the current screenshot. What is the next action?"
+    )
+    if revision_context:
+        prev = _format_candidate_plan(revision_context["previous_plan"])
+        user_text += (
+            "\n\nYour previous proposed action was reviewed and REJECTED before execution:\n"
+            f"{prev}\n"
+            f'Reviewer critique: "{revision_context["critique"]}"\n'
+            "Reconsider the current screenshot and propose a revised action that addresses this "
+            "critique. Do not just repeat the same reasoning."
+        )
+    messages = [
+        {"role": "system", "content": [{"type": "text", "text": _SYSTEM_PROMPT}]},
+        {
+            "role": "user",
+            "content": [
+                {"type": "image", "image": screenshot},
+                {"type": "text", "text": user_text},
+            ],
+        },
+    ]
+    response = qwen_model.generate(messages, max_new_tokens=max_new_tokens, temperature=temperature)
+    return _parse_planner_action(response)
+
+
+def _reflect_on_plan(
+    qwen_model: QwenVLModel,
+    task_instruction: str,
+    screenshot,
+    history_actions: list | None,
+    candidate_plan: dict,
+    max_new_tokens: int = 250,
+    temperature: float = 0.4,
+) -> dict:
+    """
+    candidate_plan 하나를 실행 전에 비평한다. planner와 별개 호출(같은 backbone, 다른
+    system prompt) - _REFLECTION_SYSTEM_PROMPT가 "네 판단부터 독립적으로 써라"를 강제함.
+
+    Returns: {"observation": str, "approved": bool, "critique": str, ...}
+    """
+    history_text = _format_history(history_actions or [])
+    user_text = (
+        f'Task: "{task_instruction}"\n\n'
+        f"History:\n{history_text}\n\n"
+        "The attached image is the current screenshot.\n\n"
+        f"Proposed next action:\n{_format_candidate_plan(candidate_plan)}\n\n"
+        "Review this proposed action."
+    )
+    messages = [
+        {"role": "system", "content": [{"type": "text", "text": _REFLECTION_SYSTEM_PROMPT}]},
+        {
+            "role": "user",
+            "content": [
+                {"type": "image", "image": screenshot},
+                {"type": "text", "text": user_text},
+            ],
+        },
+    ]
+    response = qwen_model.generate(messages, max_new_tokens=max_new_tokens, temperature=temperature)
+    return _parse_reflection_verdict(response)
+
+
+def plan_with_reflection(
+    qwen_model: QwenVLModel,
+    task_instruction: str,
+    screenshot,
+    history_actions: list | None = None,
+    max_new_tokens: int = 300,
+    planner_temperature: float = 0.0,
+    reflection_temperature: float = 0.4,
+    max_iterations: int = 2,
+) -> dict:
+    """
+    plan_next_action() <-> _reflect_on_plan() 루프. 실행 전에 후보 액션을 reflection이
+    검토해서, 승인되면 그 액션을 반환하고 반려되면 critique를 planner에 되먹여 재시도한다.
+
+    max_iterations 기본값은 2 - agent_loop.py에서 스텝마다 이 루프를 돌릴 때 "1차 시도 +
+    반려시 1번만 수정 재시도"로 쓰기로 합의한 값. agent_loop.py 쪽에서 이 인자로 override
+    가능하니 이 파일에 하드코딩하지 않고 파라미터로 남겨둠.
+
+    max_iterations번 돌아도 승인이 안 나면 마지막 후보를 그대로 반환하되
+    `_reflection_approved: False`로 표시만 하고 강제로 막지는 않는다(호출부/agent_loop.py가
+    이 플래그를 보고 그냥 실행할지, 로그만 남기고 스킵할지 결정하게 함 - 이 파일이 임의로
+    "무한 반려 -> 그냥 종료" 정책까지 정해버리면 오히려 디버깅하기 더 어려워짐).
+
+    Returns: plan_next_action()과 같은 스키마 + 다음 필드 추가:
+        "_reflection_approved": bool
+        "_reflection_log": [{"iteration": int, "plan": dict, "verdict": dict}, ...]
+    """
+    log = []
+    candidate = None
+    verdict = None
+    for i in range(1, max_iterations + 1):
+        revision_context = None
+        if i > 1:
+            revision_context = {"previous_plan": candidate, "critique": verdict.get("critique", "")}
+        candidate = plan_next_action(
+            qwen_model,
+            task_instruction,
+            screenshot,
+            history_actions=history_actions,
+            max_new_tokens=max_new_tokens,
+            temperature=planner_temperature,
+            revision_context=revision_context,
+        )
+        # terminate/파싱실패 폴백은 이미 그 자체로 "안전 종료"라 reflection 없이 바로 통과시킴 -
+        # 애초에 reflection이 잡으려는 건 "그럴듯하게 성공했다고 우기는" 케이스지, 파싱
+        # 실패로 인한 명시적 실패 폴백이 아님.
+        if candidate.get("_parse_failed"):
+            candidate["_reflection_approved"] = False
+            candidate["_reflection_log"] = log
+            return candidate
+
+        verdict = _reflect_on_plan(
+            qwen_model,
+            task_instruction,
+            screenshot,
+            history_actions,
+            candidate,
+            temperature=reflection_temperature,
+        )
+        log.append({"iteration": i, "plan": candidate, "verdict": verdict})
+        if verdict.get("approved"):
+            candidate["_reflection_approved"] = True
+            candidate["_reflection_log"] = log
+            return candidate
+
+    candidate["_reflection_approved"] = False
+    candidate["_reflection_log"] = log
+    return candidate
+
+
+# ---------------------------------------------------------------------------
+# mock 기반 단위 테스트 (실제 모델 없이 프롬프트 조립/파싱 로직만 검증)
+# ---------------------------------------------------------------------------
+def _run_mock_selftest():
+    """`python planner.py --selftest`"""
+    from unittest.mock import MagicMock
+
+    from PIL import Image
+
+    checks = []
+
+    def check(name, cond):
+        checks.append((name, bool(cond)))
+
+    # _format_history
+    check("빈 히스토리", _format_history([]) == "(no actions taken yet)")
+    hist = [
+        {"action": "left_click", "target_description": "search box"},
+        {"action": "type", "text": "python"},
+    ]
+    formatted = _format_history(hist)
+    check("클릭 히스토리 포맷", 'left_click on "search box"' in formatted)
+    check("type 히스토리 포맷", 'type "python"' in formatted)
+
+    long_hist = [{"action": "wait"} for _ in range(12)]
+    formatted_long = _format_history(long_hist, max_items=8)
+    check("긴 히스토리 -> 생략 문구 포함", "생략" in formatted_long)
+    check("긴 히스토리 -> 최근 8개만 표시", formatted_long.count("Step") == 8)
+
+    # _parse_planner_action
+    good = _parse_planner_action('{"reasoning": "r", "action": "left_click", "target_description": "X"}')
+    check("정상 JSON 파싱", good["action"] == "left_click" and good["target_description"] == "X")
+
+    bad = _parse_planner_action("this is not json at all")
+    check("파싱 실패 -> terminate/failure 폴백", bad["action"] == "terminate" and bad["status"] == "failure")
+    check("파싱 실패 -> _parse_failed 플래그", bad.get("_parse_failed") is True)
+
+    unknown_action = _parse_planner_action('{"action": "fly_away"}')
+    check("모르는 action -> 폴백", unknown_action["action"] == "terminate")
+
+    # plan_next_action: 모델 generate()를 mock으로 대체해서 메시지 조립까지만 검증
+    fake_model = MagicMock()
+    fake_model.generate.return_value = '{"reasoning": "ok", "action": "wait"}'
+    result = plan_next_action(fake_model, "do something", Image.new("RGB", (4, 4)), history_actions=hist)
+    check("plan_next_action -> generate 호출됨", fake_model.generate.called)
+    check("plan_next_action -> 파싱된 action 반환", result["action"] == "wait")
+    call_messages = fake_model.generate.call_args[0][0]
+    check("system 메시지 포함", call_messages[0]["role"] == "system")
+    check("user 메시지에 이미지 포함", any(c.get("type") == "image" for c in call_messages[1]["content"]))
+    check(
+        "user 메시지에 task instruction 포함",
+        any("do something" in c.get("text", "") for c in call_messages[1]["content"] if c.get("type") == "text"),
+    )
+
+    # revision_context -> 프롬프트에 이전 후보/critique가 실제로 들어가는지
+    fake_model.reset_mock()
+    fake_model.generate.return_value = '{"reasoning": "revised", "action": "wait"}'
+    plan_next_action(
+        fake_model,
+        "do something",
+        Image.new("RGB", (4, 4)),
+        revision_context={
+            "previous_plan": {"action": "terminate", "status": "success", "reasoning": "looked done"},
+            "critique": "the close button is still visible, task is not done",
+        },
+    )
+    call_messages2 = fake_model.generate.call_args[0][0]
+    revised_user_text = next(
+        c["text"] for c in call_messages2[1]["content"] if c.get("type") == "text"
+    )
+    check("revision_context -> REJECTED 문구 포함", "REJECTED" in revised_user_text)
+    check("revision_context -> critique 내용 포함", "close button is still visible" in revised_user_text)
+
+    # _parse_reflection_verdict
+    good_verdict = _parse_reflection_verdict(
+        '{"observation": "close button visible", "approved": false, "critique": "not done yet"}'
+    )
+    check("reflection verdict 정상 파싱", good_verdict["approved"] is False and good_verdict["critique"] == "not done yet")
+
+    bad_verdict = _parse_reflection_verdict("not json")
+    check("reflection verdict 파싱 실패 -> approved=False 폴백", bad_verdict["approved"] is False)
+    check("reflection verdict 파싱 실패 -> _parse_failed 플래그", bad_verdict.get("_parse_failed") is True)
+
+    # _format_candidate_plan
+    fmt = _format_candidate_plan(
+        {"action": "terminate", "status": "success", "answer": "42", "reasoning": "done"}
+    )
+    check("candidate plan 포맷 -> action 포함", "action: terminate" in fmt)
+    check("candidate plan 포맷 -> status 포함", "status: success" in fmt)
+    check("candidate plan 포맷 -> answer 포함", 'answer: "42"' in fmt)
+
+    # plan_with_reflection: 1회차 반려 -> 2회차 승인 시나리오
+    seq_model = MagicMock()
+    seq_model.generate.side_effect = [
+        '{"reasoning": "seems closed already", "action": "terminate", "status": "success"}',  # 1차 plan
+        '{"observation": "a dialog is still open", "approved": false, "critique": "dialog still visible"}',  # 1차 reflect
+        '{"reasoning": "need to click close first", "action": "left_click", "target_description": "close button"}',  # 2차 plan(수정)
+        '{"observation": "close button visible", "approved": true, "critique": ""}',  # 2차 reflect
+    ]
+    result = plan_with_reflection(seq_model, "close the dialog", Image.new("RGB", (4, 4)), max_iterations=3)
+    check("plan_with_reflection -> 최종 승인", result["_reflection_approved"] is True)
+    check("plan_with_reflection -> 승인된 액션은 수정된 액션", result["action"] == "left_click")
+    check("plan_with_reflection -> 로그 2개(반려1+승인1)", len(result["_reflection_log"]) == 2)
+    check("plan_with_reflection -> generate 4번 호출(plan/reflect x2)", seq_model.generate.call_count == 4)
+
+    # plan_with_reflection: 계속 반려 -> max_iterations 소진 후 마지막 후보 그대로 반환
+    always_reject_model = MagicMock()
+    always_reject_model.generate.side_effect = [
+        '{"reasoning": "r1", "action": "wait"}',
+        '{"observation": "o1", "approved": false, "critique": "c1"}',
+        '{"reasoning": "r2", "action": "wait"}',
+        '{"observation": "o2", "approved": false, "critique": "c2"}',
+    ]
+    result2 = plan_with_reflection(always_reject_model, "task", Image.new("RGB", (4, 4)), max_iterations=2)
+    check("plan_with_reflection -> max_iterations 소진시 approved=False", result2["_reflection_approved"] is False)
+    check("plan_with_reflection -> max_iterations 소진시 마지막 후보 반환", result2["action"] == "wait")
+    check("plan_with_reflection -> 로그 길이 == max_iterations", len(result2["_reflection_log"]) == 2)
+
+    # plan_with_reflection: planner 자체가 파싱 실패로 즉시 종료 폴백을 내면 reflection 없이 바로 반환
+    parse_fail_model = MagicMock()
+    parse_fail_model.generate.return_value = "not json at all"
+    result3 = plan_with_reflection(parse_fail_model, "task", Image.new("RGB", (4, 4)), max_iterations=3)
+    check("plan_with_reflection -> planner 파싱실패시 reflection 스킵", parse_fail_model.generate.call_count == 1)
+    check("plan_with_reflection -> planner 파싱실패시 approved=False", result3["_reflection_approved"] is False)
+
+    n_fail = sum(1 for _, ok in checks if not ok)
+    for name, ok in checks:
+        print(("[OK]  " if ok else "[FAIL]") + " " + name)
+    print(f"\n{len(checks) - n_fail}/{len(checks)} passed")
+    if n_fail:
+        raise SystemExit(1)
+
+
+def _cli():
+    import argparse
+
+    from PIL import Image
+
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--image", help="스크린샷 이미지 경로 (수동 테스트용)")
+    ap.add_argument("--task", help="태스크 지시문")
+    ap.add_argument("--selftest", action="store_true", help="실제 모델 없이 프롬프트 조립/파싱 로직만 mock으로 검증")
+    ap.add_argument(
+        "--reflect", action="store_true", help="plan_next_action() 대신 plan_with_reflection() 사용 (실행 전 비평 루프)"
+    )
+    ap.add_argument("--max_iterations", type=int, default=2, help="--reflect일 때 최대 재시도 횟수 (agent_loop.py 기본값과 동일하게 2)")
+    args = ap.parse_args()
+
+    if args.selftest:
+        _run_mock_selftest()
+        return
+
+    if not args.image or not args.task:
+        raise SystemExit("--image와 --task 필요 (또는 --selftest)")
+
+    from qwen import QwenVLModel  # 실제 실행 시점에만 필요 (selftest는 이 임포트를 안 탐)
+
+    model = QwenVLModel()  # LoRA 없이 base 모델
+    screenshot = Image.open(args.image)
+    if args.reflect:
+        result = plan_with_reflection(model, args.task, screenshot, max_iterations=args.max_iterations)
+    else:
+        result = plan_next_action(model, args.task, screenshot)
+    print(json.dumps(result, ensure_ascii=False, indent=2))
+
+
+if __name__ == "__main__":
+    _cli()
