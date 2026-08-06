@@ -61,11 +61,34 @@ from PIL import Image, ImageDraw, ImageColor
 from transformers.models.qwen2_vl.image_processing_qwen2_vl_fast import smart_resize
 from qwen_vl_utils import process_vision_info
 
+
+# vlm_agent(coord_utils.py/qwen.py/gui_grounding.py/evaluation.py가 있는 폴더)를
+# sys.path에 넣는다 - 이 파일들이 hypo1/ 서브폴더로 옮겨진 뒤에도(또는 vlm_agent와
+# 나란히 있어도) PYTHONPATH를 손으로 안 잡아줘도 되게 하려는 것. verifier/ 스크립트들과
+# 동일한 패턴 - ../ (hypo1이 vlm_agent 바로 밑에 있는 경우) 또는 ../vlm_agent (hypo1이
+# vlm_agent와 형제 폴더인 경우) 둘 다 자동으로 찾는다.
+import os as _os
+import sys as _sys
+
+_HERE = _os.path.dirname(_os.path.abspath(__file__))
+_BASE_DIR = None
+for _candidate in (_os.path.join(_HERE, ".."), _os.path.join(_HERE, "..", "vlm_agent")):
+    _candidate = _os.path.abspath(_candidate)
+    if _os.path.isfile(_os.path.join(_candidate, "coord_utils.py")):
+        _BASE_DIR = _candidate
+        if _candidate not in _sys.path:
+            _sys.path.insert(0, _candidate)
+        break
+
 from qwen import QwenVLModel, DEFAULT_MIN_PIXELS, DEFAULT_MAX_PIXELS
 from gui_grounding import (
     build_point_prompt_messages,
     ground as local_ground,
+    ground_toolcall_pixel as local_ground_toolcall_pixel,
     dump_prompt_debug,
+    ComputerUseTool,
+    build_grounding_messages,
+    parse_tool_call,
 )
 from coord_utils import parse_point_from_text
 # 1) 상단 import에 추가
@@ -712,6 +735,129 @@ def next_action_regionfocus(
     return projected_point, response
 
 
+def next_action_regionfocus_toolcall_pixel(
+    qwen_model,
+    instruction,
+    zoomed_img_bytes,
+    left,
+    top,
+    zoom_x,
+    zoom_y,
+    offset_w,  # vestigial: crop_and_upsample() 참고 - 실제로 아래 로직에서 안 씀
+    offset_h,  # vestigial: 위와 동일
+    w,
+    h,
+    original_image,
+    debug_image=False,
+    debug_text=False,
+    task_id=None,
+    index=None,
+    temperature=0.0,
+    top_p=1.0,
+    min_pixels=DEFAULT_MIN_PIXELS,
+    max_pixels=DEFAULT_MAX_PIXELS,
+):
+    """
+    [Step4 - old 프롬프트 그대로] region_focus.py(메인 파이프라인)의
+    next_action_regionfocus_toolcall_pixel()을 그대로 이식한 버전 - tool-call 스키마,
+    coordinate description("픽셀 좌표"), 좌표 처리(0~1000 변환 없이 tool_call의
+    coordinate를 그대로 x_upsampled/y_upsampled로 사용) 전부 old와 100% 동일.
+
+    local_ground_toolcall_pixel()(Step1)과 짝을 이뤄 가설1(judge crop/zoom) 파이프라인
+    에서도 "old 스키마+old 좌표표현" 조합을 재현하기 위한 것 - region_focus.py에서
+    이미 검증된 결과(701k 해상도에서 F=37.81%를 넘어선 40.57%)를 가설1(judge FP율)
+    쪽에도 동일하게 적용해서 재검증하려는 목적.
+    """
+    raw_zoomed_img = Image.open(io.BytesIO(zoomed_img_bytes))
+
+    resized_h, resized_w = smart_resize(
+        raw_zoomed_img.height, raw_zoomed_img.width, min_pixels=min_pixels, max_pixels=max_pixels
+    )
+    zoomed_img = raw_zoomed_img.resize((resized_w, resized_h))
+    extra_zoom_x = resized_w / raw_zoomed_img.width
+    extra_zoom_y = resized_h / raw_zoomed_img.height
+    zoom_x = zoom_x * extra_zoom_x
+    zoom_y = zoom_y * extra_zoom_y
+
+    tool = ComputerUseTool(display_width_px=resized_w, display_height_px=resized_h)
+    prompt_text = (
+        f"For this zoomed-in screenshot, identify the precise point that best matches "
+        f'the instruction: "{instruction}", by calling the computer_use function with a '
+        f"left_click action."
+    )
+    messages = build_grounding_messages(instruction, zoomed_img, tool, prompt_text=prompt_text)
+
+    response = _generate_with_sampling(
+        qwen_model,
+        messages,
+        max_new_tokens=128,
+        temperature=temperature,
+        top_p=top_p,
+        step_name=f"next_action_regionfocus_toolcall_pixel(idx={index})",
+    )
+
+    if debug_text:
+        dump_prompt_debug(
+            messages, response, task_id=task_id, step_name="next_action_regionfocus_toolcall_pixel", index=index,
+        )
+
+    tool_call = parse_tool_call(response)
+    if tool_call is None:
+        return None, response
+
+    try:
+        click_point = tool_call["arguments"]["coordinate"]
+    except (KeyError, TypeError, ValueError):
+        return None, response
+
+    x_upsampled, y_upsampled = click_point
+    x_upsampled, y_upsampled = round(x_upsampled), round(y_upsampled)
+
+    zoomed_width_calc = w * zoom_x
+    zoomed_height_calc = h * zoom_y
+
+    if 0 <= x_upsampled < zoomed_width_calc and 0 <= y_upsampled < zoomed_height_calc:
+        x_orig = left + (x_upsampled / zoom_x)
+        y_orig = top + (y_upsampled / zoom_y)
+    else:
+        clamped_x = max(0, min(zoomed_width_calc - 1, x_upsampled))
+        clamped_y = max(0, min(zoomed_height_calc - 1, y_upsampled))
+        x_orig = left + (clamped_x / zoom_x)
+        y_orig = top + (clamped_y / zoom_y)
+
+    if isinstance(original_image, Image.Image):
+        img_width, img_height = original_image.size
+    else:
+        img_height, img_width = original_image.shape[:2]
+
+    x_orig = max(0, min(x_orig, img_width - 1))
+    y_orig = max(0, min(y_orig, img_height - 1))
+
+    projected_point = (round(x_orig), round(y_orig))
+
+    if debug_image:
+        debug_dir = f"./debug/{task_id}" if task_id else "./debug"
+        os.makedirs(debug_dir, exist_ok=True)
+
+        original_pil = (
+            original_image.copy()
+            if isinstance(original_image, Image.Image)
+            else Image.fromarray(original_image).copy()
+        )
+
+        zoomed_debug = plot_points_on_image(
+            zoomed_img, [(x_upsampled, y_upsampled)], colors=[(255, 0, 255)], markers=["star"], sizes=[15]
+        )
+        original_debug = plot_points_on_image(
+            original_pil, [projected_point], colors=[(255, 0, 255)], markers=["star"], sizes=[15]
+        )
+
+        zoomed_debug.save(os.path.join(debug_dir, f"RegionFocus_upsampled_{index}.png"))
+        original_debug.save(os.path.join(debug_dir, f"RegionFocus_unprojected_{index}.png"))
+
+    return projected_point, response
+
+
 def next_action_regionfocus_aggregation(
     qwen_model, instruction, image, points, debug_image=False, debug_text=False, task_id=None
 ):
@@ -799,6 +945,12 @@ def ground_with_regionfocus(
     use_zoom=True,      # <- 추가 (2026-08): False면 judge_inference가 ZoomClick crop/zoom
                         # 전처리 없이 원본 crop 없는 이미지로 판정 - "순수 RegionFocus"
                         # (가설1 이전 baseline과 동일 조건)를 이 파일 하나로 재현하기 위함.
+    step1_format="point_text",  # <- 추가 (2026-08): region_focus.py와 동일한 옵션.
+    step4_format="point_text",  # "point_text"(기본, LoRA 학습 포맷) | "toolcall_pixel"
+                                 # (old 프롬프트 그대로) - region_focus.py에서 700k 해상도로
+                                 # 재검증했을 때 toolcall_pixel이 더 잘 나왔던 것과 동일한
+                                 # 설정을 가설1(judge crop/zoom) 파이프라인에도 적용하기 위함.
+                                 # region_focus.py와 달리 norm1000은 여기선 지원 안 함(불필요).
 ) -> dict:
     """
     베이스라인 Qwen25VLModel.ground_with_regionfocus()의 로컬 모델 버전.
@@ -819,7 +971,15 @@ def ground_with_regionfocus(
     끄고 "순수 RegionFocus"(judge가 원본 이미지 그대로 보고 판정)로 동작한다 -
     LoRA eval / RegionFocus eval / RegionFocus+가설1 eval 세 가지를 전부 이 한 파일로
     돌리기 위한 스위치.
+
+    step1_format/step4_format: "point_text"(기본) | "toolcall_pixel". Step3(region_focus
+    재탐색)는 region_focus.py와 동일하게 이 옵션과 무관하게 항상 point_text로 고정 - 원본
+    파이프라인에서도 Step1/4만 옵션화하고 Step3은 안 건드렸던 선례를 그대로 따름.
     """
+    _valid_formats = ("point_text", "toolcall_pixel")
+    assert step1_format in _valid_formats, f"unknown step1_format: {step1_format}"
+    assert step4_format in _valid_formats, f"unknown step4_format: {step4_format}"
+
     debug_dir = f"./debug/{task_id}" if task_id else "./debug"
     if debug_image or debug_text:
         os.makedirs(debug_dir, exist_ok=True)
@@ -833,7 +993,8 @@ def ground_with_regionfocus(
 
     # Step 1: 초기 grounding (local_ground와 동일한 smart_resize 기준으로 원본 크기 재계산)
     _log("Step 1/5: 초기 grounding 시작")
-    initial_result = local_ground(
+    step1_fn = {"point_text": local_ground, "toolcall_pixel": local_ground_toolcall_pixel}[step1_format]
+    initial_result = step1_fn(
         qwen_model, instruction, pil_image, min_pixels=min_pixels, max_pixels=max_pixels,
         debug_text=debug_text, task_id=task_id,
     )
@@ -893,6 +1054,10 @@ def ground_with_regionfocus(
     zoomed_results = []
     ratio_list = [[0.5, 0.5], [0.3, 0.3], [0.4, 0.8], [0.8, 0.4]]
     point = region_points[0]
+    step4_fn = {
+        "point_text": next_action_regionfocus,
+        "toolcall_pixel": next_action_regionfocus_toolcall_pixel,
+    }[step4_format]
     for i, ratio in enumerate(ratio_list):
         _log(f"Step 4/5: crop/zoom {i+1}/{len(ratio_list)} (ratio={ratio}) 시작")
         left, top, w, h = calculate_crop_region(
@@ -908,7 +1073,7 @@ def ground_with_regionfocus(
             (left, top, w, h), original_image, keep_aspect_ratio=True,
             debug_image=debug_image, task_id=task_id, index=i,
         )
-        action_point, action_response = next_action_regionfocus(
+        action_point, action_response = step4_fn(
             qwen_model,
             instruction,
             zoomed_bytes,

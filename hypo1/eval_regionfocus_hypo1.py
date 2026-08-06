@@ -66,23 +66,33 @@ import time
 
 from tqdm import tqdm
 
+
+# vlm_agent(coord_utils.py/qwen.py/gui_grounding.py/evaluation.py가 있는 폴더)를
+# sys.path에 넣는다 - 이 파일들이 hypo1/ 서브폴더로 옮겨진 뒤에도(또는 vlm_agent와
+# 나란히 있어도) PYTHONPATH를 손으로 안 잡아줘도 되게 하려는 것. verifier/ 스크립트들과
+# 동일한 패턴 - ../ (hypo1이 vlm_agent 바로 밑에 있는 경우) 또는 ../vlm_agent (hypo1이
+# vlm_agent와 형제 폴더인 경우) 둘 다 자동으로 찾는다.
+import os as _os
+import sys as _sys
+
+_HERE = _os.path.dirname(_os.path.abspath(__file__))
+_BASE_DIR = None
+for _candidate in (_os.path.join(_HERE, ".."), _os.path.join(_HERE, "..", "vlm_agent")):
+    _candidate = _os.path.abspath(_candidate)
+    if _os.path.isfile(_os.path.join(_candidate, "coord_utils.py")):
+        _BASE_DIR = _candidate
+        if _candidate not in _sys.path:
+            _sys.path.insert(0, _candidate)
+        break
+
 from coord_utils import load_jsonl
-from evaluation import aggregate_metrics, format_report
+# _get_category/_get_platform/_get_dataset은 evaluation.py(grounding 평가, 루트 폴더)에
+# 이미 있는 걸 그대로 재사용 - "unknown" 폴백 로직을 두 군데서 따로 관리하지 않기 위함
+# (verifier/eval_verifier.py에서도 같은 이유로 이렇게 재사용하는 패턴을 씀).
+from evaluation import aggregate_metrics, format_report, _get_category, _get_platform, _get_dataset
 from qwen import QwenVLModel, DEFAULT_MIN_PIXELS, DEFAULT_MAX_PIXELS
-from region_focus_WJ import ground_with_regionfocus
-from gui_grounding import ground as local_ground
-
-
-def _get_category(rec):
-    return rec.get("category") or rec.get("element_type") or "unknown"
-
-
-def _get_platform(rec):
-    return rec.get("platform") or "unknown"
-
-
-def _get_dataset(rec):
-    return rec.get("dataset") or rec.get("source") or "unknown"
+from region_focus_hypo1 import ground_with_regionfocus
+from gui_grounding import ground as local_ground, ground_toolcall_pixel as local_ground_toolcall_pixel
 
 
 class _Tee:
@@ -209,6 +219,11 @@ def main():
     ap.add_argument("--debug_mode", choices=["always", "incorrect"], default="always",
                     help="always: 판정과 무관하게 항상 저장 / incorrect: judge가 오답으로 판단한 "
                          "샘플만 저장 (정답 조기종료 샘플은 스킵, RegionFocus 모드에서만 의미 있음)")
+    ap.add_argument("--step1_format", choices=["point_text", "toolcall_pixel"], default="point_text",
+                    help="Step1(초기 grounding) 프롬프트 방식. region_focus.py 700k 재검증에서 "
+                         "toolcall_pixel(old 프롬프트)이 더 잘 나온 걸 가설1에도 동일하게 적용하기 위함.")
+    ap.add_argument("--step4_format", choices=["point_text", "toolcall_pixel"], default="point_text",
+                    help="Step4(crop/zoom 후 좌표 재추출) 프롬프트 방식. 위와 동일한 이유.")
     ap.add_argument("--min_crop_config", default=None,
                     help="calibrate_min_crop.py로 만든 min_crop_config.json 경로. 주면 record의 "
                          "platform에 맞는 min_crop_px를 ground_with_regionfocus에 넘겨줌. "
@@ -278,7 +293,11 @@ def main():
             t0 = time.time()
             with contextlib.redirect_stdout(tee):
                 if args.no_regionfocus:
-                    result = local_ground(
+                    step1_fn = {
+                        "point_text": local_ground,
+                        "toolcall_pixel": local_ground_toolcall_pixel,
+                    }[args.step1_format]
+                    result = step1_fn(
                         model, rec["instruction"], rec["image_path"],
                         min_pixels=args.min_pixels, max_pixels=args.max_pixels,
                         debug_text=args.debug_text, task_id=task_id,
@@ -289,6 +308,7 @@ def main():
                         debug_mode=args.debug_mode, task_id=task_id,
                         min_pixels=args.min_pixels, max_pixels=args.max_pixels,
                         use_zoom=not args.no_zoom,
+                        step1_format=args.step1_format, step4_format=args.step4_format,
                     )
                     if min_crop_px is not None:
                         # None을 명시적으로 넘기면 region_focus.py의 기본값(int)을 덮어써서
