@@ -9,7 +9,7 @@ v1은 이미지 파일 경로/이름에 "mobile"/"desktop"/"web" 문자열이 �
 추측했는데, 실제 데이터셋은 android/ios/macos/windows/gitlab/forum/shop/tool 8개
 platform을 쓰고 이 문자열이 경로에 안 박혀 있어서 전부 "all"로 뭉뚱그려지는 문제가
 있었다. 게다가 이 platform 정보는 이미 evaluation 파이프라인이 쓰는 jsonl의
-"platform" 필드에 정확하게 들어있다 (eval_regionfocus_WJ.py의 _get_platform()이
+"platform" 필드에 정확하게 들어있다 (eval_regionfocus_hypo1.py의 _get_platform()이
 쓰는 것과 동일한 필드).
 
 그래서 v2는 파일명 추측을 완전히 버리고, coord_utils.load_jsonl()로 jsonl을 그대로
@@ -18,7 +18,7 @@ platform을 쓰고 이 문자열이 경로에 안 박혀 있어서 전부 "all"�
 필드를 신뢰하고 쓰고 있는 것과 동일한 가정 - 없는 record만 image_path를 열어 fallback).
 
 이렇게 하면:
-    - jsonl과 100% 같은 platform 정의를 쓰므로 eval_regionfocus_WJ.py의
+    - jsonl과 100% 같은 platform 정의를 쓰므로 eval_regionfocus_hypo1.py의
       _lookup_min_crop_px(min_crop_cfg, platform)이 항상 정확히 매칭됨.
     - annotation_json(순수 JSON 배열)을 쓸 필요가 없어짐 - 애초에 데이터가 jsonl이라
       그 방식은 안 맞았음.
@@ -37,7 +37,27 @@ import argparse
 import json
 import os
 
+
+# vlm_agent(coord_utils.py/qwen.py/gui_grounding.py/evaluation.py가 있는 폴더)를
+# sys.path에 넣는다 - 이 파일들이 hypo1/ 서브폴더로 옮겨진 뒤에도(또는 vlm_agent와
+# 나란히 있어도) PYTHONPATH를 손으로 안 잡아줘도 되게 하려는 것. verifier/ 스크립트들과
+# 동일한 패턴 - ../ (hypo1이 vlm_agent 바로 밑에 있는 경우) 또는 ../vlm_agent (hypo1이
+# vlm_agent와 형제 폴더인 경우) 둘 다 자동으로 찾는다.
+import os as _os
+import sys as _sys
+
+_HERE = _os.path.dirname(_os.path.abspath(__file__))
+_BASE_DIR = None
+for _candidate in (_os.path.join(_HERE, ".."), _os.path.join(_HERE, "..", "vlm_agent")):
+    _candidate = _os.path.abspath(_candidate)
+    if _os.path.isfile(_os.path.join(_candidate, "coord_utils.py")):
+        _BASE_DIR = _candidate
+        if _candidate not in _sys.path:
+            _sys.path.insert(0, _candidate)
+        break
+
 from coord_utils import load_jsonl
+from evaluation import _get_platform  # eval_regionfocus_hypo1.py와 동일한 걸 그대로 재사용
 from judge_zoom_crop import (
     analyze_dataset_resolutions,
     calibrate_min_crop_px,
@@ -45,14 +65,9 @@ from judge_zoom_crop import (
 )
 
 
-def _get_platform(rec):
-    """eval_regionfocus_WJ.py의 _get_platform()과 동일한 규칙 (같은 fallback을 씀)."""
-    return rec.get("platform") or "unknown"
-
-
 def _resolution_of(rec, image_root=None):
     """
-    rec["resolution"]을 우선 사용 (evaluation.py/eval_regionfocus_WJ.py가 이미 신뢰하는
+    rec["resolution"]을 우선 사용 (evaluation.py/eval_regionfocus_hypo1.py가 이미 신뢰하는
     필드라 이미지 I/O 없이 바로 씀). 없으면 image_path를 열어서 PIL로 크기를 구한다.
     둘 다 없으면 None 반환(해당 record는 스킵).
     """
@@ -140,7 +155,7 @@ def main():
         json.dump(config, f, indent=2, ensure_ascii=False)
 
     print(json.dumps(config, indent=2, ensure_ascii=False))
-    print(f"\n-> {args.out} 에 저장됨. eval_regionfocus_WJ.py --min_crop_config로 넘길 것.")
+    print(f"\n-> {args.out} 에 저장됨. eval_regionfocus_hypo1.py --min_crop_config로 넘길 것.")
 
 
 if __name__ == "__main__":
