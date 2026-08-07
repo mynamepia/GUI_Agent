@@ -83,7 +83,7 @@ from typing import TYPE_CHECKING
 if TYPE_CHECKING:
     # 실행에는 필요 없고 타입 힌트용 - qwen.py(torch/transformers 등 무거운 의존성)를
     # 이 selftest 경로에서까지 강제로 임포트하지 않기 위해 TYPE_CHECKING 가드로 묶어둠.
-    from qwen import QwenVLModel
+    from ..qwen import QwenVLModel
 
 _ACTIONS = ("left_click", "double_click", "right_click", "type", "key", "scroll", "wait", "terminate")
 
@@ -582,7 +582,7 @@ def _cli():
     if not args.image or not args.task:
         raise SystemExit("--image와 --task 필요 (또는 --selftest)")
 
-    from qwen import QwenVLModel  # 실제 실행 시점에만 필요 (selftest는 이 임포트를 안 탐)
+    from ..qwen import QwenVLModel  # 실제 실행 시점에만 필요 (selftest는 이 임포트를 안 탐)
 
     model = QwenVLModel()  # LoRA 없이 base 모델
     screenshot = Image.open(args.image)
