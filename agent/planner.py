@@ -14,11 +14,16 @@ gui_grounding.ground_with_regionfocus()(grounding LoRA 담당)의 몫이다. 이
 합치는 건 agent_loop.py의 몫(다음 단계, 아직 없음).
 
 [모델 로딩 방식]
-지금은 base 모델(LoRA 없음)로만 planning한다 - grounding LoRA는 이 planning 프롬프트
-포맷(JSON, target_description 등)을 학습에서 본 적이 없어서 오히려 방해가 될 수 있음.
+기본은 base 모델(LoRA 없음)로 planning한다 - grounding LoRA는 이 planning 프롬프트
+포맷(JSON, target_description 등)을 학습에서 본 적이 없어서 오히려 방해가 될 수 있다는
+가설 때문. agent_loop.py의 실제 파이프라인에서도 planning은 항상 어댑터를 끈 채로
+돈다(_BaseModelView/disable_adapter()). 다만 이 파일의 CLI(`_cli()`)는 2026-08-07부터
+`--adapter_dir`를 선택적으로 받아서, "grounding LoRA를 켠 채로 planning하면 정말
+방해가 되는지"를 직접 base/adapter 두 조건으로 비교 실행해볼 수 있게 열어뒀다(수동
+비교/디버깅용 - agent_loop.py가 쓰는 정식 파이프라인의 기본 동작을 바꾸는 건 아님).
 LoRA 어댑터 스왑(planning ↔ grounding)으로 하나의 backbone만 로드해서 쓰는 통합은
-agent_loop.py 단계에서 처리하기로 함(verifier/model.py 문서에 적어둔 멀티 어댑터
-스왑 계획과 같은 방향).
+agent_loop.py가 처리한다(verifier/model.py 문서에 적어둔 멀티 어댑터 스왑 계획과 같은
+방향).
 
 [테스트 대상: WebVoyager]
 MiniWob(utterance/fields로 태스크가 구조화돼 나옴)이 아니라 WebVoyager(자유 텍스트
@@ -80,10 +85,31 @@ import json
 import re
 from typing import TYPE_CHECKING
 
+# vlm_agent(qwen.py가 있는 폴더)를 sys.path에 넣는다 - hypo1/verifier 스크립트들과 동일한
+# 패턴. 이걸 안 넣어두면 `from qwen import ...`(위 TYPE_CHECKING 블록/아래 _cli() 양쪽)가
+# "이 스크립트를 어느 cwd/방식으로 실행했느냐"에 따라 조용히 ModuleNotFoundError가 날 수
+# 있다 - agent/가 vlm_agent 바로 밑(현재 구조)이든 vlm_agent와 형제 폴더로 옮겨지든 둘 다
+# 자동으로 찾는다.
+import os as _os
+import sys as _sys
+
+_HERE = _os.path.dirname(_os.path.abspath(__file__))
+for _candidate in (_os.path.join(_HERE, ".."), _os.path.join(_HERE, "..", "vlm_agent")):
+    _candidate = _os.path.abspath(_candidate)
+    if _os.path.isfile(_os.path.join(_candidate, "qwen.py")):
+        if _candidate not in _sys.path:
+            _sys.path.insert(0, _candidate)
+        break
+
 if TYPE_CHECKING:
     # 실행에는 필요 없고 타입 힌트용 - qwen.py(torch/transformers 등 무거운 의존성)를
     # 이 selftest 경로에서까지 강제로 임포트하지 않기 위해 TYPE_CHECKING 가드로 묶어둠.
-    from ..qwen import QwenVLModel
+    # (2026-08-07) 상대 import(from ..qwen import ...)는 vlm_agent/, vlm_agent/agent/에
+    # __init__.py가 없어서 `python agent/planner.py`처럼 스크립트로 직접 실행하면
+    # "attempted relative import with no known parent package"로 깨진다. agent_loop.py가
+    # 이미 절대 import(`from qwen import QwenVLModel`, 스크립트를 vlm_agent/ 안에서 직접
+    # 실행하는 걸 전제)를 쓰고 있어서, 여기도 그 스타일로 통일한다.
+    from qwen import QwenVLModel
 
 _ACTIONS = ("left_click", "double_click", "right_click", "type", "key", "scroll", "wait", "terminate")
 
@@ -119,6 +145,8 @@ chosen action): {{"reasoning": "...", "action": "...", "target_description": "..
 "status": "...", "answer": "..."}}
 Think through your reasoning first, then decide the action - write "reasoning" before "action" in
 your JSON.
+Always write all free-text field values ("reasoning", "target_description", "answer", etc.) in
+English, even if the task description is given in another language.
 """
 
 _REFLECTION_SYSTEM_PROMPT = """You are a skeptical, adversarial reviewer checking another agent's
@@ -166,6 +194,8 @@ Reply with ONLY a single JSON object: {"observation": "<what you see, written be
 "possible_failure_reason": "<at least one concrete reason this action could be wrong, even if you
 approve anyway>", "approved": true or false, "critique": "<if not approved, a specific, actionable
 reason the proposer can use to revise - otherwise empty string>"}
+Always write all free-text field values ("observation", "possible_failure_reason", "critique") in
+English, even if the task description is given in another language.
 """
 
 
@@ -200,22 +230,49 @@ def _format_history(history_actions, max_items=8):
     return "\n".join(lines)
 
 
+def _action_schema_valid(obj: dict) -> bool:
+    """
+    (2026-08-07 추가) action 이름만 _ACTIONS에 속하는지 보는 것만으론 부족했다 -
+    실측으로 확인된 사례: grounding LoRA(어댑터)를 켠 채로 planning을 시키면, 자기가
+    학습받은 좌표 tool-call 포맷 그대로 {"action": "left_click", "coordinate": [x, y]}
+    를 내놓는데, "left_click"이 우연히 planner의 액션 이름과도 겹쳐서 _parse_planner_action이
+    이걸 "정상 파싱"으로 잘못 받아들이고 있었다 - target_description이 아예 없는데도
+    통과됨. action별 필수 필드까지 확인해야 이런 스키마 불일치(포맷은 다른데 action
+    이름만 우연히 같은 경우)를 제대로 걸러낸다.
+    """
+    action = obj.get("action")
+    if action in ("left_click", "double_click", "right_click"):
+        target = obj.get("target_description")
+        return isinstance(target, str) and target.strip() != ""
+    if action in ("type", "key"):
+        text = obj.get("text")
+        return isinstance(text, str) and text.strip() != ""
+    if action == "scroll":
+        return obj.get("text") in ("up", "down")
+    if action == "wait":
+        return True
+    if action == "terminate":
+        return obj.get("status") in ("success", "failure")
+    return False
+
+
 def _parse_planner_action(response_text: str):
     """
     region_focus._parse_judge_verdict()와 같은 원칙: JSON 우선 파싱, action이 알려진
     값이 아니거나 파싱 자체가 실패하면 안전한 기본값(terminate/failure)으로 폴백해서
-    조용히 잘못된 액션이 실행되는 걸 막는다.
+    조용히 잘못된 액션이 실행되는 걸 막는다. action 이름 확인뿐 아니라 action별 필수
+    필드(_action_schema_valid)까지 통과해야 정상 파싱으로 인정한다.
     """
     match = re.search(r"\{.*\}", response_text, re.DOTALL)
     if match:
         try:
             obj = json.loads(match.group(0))
-            if obj.get("action") in _ACTIONS:
+            if obj.get("action") in _ACTIONS and _action_schema_valid(obj):
                 return obj
         except (json.JSONDecodeError, AttributeError):
             pass
     return {
-        "reasoning": "(파싱 실패 또는 알 수 없는 action - 안전하게 종료 처리)",
+        "reasoning": "(parse failure, unknown action, or missing required field - falling back to safe terminate)",
         "action": "terminate",
         "status": "failure",
         "answer": None,
@@ -260,7 +317,7 @@ def _parse_reflection_verdict(response_text: str) -> dict:
         "observation": "",
         "possible_failure_reason": "",
         "approved": False,
-        "critique": "(reflection 응답 파싱 실패 - 안전하게 반려 처리)",
+        "critique": "(reflection response failed to parse - falling back to safe rejection)",
         "_parse_failed": True,
         "_raw_response": response_text,
     }
@@ -416,7 +473,13 @@ def plan_with_reflection(
             candidate,
             temperature=reflection_temperature,
         )
-        log.append({"iteration": i, "plan": candidate, "verdict": verdict})
+        # (2026-08-07 버그 수정) candidate를 그대로(같은 dict 객체 참조로) log에 넣으면,
+        # 승인/소진 경로에서 밑에 candidate["_reflection_log"] = log를 실행하는 순간
+        # candidate -> _reflection_log -> log[-1]["plan"] -> candidate로 되돌아오는 순환
+        # 참조가 생겨서 json.dumps()가 "Circular reference detected"로 죽는다(실측 확인됨).
+        # log에는 이 시점까지의 candidate 스냅샷(얕은 복사)만 남기면 이후 candidate에
+        # 필드를 추가로 붙여도 log 안의 항목은 영향받지 않는다.
+        log.append({"iteration": i, "plan": dict(candidate), "verdict": verdict})
         if verdict.get("approved"):
             candidate["_reflection_approved"] = True
             candidate["_reflection_log"] = log
@@ -466,6 +529,22 @@ def _run_mock_selftest():
 
     unknown_action = _parse_planner_action('{"action": "fly_away"}')
     check("모르는 action -> 폴백", unknown_action["action"] == "terminate")
+
+    # (2026-08-07 회귀 테스트) grounding LoRA를 켠 채로 planning시켰을 때 실측된 사례:
+    # 좌표 tool-call 포맷({"action": "left_click", "coordinate": [x, y]})이 action 이름만
+    # 우연히 겹쳐서 "정상 파싱"으로 잘못 통과되면 안 된다 - target_description이 없으면 폴백.
+    coord_format_leak = _parse_planner_action('{"action": "left_click", "coordinate": [739, 465]}')
+    check("좌표 tool-call 포맷 누수 -> target_description 없어서 폴백", coord_format_leak["action"] == "terminate")
+    check("좌표 tool-call 포맷 누수 -> _parse_failed 플래그", coord_format_leak.get("_parse_failed") is True)
+
+    missing_text = _parse_planner_action('{"action": "type"}')
+    check("type인데 text 없음 -> 폴백", missing_text["action"] == "terminate")
+
+    bad_scroll = _parse_planner_action('{"action": "scroll", "text": "sideways"}')
+    check("scroll인데 up/down이 아님 -> 폴백", bad_scroll["action"] == "terminate")
+
+    ok_wait = _parse_planner_action('{"action": "wait"}')
+    check("wait는 추가 필드 없어도 통과", ok_wait["action"] == "wait" and not ok_wait.get("_parse_failed"))
 
     # plan_next_action: 모델 generate()를 mock으로 대체해서 메시지 조립까지만 검증
     fake_model = MagicMock()
@@ -573,6 +652,28 @@ def _cli():
         "--reflect", action="store_true", help="plan_next_action() 대신 plan_with_reflection() 사용 (실행 전 비평 루프)"
     )
     ap.add_argument("--max_iterations", type=int, default=2, help="--reflect일 때 최대 재시도 횟수 (agent_loop.py 기본값과 동일하게 2)")
+    ap.add_argument(
+        "--adapter_dir",
+        default=None,
+        help="(2026-08-07 추가) 지정하면 이 경로의 grounding LoRA(peft)를 얹은 채로 planning을 "
+        "테스트한다. 미지정(기본)이면 파일 상단 docstring에 적힌 설계대로 base 모델(LoRA 없음)로 "
+        "돈다. base vs adapter를 그냥 비교해보고 싶을 때(=grounding LoRA가 planning 포맷을 "
+        "실제로 방해하는지 실측하고 싶을 때) 이 옵션을 켜고 끄면서 같은 --image/--task로 "
+        "돌려보면 됨 (예: checkpoint-4130).",
+    )
+    ap.add_argument(
+        "--min_pixels", type=int, default=None,
+        help="미지정시 qwen.py의 DEFAULT_MIN_PIXELS(256*28*28=200704) 사용",
+    )
+    ap.add_argument(
+        "--max_pixels", type=int, default=None,
+        help="(2026-08-07 추가) 미지정시 700,000을 기본값으로 쓴다 - qwen.py의 "
+        "DEFAULT_MAX_PIXELS는 501,760(50만)인데, checkpoint-4130 LoRA는 700,000으로 "
+        "파인튜닝됐다. RegionFocus 쪽에서 이 둘을 헷갈려서 생긴 해상도 confound로 "
+        "크게 데인 적 있어서(project_step14_ablation_dosample_noise 메모리 참고) 여기서는 "
+        "qwen.py 기본값을 그대로 따르지 않는다. 50만과 비교하고 싶으면 --max_pixels 501760을 "
+        "명시적으로 넘기면 됨.",
+    )
     args = ap.parse_args()
 
     if args.selftest:
@@ -582,9 +683,14 @@ def _cli():
     if not args.image or not args.task:
         raise SystemExit("--image와 --task 필요 (또는 --selftest)")
 
-    from ..qwen import QwenVLModel  # 실제 실행 시점에만 필요 (selftest는 이 임포트를 안 탐)
+    # 실제 실행 시점에만 필요 (selftest는 이 임포트를 안 탐) - 절대 import로 통일
+    # (agent_loop.py와 동일 스타일, vlm_agent/ 안에서 스크립트로 직접 실행하는 걸 전제).
+    from qwen import DEFAULT_MIN_PIXELS, QwenVLModel
 
-    model = QwenVLModel()  # LoRA 없이 base 모델
+    min_pixels = args.min_pixels if args.min_pixels is not None else DEFAULT_MIN_PIXELS
+    max_pixels = args.max_pixels if args.max_pixels is not None else 700_000
+
+    model = QwenVLModel(adapter_dir=args.adapter_dir, min_pixels=min_pixels, max_pixels=max_pixels)
     screenshot = Image.open(args.image)
     if args.reflect:
         result = plan_with_reflection(model, args.task, screenshot, max_iterations=args.max_iterations)
