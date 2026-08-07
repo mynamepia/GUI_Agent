@@ -111,6 +111,19 @@ run_episode(..., ground_kwargs={"max_pixels": ...})를 함께 명시적으로 �
     )
     env.close()
 
+    # WebVoyager 태스크 jsonl 전체를 배치로 돌려서 결과를 jsonl로 저장 (run_batch, resume 지원)
+    from env_webvoyager import load_webvoyager_tasks
+    tasks = load_webvoyager_tasks("/srv/project/data/processed/WebVoyager_data.jsonl")
+    stats = run_batch(
+        grounding_view, planner_view, reflector_view, env, tasks,
+        output_jsonl_path="/srv/project/data/results/webvoyager_results.jsonl",
+        use_reflection=True,
+    )
+    env.close()
+    # CLI로 똑같이: python agent_loop.py --adapter_dir checkpoint-4130 --run_episode \
+    #   --tasks_jsonl /srv/project/data/processed/WebVoyager_data.jsonl \
+    #   --output_jsonl /srv/project/data/results/webvoyager_results.jsonl --reflect
+
 model 하나만 메모리에 올라간다 - 세 view는 전부 같은 model을 감싸서 .generate() 호출
 직전에 (peft의 set_adapter로) 자기 역할에 맞는 어댑터로 바꾸거나 (disable_adapter로)
 어댑터를 끄는 얇은 프록시일 뿐, 별도 모델이 아니다.
@@ -466,6 +479,138 @@ def run_episode(
         "history": history,
         "task_info": task_info,
     }
+
+
+# ---------------------------------------------------------------------------
+# 배치 실행: WebVoyager jsonl(예: /srv/project/data/processed/WebVoyager_data.jsonl)의
+# 태스크 여러 개를 순서대로 run_episode()로 돌리고, 결과를 jsonl로 한 줄씩 저장한다.
+# ---------------------------------------------------------------------------
+def run_batch(
+    grounding_view,
+    planner_view,
+    reflector_view,
+    env,
+    tasks: list,
+    output_jsonl_path: str,
+    use_reflection: bool,
+    max_steps: int | None = 50,
+    reflection_max_iterations: int = 2,
+    planner_kwargs: dict | None = None,
+    ground_kwargs: dict | None = None,
+    resume: bool = True,
+    verbose: bool = True,
+) -> dict:
+    """
+    WebVoyager 태스크 jsonl(env_webvoyager.load_webvoyager_tasks()가 읽는 그 포맷,
+    {"web_name":..., "id":..., "ques":..., "web":...} 레코드들의 리스트)을 순서대로
+    run_episode()에 하나씩 넘겨 돌리고, 매 태스크가 끝날 때마다 결과를
+    output_jsonl_path에 한 줄(JSON)씩 append + flush한다 - 수백 개짜리 배치를 실제
+    브라우저로 몇 시간씩 돌릴 수 있어서, 중간에 죽어도 그때까지 결과는 디스크에 남아있게
+    하기 위함(전부 메모리에 모았다가 끝에 한 번에 쓰면 중간에 죽는 순간 그동안의 결과가
+    전부 날아간다).
+
+    [resume - 이미 끝난 태스크는 건너뛰고 이어서 실행]
+    output_jsonl_path가 이미 존재하면(이전 실행이 중간에 끊겼거나 같은 커맨드를 다시
+    돌리는 경우), 그 파일에 이미 기록된 task_id들을 먼저 읽어서 이번 배치에서는
+    건너뛴다(resume=True, 기본값). 처음부터 전부 다시 돌리고 싶으면 resume=False를
+    주거나 output_jsonl_path를 지우고 시작할 것. 이미 있는 파일에는 겹치는 task_id를
+    다시 쓰지 않고 그대로 두고, 새로 처리한 태스크만 뒤에 이어서 append한다.
+
+    [태스크 하나의 예외가 배치 전체를 안 죽이게]
+    run_episode() 자체는 이미 "액션 실행 실패"(grounding 실패/env.execute_action 예외)를
+    자체적으로 잡아서 정상적인 outcome(status="failure", reason="execution_failed")으로
+    돌려준다 - 그건 여기서 또 잡을 필요가 없다. 여기서 추가로 감싸는 try/except는 그보다
+    "이전" 단계, 즉 env.reset()이 Chrome 크래시/네트워크 완전 단절 등으로 예외를 던지거나
+    plan_next_action()/plan_with_reflection() 자체가 (마지막 폴백조차 못 갈 정도로) 예외를
+    던지는, run_episode()가 원래 처리 대상으로 두지 않은 종류의 실패를 잡기 위함이다. 이
+    경우 해당 태스크만 {"status": "error", "error": "<메시지>"}로 기록하고 다음 태스크로
+    넘어간다 - 태스크 597개 중 1개가 이런 이유로 죽었다고 나머지 596개를 못 돌리면 안 됨.
+
+    env는 태스크 사이에 재사용한다 - WebVoyagerEnv.reset()이 이미 "driver가 있으면 먼저
+    close()하고 새로 띄운다"는 로직을 갖고 있어서(env_webvoyager.py 참고), 매 태스크마다
+    새 WebVoyagerEnv 인스턴스를 만들 필요 없이 env.reset(task)만 반복 호출하면 된다.
+
+    Args:
+        tasks: env_webvoyager.load_webvoyager_tasks()가 반환하는 것과 같은 dict 리스트.
+            각 태스크는 "id" 필드가 있어야 resume 스킵/결과 식별이 정상 동작한다.
+        output_jsonl_path: 결과를 append할 jsonl 파일 경로. 각 줄은
+            {"task_id", "web_name", "web", "ques"} + run_episode()의 반환 dict 전체
+            (또는 위 예외 케이스의 {"status": "error", "error": ...}).
+        나머지 인자는 run_episode()에 각 태스크마다 그대로 전달됨(파라미터 설명은
+        run_episode() 참고).
+
+    Returns:
+        {"total": int, "completed": int, "skipped": int, "succeeded": int,
+         "failed": int, "errored": int}
+        completed = skipped를 제외하고 이번에 실제로 처리한 태스크 수 (succeeded+failed+errored).
+    """
+    import json
+    import os
+
+    already_done = set()
+    if resume and os.path.exists(output_jsonl_path):
+        with open(output_jsonl_path, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    row = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if row.get("task_id"):
+                    already_done.add(row["task_id"])
+
+    stats = {"total": len(tasks), "completed": 0, "skipped": 0, "succeeded": 0, "failed": 0, "errored": 0}
+
+    with open(output_jsonl_path, "a", encoding="utf-8") as out_f:
+        for i, task in enumerate(tasks, start=1):
+            task_id = task.get("id")
+
+            if resume and task_id is not None and task_id in already_done:
+                stats["skipped"] += 1
+                if verbose:
+                    print(f"[agent_loop] [{i}/{len(tasks)}] {task_id!r} 이미 완료됨 - 건너뜀")
+                continue
+
+            if verbose:
+                print(f"[agent_loop] [{i}/{len(tasks)}] {task_id!r} 시작: {task.get('ques', '')!r}")
+
+            row = {
+                "task_id": task_id,
+                "web_name": task.get("web_name"),
+                "web": task.get("web"),
+                "ques": task.get("ques"),
+            }
+            try:
+                outcome = run_episode(
+                    grounding_view, planner_view, reflector_view, env, task,
+                    use_reflection=use_reflection,
+                    max_steps=max_steps,
+                    reflection_max_iterations=reflection_max_iterations,
+                    planner_kwargs=planner_kwargs,
+                    ground_kwargs=ground_kwargs,
+                    verbose=verbose,
+                )
+                row.update(outcome)
+                if outcome.get("status") == "success":
+                    stats["succeeded"] += 1
+                else:
+                    stats["failed"] += 1
+            except Exception as e:
+                row["status"] = "error"
+                row["error"] = str(e)
+                stats["errored"] += 1
+                if verbose:
+                    print(f"[agent_loop] [{i}/{len(tasks)}] {task_id!r} 처리 중 예외 - {e}")
+
+            out_f.write(json.dumps(row, ensure_ascii=False) + "\n")
+            out_f.flush()
+            stats["completed"] += 1
+
+    if verbose:
+        print(f"[agent_loop] 배치 완료: {stats}")
+    return stats
 
 
 # ---------------------------------------------------------------------------
@@ -918,6 +1063,122 @@ def _run_mock_selftest():
     finally:
         _uninstall_fake_modules()
 
+    # =======================================================================
+    # run_batch(): 실제 파일시스템에 임시 jsonl을 만들어서 append/resume/예외격리를 검증.
+    # (run_episode 자체는 이미 위에서 충분히 검증했으므로, 여기서는 "여러 태스크를 순회
+    # 하면서 jsonl에 쓰는" 오케스트레이션 로직만 집중적으로 본다.)
+    # =======================================================================
+    import json as _json
+    import os as _os
+    import tempfile as _tempfile
+
+    tmp_dir = _tempfile.mkdtemp(prefix="agent_loop_selftest_")
+    out_path = _os.path.join(tmp_dir, "results.jsonl")
+
+    three_tasks = [
+        {"id": "Site--0", "web_name": "Site", "web": "http://x/0", "ques": "task 0"},
+        {"id": "Site--1", "web_name": "Site", "web": "http://x/1", "ques": "task 1"},
+        {"id": "Site--2", "web_name": "Site", "web": "http://x/2", "ques": "task 2"},
+    ]
+
+    # 매 태스크마다 env.reset()이 새로 불리고 plan_next_action()이 곧장 terminate/success를
+    # 내서 1스텝만에 끝나는 가장 단순한 성공 경로.
+    always_terminate = MagicMock(
+        return_value={"reasoning": "done", "action": "terminate", "status": "success", "answer": "ok"}
+    )
+    _install_fake_planner_and_grounding(plan_next_action=always_terminate)
+    try:
+        env = _FakeEnv()
+        stats = run_batch(
+            grounding_view="gv", planner_view="pv", reflector_view="rv", env=env,
+            tasks=three_tasks, output_jsonl_path=out_path,
+            use_reflection=False, verbose=False,
+        )
+        check("run_batch -> total == 3", stats["total"] == 3)
+        check("run_batch -> completed == 3(처음 실행이라 스킵 없음)", stats["completed"] == 3)
+        check("run_batch -> skipped == 0", stats["skipped"] == 0)
+        check("run_batch -> succeeded == 3", stats["succeeded"] == 3)
+        check("run_batch -> env.reset이 태스크마다 1번씩, 총 3번", len(env.reset_calls) == 3)
+
+        with open(out_path, "r", encoding="utf-8") as f:
+            lines = [line for line in f if line.strip()]
+        check("run_batch -> jsonl에 3줄 기록됨", len(lines) == 3)
+        rows = [_json.loads(line) for line in lines]
+        check("run_batch -> 각 줄에 task_id 보존", [r["task_id"] for r in rows] == ["Site--0", "Site--1", "Site--2"])
+        check("run_batch -> 각 줄에 ques 보존", rows[0]["ques"] == "task 0")
+        check("run_batch -> 각 줄에 run_episode 결과(status) 병합됨", all(r["status"] == "success" for r in rows))
+        check("run_batch -> 각 줄에 answer도 병합됨", rows[0]["answer"] == "ok")
+    finally:
+        _uninstall_fake_modules()
+
+    # --- resume: 이미 3줄이 있는 out_path에 새 태스크 1개(Site--3) 추가해서 다시 돌리면,
+    #     기존 3개는 건너뛰고 Site--3만 처리 + append(파일은 4줄이 됨) ---
+    four_tasks = three_tasks + [{"id": "Site--3", "web_name": "Site", "web": "http://x/3", "ques": "task 3"}]
+    _install_fake_planner_and_grounding(plan_next_action=always_terminate)
+    try:
+        env = _FakeEnv()
+        stats2 = run_batch(
+            grounding_view="gv", planner_view="pv", reflector_view="rv", env=env,
+            tasks=four_tasks, output_jsonl_path=out_path,
+            use_reflection=False, verbose=False,
+        )
+        check("resume -> skipped == 3(이미 끝난 것들)", stats2["skipped"] == 3)
+        check("resume -> completed == 1(새 태스크 하나만)", stats2["completed"] == 1)
+        check("resume -> env.reset은 새 태스크 것만 1번 호출", len(env.reset_calls) == 1)
+
+        with open(out_path, "r", encoding="utf-8") as f:
+            lines2 = [line for line in f if line.strip()]
+        check("resume -> 기존 3줄 + 새 1줄 = 4줄(기존 줄 중복 안 됨)", len(lines2) == 4)
+    finally:
+        _uninstall_fake_modules()
+
+    # --- resume=False면 이미 끝난 것도 다시 처리(+append, 기존 줄은 그대로 남아 중복 생김) ---
+    _install_fake_planner_and_grounding(plan_next_action=always_terminate)
+    try:
+        env = _FakeEnv()
+        stats3 = run_batch(
+            grounding_view="gv", planner_view="pv", reflector_view="rv", env=env,
+            tasks=three_tasks, output_jsonl_path=out_path,
+            use_reflection=False, resume=False, verbose=False,
+        )
+        check("resume=False -> skipped == 0(전부 다시 처리)", stats3["skipped"] == 0)
+        check("resume=False -> completed == 3", stats3["completed"] == 3)
+    finally:
+        _uninstall_fake_modules()
+
+    # --- 태스크 하나에서 run_episode 호출 자체가 예외를 던지면(env.reset 실패 등),
+    #     그 태스크만 status=error로 기록하고 나머지 태스크는 정상 처리 ---
+    fresh_out_path = _os.path.join(tmp_dir, "results_with_error.jsonl")
+    error_then_ok = MagicMock(
+        side_effect=[
+            {"reasoning": "done", "action": "terminate", "status": "success", "answer": "first ok"},
+            RuntimeError("model crashed mid-task"),
+            {"reasoning": "done", "action": "terminate", "status": "success", "answer": "third ok"},
+        ]
+    )
+    _install_fake_planner_and_grounding(plan_next_action=error_then_ok)
+    try:
+        env = _FakeEnv()
+        stats4 = run_batch(
+            grounding_view="gv", planner_view="pv", reflector_view="rv", env=env,
+            tasks=three_tasks, output_jsonl_path=fresh_out_path,
+            use_reflection=False, verbose=False,
+        )
+        check("예외 격리 -> completed == 3(에러난 것도 처리는 됨, 스킵 아님)", stats4["completed"] == 3)
+        check("예외 격리 -> succeeded == 2", stats4["succeeded"] == 2)
+        check("예외 격리 -> errored == 1", stats4["errored"] == 1)
+        check("예외 격리 -> 배치 전체가 안 죽고 3개 다 jsonl에 기록됨", True)  # 아래에서 실제 파일로 재확인
+
+        with open(fresh_out_path, "r", encoding="utf-8") as f:
+            err_rows = [_json.loads(line) for line in f if line.strip()]
+        check("예외 격리 -> jsonl 3줄 모두 기록됨(에러난 태스크 포함)", len(err_rows) == 3)
+        check("예외 격리 -> 에러난 태스크 status=='error'", err_rows[1]["status"] == "error")
+        check("예외 격리 -> 에러 메시지 보존", "model crashed mid-task" in err_rows[1]["error"])
+        check("예외 격리 -> 에러난 태스크도 task_id는 보존됨", err_rows[1]["task_id"] == "Site--1")
+        check("예외 격리 -> 앞뒤 태스크는 정상 success", err_rows[0]["status"] == "success" and err_rows[2]["status"] == "success")
+    finally:
+        _uninstall_fake_modules()
+
     n_fail = sum(1 for _, ok in checks if not ok)
     for name, ok in checks:
         print(("[OK]  " if ok else "[FAIL]") + " " + name)
@@ -983,6 +1244,29 @@ def _cli():
     episode.add_argument("--width", type=int, default=1280)
     episode.add_argument("--height", type=int, default=800)
 
+    batch = ap.add_argument_group(
+        "배치 모드 (--output_jsonl까지 같이 주면, --tasks_jsonl의 태스크를 첫 번째 하나만이 "
+        "아니라 전부(또는 --limit개까지) 순서대로 돌려서 결과를 jsonl로 저장)"
+    )
+    batch.add_argument(
+        "--output_jsonl",
+        help="지정하면 배치 모드로 전환 - --tasks_jsonl의 태스크를 전부(또는 --limit개까지) "
+        "run_episode()로 돌리고, 결과를 이 경로에 한 줄씩(JSON Lines) append한다. "
+        "--tasks_jsonl과 함께 써야 함(--url/--instruction 단일 태스크 모드에는 안 됨).",
+    )
+    batch.add_argument(
+        "--limit", type=int, default=None,
+        help="--output_jsonl(배치 모드)일 때 처리할 태스크 수 상한. 미지정시 --tasks_jsonl "
+        "(및 --web_name 필터링) 전체를 다 돈다. 전체 배치 전에 몇 개만 먼저 돌려서 "
+        "확인해보고 싶을 때 씀(예: --limit 3).",
+    )
+    batch.add_argument(
+        "--no_resume", dest="resume", action="store_false", default=True,
+        help="기본은 resume=True - --output_jsonl 파일이 이미 있으면 거기 기록된 task_id는 "
+        "건너뛰고 이어서 돌린다. 처음부터 전부 다시 돌리고 싶으면 이 플래그를 주거나 "
+        "--output_jsonl 파일을 미리 지울 것.",
+    )
+
     args = ap.parse_args()
 
     if args.selftest:
@@ -993,18 +1277,12 @@ def _cli():
         raise SystemExit("--adapter_dir(grounding LoRA 체크포인트) 필요 (또는 --selftest)")
 
     if args.run_episode:
+        if args.output_jsonl and not args.tasks_jsonl:
+            raise SystemExit("--output_jsonl(배치 모드)에는 --tasks_jsonl 필요")
         if not (args.tasks_jsonl or (args.url and args.instruction)):
             raise SystemExit("--run_episode에는 --tasks_jsonl 또는 (--url + --instruction) 필요")
 
         from env_webvoyager import WebVoyagerEnv, load_webvoyager_tasks
-
-        if args.tasks_jsonl:
-            tasks = load_webvoyager_tasks(args.tasks_jsonl, web_name=args.web_name)
-            if not tasks:
-                raise SystemExit("조건에 맞는 태스크가 없음")
-            task = tasks[0]
-        else:
-            task = (args.url, args.instruction)
 
         print("=== 모델 로딩 시작 (아래 '[qwen.py] Loading ...' 메시지가 한 번만 찍혀야 함) ===")
         model, grounding_view, planner_view, reflector_view = load_shared_model(
@@ -1016,16 +1294,44 @@ def _cli():
 
         env = WebVoyagerEnv(window_size=(args.width, args.height), headless=args.headless)
         try:
-            outcome = run_episode(
-                grounding_view, planner_view, reflector_view, env, task,
-                use_reflection=args.reflect,
-                max_steps=args.max_steps,
-                reflection_max_iterations=args.max_iterations,
-            )
+            if args.output_jsonl:
+                # --- 배치 모드: --tasks_jsonl의 태스크를 전부(또는 --limit개까지) 돌려서
+                #     결과를 --output_jsonl에 한 줄씩 저장 ---
+                tasks = load_webvoyager_tasks(args.tasks_jsonl, web_name=args.web_name)
+                if args.limit is not None:
+                    tasks = tasks[: args.limit]
+                if not tasks:
+                    raise SystemExit("조건에 맞는 태스크가 없음")
+                print(f"=== 배치 시작: 태스크 {len(tasks)}개, 결과는 {args.output_jsonl}에 저장 ===")
+                stats = run_batch(
+                    grounding_view, planner_view, reflector_view, env, tasks,
+                    output_jsonl_path=args.output_jsonl,
+                    use_reflection=args.reflect,
+                    max_steps=args.max_steps,
+                    reflection_max_iterations=args.max_iterations,
+                    resume=args.resume,
+                )
+                print(json.dumps(stats, ensure_ascii=False, indent=2))
+            else:
+                # --- 단일 태스크 모드 (기존 동작 그대로) ---
+                if args.tasks_jsonl:
+                    tasks = load_webvoyager_tasks(args.tasks_jsonl, web_name=args.web_name)
+                    if not tasks:
+                        raise SystemExit("조건에 맞는 태스크가 없음")
+                    task = tasks[0]
+                else:
+                    task = (args.url, args.instruction)
+
+                outcome = run_episode(
+                    grounding_view, planner_view, reflector_view, env, task,
+                    use_reflection=args.reflect,
+                    max_steps=args.max_steps,
+                    reflection_max_iterations=args.max_iterations,
+                )
+                print(json.dumps(outcome, ensure_ascii=False, indent=2))
         finally:
             env.close()
 
-        print(json.dumps(outcome, ensure_ascii=False, indent=2))
         return
 
     if not args.image or not args.task:
