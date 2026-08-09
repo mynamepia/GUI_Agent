@@ -69,6 +69,20 @@ Agent Distillation 논문에서 언급된 "여러 번 샘플링 + 다수결"로 
 max_iterations 기본값은 2("1차 시도 + 반려시 1번만 수정 재시도") - agent_loop.py에서 스텝마다
 이 루프를 그대로 쓸 예정이라 여기서 기본값을 정해두되 인자로 override 가능하게 열어둠.
 
+[reflection_model 파라미터 - 제안과 비평을 각자 다른 모델로]
+plan_with_reflection()은 내부에서 plan_next_action()(제안)과 _reflect_on_plan()(비평)을
+호출하는데, reflection_model을 통해 이 둘을 서로 다른 모델 객체로 돌릴 수 있다 - 예를
+들어 제안은 planner 전용 LoRA를 얹은 모델로, 비평은 reflector 전용 LoRA를 얹은(또는
+LoRA 없는 base) 모델로 나누는 식. reflection_model을 지정하지 않으면(기본값 None) 예전
+방식 그대로 qwen_model 하나로 제안/비평을 둘 다 돌린다(하위 호환).
+
+이 파일은 qwen_model/reflection_model이 실제로 어댑터를 얹었는지 base인지 전혀 모르고
+신경 쓰지도 않는다 - duck-typing으로 .generate(messages, max_new_tokens=..., temperature=...)
+만 있으면 그대로 동작한다. 즉 "제안/비평 각각 자기 어댑터를 쓸 수도, 어댑터 없이 base로
+돌 수도 있다"는 요구사항은 이 파일이 직접 구현하는 게 아니라, 호출부(agent_loop.py)가
+qwen_model/reflection_model에 뭘 넘기느냐로 결정된다 - 이 파일은 그 결정과 완전히
+무관하게 항상 똑같이 동작한다(이 파일이 어댑터 유무를 분기 처리할 필요가 없다는 뜻).
+
 [reflection 프롬프트 강화 - 1차 버전에서 빠졌던 것들]
 1차 버전은 "모순이 있으면 반려"라는 수동적 비교 위주였고, terminate/click에만 명시적
 반려 기준이 있었음. 강화하면서 추가한 것: (1) type/key/scroll에도 액션별 반려 기준 추가,
@@ -387,8 +401,11 @@ def _reflect_on_plan(
     temperature: float = 0.4,
 ) -> dict:
     """
-    candidate_plan 하나를 실행 전에 비평한다. planner와 별개 호출(같은 backbone, 다른
-    system prompt) - _REFLECTION_SYSTEM_PROMPT가 "네 판단부터 독립적으로 써라"를 강제함.
+    candidate_plan 하나를 실행 전에 비평한다. planner와 별개 호출(system prompt가 다름) -
+    _REFLECTION_SYSTEM_PROMPT가 "네 판단부터 독립적으로 써라"를 강제함. 여기 넘어오는
+    qwen_model은 plan_with_reflection()이 reflection_model(지정 안 하면 제안과 동일한
+    모델)을 그대로 전달한 것 - 이 함수 자체는 그 모델이 base인지 어떤 LoRA를 얹었는지
+    모른다(duck-typing).
 
     Returns: {"observation": str, "approved": bool, "critique": str, ...}
     """
@@ -423,10 +440,19 @@ def plan_with_reflection(
     planner_temperature: float = 0.0,
     reflection_temperature: float = 0.4,
     max_iterations: int = 2,
+    reflection_model: "QwenVLModel | None" = None,
 ) -> dict:
     """
     plan_next_action() <-> _reflect_on_plan() 루프. 실행 전에 후보 액션을 reflection이
     검토해서, 승인되면 그 액션을 반환하고 반려되면 critique를 planner에 되먹여 재시도한다.
+
+    Args:
+        qwen_model: 제안(plan_next_action) 호출에 쓸 모델.
+        reflection_model: 비평(_reflect_on_plan) 호출에 쓸 모델. None이면(기본값)
+            qwen_model을 그대로 재사용한다 - 제안/비평 둘 다 같은 모델 하나로 도는
+            동작(하위 호환). 제안용 어댑터와 비평용 어댑터를 따로 쓰고 싶을 때(또는 둘 중
+            하나만 어댑터가 있고 나머지는 base일 때)만 명시적으로 넘기면 된다 - 이 함수는
+            qwen_model/reflection_model이 어댑터를 얹었는지 base인지 전혀 모른다.
 
     max_iterations 기본값은 2 - agent_loop.py에서 스텝마다 이 루프를 돌릴 때 "1차 시도 +
     반려시 1번만 수정 재시도"로 쓰기로 합의한 값. agent_loop.py 쪽에서 이 인자로 override
@@ -441,6 +467,8 @@ def plan_with_reflection(
         "_reflection_approved": bool
         "_reflection_log": [{"iteration": int, "plan": dict, "verdict": dict}, ...]
     """
+    reflect_qwen_model = reflection_model if reflection_model is not None else qwen_model
+
     log = []
     candidate = None
     verdict = None
@@ -466,7 +494,7 @@ def plan_with_reflection(
             return candidate
 
         verdict = _reflect_on_plan(
-            qwen_model,
+            reflect_qwen_model,
             task_instruction,
             screenshot,
             history_actions,
@@ -630,6 +658,38 @@ def _run_mock_selftest():
     result3 = plan_with_reflection(parse_fail_model, "task", Image.new("RGB", (4, 4)), max_iterations=3)
     check("plan_with_reflection -> planner 파싱실패시 reflection 스킵", parse_fail_model.generate.call_count == 1)
     check("plan_with_reflection -> planner 파싱실패시 approved=False", result3["_reflection_approved"] is False)
+
+    # plan_with_reflection: reflection_model을 명시하면 제안/비평이 서로 다른 모델 객체로
+    # 라우팅되는지 - planner 전용 어댑터(propose_model)와 reflector 전용 어댑터(또는 base)
+    # (reflect_model)를 분리해서 쓰는 agent_loop.py 사용 패턴을 재현.
+    propose_model = MagicMock()
+    propose_model.generate.side_effect = [
+        '{"reasoning": "seems closed already", "action": "terminate", "status": "success"}',
+        '{"reasoning": "need to click close first", "action": "left_click", "target_description": "close button"}',
+    ]
+    reflect_model = MagicMock()
+    reflect_model.generate.side_effect = [
+        '{"observation": "a dialog is still open", "approved": false, "critique": "dialog still visible"}',
+        '{"observation": "close button visible", "approved": true, "critique": ""}',
+    ]
+    result4 = plan_with_reflection(
+        propose_model, "close the dialog", Image.new("RGB", (4, 4)),
+        max_iterations=3, reflection_model=reflect_model,
+    )
+    check("reflection_model 지정 -> 최종 승인", result4["_reflection_approved"] is True)
+    check("reflection_model 지정 -> propose_model이 제안 2번 호출됨", propose_model.generate.call_count == 2)
+    check("reflection_model 지정 -> reflect_model이 비평 2번 호출됨", reflect_model.generate.call_count == 2)
+    check(
+        "reflection_model 지정 -> 비평 호출이 propose_model로는 안 감(라우팅 분리 확인)",
+        not any("observation" in str(c) for c in propose_model.generate.call_args_list),
+    )
+
+    # reflection_model을 안 주면(기본값 None) 예전처럼 qwen_model 하나로 제안/비평이 다 감
+    # (하위 호환 확인 - 위의 seq_model 테스트가 이미 이 경로를 검증하지만, 명시적으로 한 번 더)
+    check(
+        "reflection_model 기본값 None -> _reflect_on_plan()에도 qwen_model이 그대로 감(seq_model 재사용 테스트로 이미 확인됨)",
+        seq_model.generate.call_count == 4,
+    )
 
     n_fail = sum(1 for _, ok in checks if not ok)
     for name, ok in checks:
