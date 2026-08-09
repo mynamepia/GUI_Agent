@@ -38,12 +38,24 @@ Distillation처럼 별도 planner LoRA를 소규모 trajectory로 파인튜닝�
   "reasoning": "<왜 이 액션을 골랐는지 - action보다 먼저 쓰게 강제해서, 결론부터 내리고
                 사후정당화하는 대신 근거를 먼저 풀게 유도함. region_focus.judge_inference()의
                 reason-then-ans 트릭과 동일한 원칙>",
-  "action": "left_click" | "double_click" | "right_click" | "type" | "key" | "scroll" | "wait" | "terminate",
-  "target_description": "<click류일 때만 - 화면에서 뭘 클릭할지 자연어 설명. 좌표 아님!>",
-  "text": "<type/key/scroll일 때만 - 입력할 텍스트 / 키 이름 / 스크롤 방향("up"|"down")>",
+  "action": "left_click" | "double_click" | "right_click" | "drag" | "type" | "key" | "scroll" | "wait" | "terminate",
+  "target_description": "<click/drag류일 때만 - click은 뭘 클릭할지, drag는 어디서 드래그를
+                          시작할지에 대한 자연어 설명. 좌표 아님!>",
+  "text": "<type/key/scroll/drag일 때만 - 입력할 텍스트 / 키 이름 / 스크롤 방향("up"|"down") /
+          drag의 경우 어디까지 드래그해서 놓을지에 대한 자연어 설명>",
   "status": "success" | "failure",   # terminate일 때만
   "answer": "<질문형 태스크의 최종 답변, 있으면>"  # terminate일 때만
 }
+
+[drag 액션 - 2026-08-07 추가]
+AgentNet 기반 planner LoRA 학습 데이터를 만들다가(prepare_planner_dataset.py) 궤적의
+3.9%가 pyautogui.moveTo()+dragTo() 조합(드래그)이었는데 이 파일의 액션 스키마에 drag가
+없어서 전부 스킵되고 있었다. 새 필드를 만들지 않고 기존 target_description(드래그 시작
+지점 설명)/text(드래그 끝 지점 설명) 필드를 재사용하는 쪽으로 넣었다 - _format_candidate_plan()이
+이미 두 필드를 액션 종류와 무관하게 있으면 그대로 보여주도록 짜여 있어서 별도 수정 없이도
+동작하고, agent_loop.py/gui_grounding 쪽에서 "drag는 두 지점을 grounding해서 좌표로
+바꿔야 한다"는 처리만 나중에 추가하면 된다(아직 agent_loop.py의 실행 매핑 자체가 없는
+단계라 이 파일에서는 스키마/파싱만 준비해둠).
 
 [self-consistency 관련 메모]
 plan_next_action()은 temperature 파라미터를 받지만 내부에서 여러 번 샘플링하지는 않는다
@@ -125,7 +137,7 @@ if TYPE_CHECKING:
     # 실행하는 걸 전제)를 쓰고 있어서, 여기도 그 스타일로 통일한다.
     from qwen import QwenVLModel
 
-_ACTIONS = ("left_click", "double_click", "right_click", "type", "key", "scroll", "wait", "terminate")
+_ACTIONS = ("left_click", "double_click", "right_click", "drag", "type", "key", "scroll", "wait", "terminate")
 
 _FEWSHOT = """
 Example:
@@ -145,6 +157,9 @@ Available actions: {", ".join(_ACTIONS)}
 - left_click / double_click / right_click: needs "target_description" (a short natural-language
   description of the UI element to interact with, NOT coordinates - e.g. "the search button" or
   "the first result link").
+- drag: needs "target_description" (a short natural-language description of WHERE THE DRAG
+  STARTS, NOT coordinates - e.g. "the fill handle at the bottom-right corner of cell A2") and
+  "text" (a short natural-language description of WHERE THE DRAG ENDS - e.g. "cell A13").
 - type: needs "text" (the string to type into the currently focused input).
 - key: needs "text" (a key name, e.g. "Enter", "Tab", "Escape").
 - scroll: needs "text" ("up" or "down").
@@ -191,6 +206,9 @@ Your job, in order:
    - left_click / double_click / right_click: reject unless target_description maps to exactly one
      clearly identifiable element in your observation. If it's ambiguous (could match more than one
      element) or you cannot locate it at all, reject.
+   - drag: reject unless BOTH target_description (drag start) and text (drag end) map to exactly
+     one clearly identifiable element/location each in your observation. If either endpoint is
+     ambiguous or not visible, reject.
    - type: reject unless your observation shows a text input area that is actually focused/active
      and appropriate for this text.
    - key: reject if the key press assumes a UI state (a focused field, an open menu, etc.) that is
@@ -230,6 +248,8 @@ def _format_history(history_actions, max_items=8):
         act = a.get("action")
         if act in ("left_click", "double_click", "right_click"):
             desc = f'{act} on "{a.get("target_description", "?")}"'
+        elif act == "drag":
+            desc = f'drag from "{a.get("target_description", "?")}" to "{a.get("text", "?")}"'
         elif act == "type":
             desc = f'type "{a.get("text", "")}"'
         elif act == "key":
@@ -258,6 +278,15 @@ def _action_schema_valid(obj: dict) -> bool:
     if action in ("left_click", "double_click", "right_click"):
         target = obj.get("target_description")
         return isinstance(target, str) and target.strip() != ""
+    if action == "drag":
+        # (2026-08-07 추가) drag는 target_description(시작 지점)과 text(끝 지점) 둘 다
+        # 있어야 함 - 둘 중 하나라도 없으면 어디서 어디로 드래그하는지 알 수 없음.
+        target = obj.get("target_description")
+        text = obj.get("text")
+        return (
+            isinstance(target, str) and target.strip() != ""
+            and isinstance(text, str) and text.strip() != ""
+        )
     if action in ("type", "key"):
         text = obj.get("text")
         return isinstance(text, str) and text.strip() != ""
@@ -573,6 +602,22 @@ def _run_mock_selftest():
 
     ok_wait = _parse_planner_action('{"action": "wait"}')
     check("wait는 추가 필드 없어도 통과", ok_wait["action"] == "wait" and not ok_wait.get("_parse_failed"))
+
+    # (2026-08-07 추가) drag 액션 - AgentNet 학습 데이터에서 3.9%가 moveTo+dragTo 조합으로
+    # 나왔는데 원래 스키마에 없어서 스킵되던 것을 추가함.
+    ok_drag = _parse_planner_action(
+        '{"reasoning": "r", "action": "drag", "target_description": "the fill handle of cell A2", "text": "cell A13"}'
+    )
+    check("drag: target_description+text 둘 다 있으면 통과", ok_drag["action"] == "drag" and not ok_drag.get("_parse_failed"))
+
+    missing_drag_end = _parse_planner_action('{"action": "drag", "target_description": "the fill handle of cell A2"}')
+    check("drag: text(끝 지점) 없으면 폴백", missing_drag_end["action"] == "terminate")
+
+    missing_drag_start = _parse_planner_action('{"action": "drag", "text": "cell A13"}')
+    check("drag: target_description(시작 지점) 없으면 폴백", missing_drag_start["action"] == "terminate")
+
+    drag_hist = _format_history([{"action": "drag", "target_description": "cell A2 fill handle", "text": "cell A13"}])
+    check("drag 히스토리 포맷", 'drag from "cell A2 fill handle" to "cell A13"' in drag_hist)
 
     # plan_next_action: 모델 generate()를 mock으로 대체해서 메시지 조립까지만 검증
     fake_model = MagicMock()
