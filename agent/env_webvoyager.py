@@ -35,10 +35,21 @@ Chrome+chromedriver 있는 로컬 환경에서 최종 확인 필요 - env_miniwo
 
 import io
 import json
+import os
 import time
 from PIL import Image
 
 DEFAULT_WINDOW_SIZE = (1280, 800)  # WaveUI desktop 샘플 해상도(1280x720)와 비슷하게 기본값 설정
+
+# (2026-08-10 추가) 실측: Allrecipes가 headless Selenium을 봇으로 감지해서 CAPTCHA를 띄우는 게
+# 확인됨(planner/reflection이 정상 작동해도 CAPTCHA는 애초에 풀 수 없어서 태스크 자체가 막힘) -
+# 흔히 알려진 Selenium 자동화 탐지 우회 기본값. 실제 최신 데스크톱 Chrome의 UA 문자열을 흉내내서
+# "headless Chrome"이라는 티가 나는 기본 UA를 대체한다. 필요하면 WebVoyagerEnv(user_agent=...)로
+# 덮어쓸 수 있음.
+DEFAULT_USER_AGENT = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) "
+    "Chrome/124.0.0.0 Safari/537.36"
+)
 
 
 def _make_driver(window_size, headless=True, user_agent=None):
@@ -55,10 +66,29 @@ def _make_driver(window_size, headless=True, user_agent=None):
     # --render(비-headless) 때 겪었던 크래시와 같은 종류의 문제를 사전에 막는다.
     options.add_argument("--no-sandbox")
     options.add_argument("--disable-dev-shm-usage")
-    if user_agent:
-        options.add_argument(f"--user-agent={user_agent}")
+    # (2026-08-10 추가) Selenium 자동화 탐지 우회 - 아래 세 가지가 봇 탐지 스크립트들이 흔히
+    # 확인하는 시그널이다: (1) --disable-blink-features=AutomationControlled로 크로미움이
+    # 자동화 플래그를 노출하는 blink 기능을 꺼서 navigator.webdriver 등 관련 흔적을 줄임,
+    # (2) excludeSwitches=["enable-automation"]으로 "Chrome이 자동화 소프트웨어에 의해
+    # 제어되고 있습니다" 인포바/관련 시그널 제거, (3) useAutomationExtension=False로 셀레니움
+    # 기본 자동화 확장을 안 씀(이것도 탐지에 잘 걸리는 흔적). Allrecipes CAPTCHA 실측 이후 추가.
+    options.add_argument("--disable-blink-features=AutomationControlled")
+    options.add_experimental_option("excludeSwitches", ["enable-automation"])
+    options.add_experimental_option("useAutomationExtension", False)
+    options.add_argument(f"--user-agent={user_agent or DEFAULT_USER_AGENT}")
     driver = webdriver.Chrome(options=options)
     driver.set_window_size(w, h)
+    # (2026-08-10 추가) navigator.webdriver 프로퍼티를 자바스크립트 레벨에서 지운다 -
+    # Options만으로는 안 지워지는 잔여 시그널이라, 새 문서가 로드될 때마다(모든 페이지 이동에
+    # 대해) 이 스크립트가 먼저 실행되도록 CDP로 등록해둔다. 흔히 알려진 셀레니움 탐지 우회
+    # 트릭(navigator.webdriver === true면 자동화로 간주하는 사이트가 많음).
+    try:
+        driver.execute_cdp_cmd(
+            "Page.addScriptToEvaluateOnNewDocument",
+            {"source": "Object.defineProperty(navigator, 'webdriver', {get: () => undefined})"},
+        )
+    except Exception as e:  # noqa: BLE001 - 이 우회가 실패해도 브라우저 자체는 계속 쓸 수 있어야 함
+        print(f"[env_webvoyager.py] navigator.webdriver 우회 스크립트 등록 실패(무시하고 진행): {e}")
     return driver
 
 
@@ -408,6 +438,16 @@ if __name__ == "__main__":
     ap.add_argument("--width", type=int, default=DEFAULT_WINDOW_SIZE[0])
     ap.add_argument("--height", type=int, default=DEFAULT_WINDOW_SIZE[1])
     ap.add_argument("--selftest", action="store_true", help="실제 브라우저 없이 액션 dispatch 로직만 mock으로 검증")
+    ap.add_argument(
+        "--out_image", default=None,
+        help="reset 스크린샷 저장 경로. 미지정시 실행 위치(cwd) 기준 './webvoyager_reset.png' - "
+        "(2026-08-10 수정 x2) 처음엔 '/tmp/...'로 하드코딩돼 있어서 Windows에서 FileNotFoundError가 "
+        "났었고(실측), tempfile.gettempdir()로 바꿨더니 이번엔 이 값이 OS 기본 TEMP가 아니라 사용자 "
+        "PC에 깔린 ESTsoft(알집/반디집류) 프로그램이 TEMP 환경변수를 자기 폴더로 덮어써놓은 값이 "
+        "그대로 나와서 경로가 이상하게 나왔다(실측: C:\\Users\\Public\\...\\ESTsoft\\CreatorTemp\\...) - "
+        "예측 불가능한 시스템 환경변수에 기대는 대신, 그냥 이 스크립트를 실행한 위치 기준으로 저장하게 "
+        "바꿔서 항상 어디에 저장됐는지 바로 알 수 있게 함.",
+    )
     args = ap.parse_args()
 
     if args.selftest:
@@ -428,6 +468,9 @@ if __name__ == "__main__":
         print("instruction:", task_info["instruction"])
         print("url:", task_info["url"])
         print("screenshot size:", screenshot.size)
-        screenshot.save("/tmp/webvoyager_reset.png")
-        print("[env_webvoyager.py] reset 완료. screenshot 저장: /tmp/webvoyager_reset.png")
+
+        out_image = args.out_image or os.path.join(os.getcwd(), "webvoyager_reset.png")
+        screenshot.save(out_image)
+        print(f"[env_webvoyager.py] reset 완료. screenshot 저장: {out_image}")
+        env.close()
         env.close()

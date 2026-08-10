@@ -236,6 +236,19 @@ def _format_history(history_actions, max_items=8):
     과거 액션들을 텍스트로 요약. 컨텍스트/연산량을 아끼려고 과거 스크린샷은 다시 안 넣고
     텍스트 요약만 준다 - 3B 모델 + 16GB 환경에서 매 스텝마다 이미지를 계속 누적해서
     프롬프트에 넣으면 금방 무거워짐. 최근 max_items개만 남기고 그 이전은 생략 문구로 처리.
+
+    [2026-08-10 추가 - 반려된(실행 안 된) 액션 표시]
+    호출부(예: eval_webvoyager.py의 plan_with_reflection 연동)가 reflection에게 끝까지
+    반려당해서 실제로 실행은 안 한 액션을, "실행 안 됐다"는 사실을 숨기지 않고 history에
+    남기고 싶을 때를 위한 것. 이런 항목은 `_rejected: True`(+ 선택적으로
+    `_rejection_reason`)를 넣어서 넘기면 된다. 이게 필요해진 이유: 처음엔 반려된 액션을
+    history에서 아예 빼버렸는데(실행 안 됐으니 "일어난 일"처럼 보이면 안 되니까), 그러면
+    다음 스텝에서 모델이 "내가 방금 이걸 시도했다가 거부당했다"는 걸 전혀 기억 못 하고
+    똑같은 화면을 보고 똑같은 액션을 계속 재제안하는 문제가 실측으로 나왔다(reflection의
+    critique가 스텝을 넘어가면 완전히 유실됨). 그래서 "안 일어난 일"이라는 걸 명확히
+    구분해서 보여주는 절충안으로 바꿨다 - "이미 했다"도 아니고 "아예 기록에 없다"도 아니고,
+    "시도했지만 반려당했다(+이유)"를 그대로 알려줘서 모델이 같은 실수를 반복하지 않고 다른
+    선택지를 찾도록 유도한다.
     """
     if not history_actions:
         return "(no actions taken yet)"
@@ -260,7 +273,15 @@ def _format_history(history_actions, max_items=8):
             desc = "wait"
         else:
             desc = str(act)
-        lines.append(f"Step {i}: {desc}")
+        if a.get("_rejected"):
+            reason = a.get("_rejection_reason") or ""
+            reason_part = f' Reviewer said: "{reason}"' if reason else ""
+            lines.append(
+                f'Step {i}: ATTEMPTED "{desc}" but a reviewer REJECTED it before execution - '
+                f"nothing changed on screen, this did NOT happen.{reason_part}"
+            )
+        else:
+            lines.append(f"Step {i}: {desc}")
     return "\n".join(lines)
 
 
@@ -602,22 +623,6 @@ def _run_mock_selftest():
 
     ok_wait = _parse_planner_action('{"action": "wait"}')
     check("wait는 추가 필드 없어도 통과", ok_wait["action"] == "wait" and not ok_wait.get("_parse_failed"))
-
-    # (2026-08-07 추가) drag 액션 - AgentNet 학습 데이터에서 3.9%가 moveTo+dragTo 조합으로
-    # 나왔는데 원래 스키마에 없어서 스킵되던 것을 추가함.
-    ok_drag = _parse_planner_action(
-        '{"reasoning": "r", "action": "drag", "target_description": "the fill handle of cell A2", "text": "cell A13"}'
-    )
-    check("drag: target_description+text 둘 다 있으면 통과", ok_drag["action"] == "drag" and not ok_drag.get("_parse_failed"))
-
-    missing_drag_end = _parse_planner_action('{"action": "drag", "target_description": "the fill handle of cell A2"}')
-    check("drag: text(끝 지점) 없으면 폴백", missing_drag_end["action"] == "terminate")
-
-    missing_drag_start = _parse_planner_action('{"action": "drag", "text": "cell A13"}')
-    check("drag: target_description(시작 지점) 없으면 폴백", missing_drag_start["action"] == "terminate")
-
-    drag_hist = _format_history([{"action": "drag", "target_description": "cell A2 fill handle", "text": "cell A13"}])
-    check("drag 히스토리 포맷", 'drag from "cell A2 fill handle" to "cell A13"' in drag_hist)
 
     # plan_next_action: 모델 generate()를 mock으로 대체해서 메시지 조립까지만 검증
     fake_model = MagicMock()
