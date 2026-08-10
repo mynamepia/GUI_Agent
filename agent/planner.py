@@ -38,12 +38,24 @@ Distillation처럼 별도 planner LoRA를 소규모 trajectory로 파인튜닝�
   "reasoning": "<왜 이 액션을 골랐는지 - action보다 먼저 쓰게 강제해서, 결론부터 내리고
                 사후정당화하는 대신 근거를 먼저 풀게 유도함. region_focus.judge_inference()의
                 reason-then-ans 트릭과 동일한 원칙>",
-  "action": "left_click" | "double_click" | "right_click" | "type" | "key" | "scroll" | "wait" | "terminate",
-  "target_description": "<click류일 때만 - 화면에서 뭘 클릭할지 자연어 설명. 좌표 아님!>",
-  "text": "<type/key/scroll일 때만 - 입력할 텍스트 / 키 이름 / 스크롤 방향("up"|"down")>",
+  "action": "left_click" | "double_click" | "right_click" | "drag" | "type" | "key" | "scroll" | "wait" | "terminate",
+  "target_description": "<click/drag류일 때만 - click은 뭘 클릭할지, drag는 어디서 드래그를
+                          시작할지에 대한 자연어 설명. 좌표 아님!>",
+  "text": "<type/key/scroll/drag일 때만 - 입력할 텍스트 / 키 이름 / 스크롤 방향("up"|"down") /
+          drag의 경우 어디까지 드래그해서 놓을지에 대한 자연어 설명>",
   "status": "success" | "failure",   # terminate일 때만
   "answer": "<질문형 태스크의 최종 답변, 있으면>"  # terminate일 때만
 }
+
+[drag 액션 - 2026-08-07 추가]
+AgentNet 기반 planner LoRA 학습 데이터를 만들다가(prepare_planner_dataset.py) 궤적의
+3.9%가 pyautogui.moveTo()+dragTo() 조합(드래그)이었는데 이 파일의 액션 스키마에 drag가
+없어서 전부 스킵되고 있었다. 새 필드를 만들지 않고 기존 target_description(드래그 시작
+지점 설명)/text(드래그 끝 지점 설명) 필드를 재사용하는 쪽으로 넣었다 - _format_candidate_plan()이
+이미 두 필드를 액션 종류와 무관하게 있으면 그대로 보여주도록 짜여 있어서 별도 수정 없이도
+동작하고, agent_loop.py/gui_grounding 쪽에서 "drag는 두 지점을 grounding해서 좌표로
+바꿔야 한다"는 처리만 나중에 추가하면 된다(아직 agent_loop.py의 실행 매핑 자체가 없는
+단계라 이 파일에서는 스키마/파싱만 준비해둠).
 
 [self-consistency 관련 메모]
 plan_next_action()은 temperature 파라미터를 받지만 내부에서 여러 번 샘플링하지는 않는다
@@ -68,6 +80,20 @@ Agent Distillation 논문에서 언급된 "여러 번 샘플링 + 다수결"로 
 플래그만 남김(무한루프 방지 + 조용히 막지 않고 호출부가 판단하게 하는 기존 폴백 원칙과 동일).
 max_iterations 기본값은 2("1차 시도 + 반려시 1번만 수정 재시도") - agent_loop.py에서 스텝마다
 이 루프를 그대로 쓸 예정이라 여기서 기본값을 정해두되 인자로 override 가능하게 열어둠.
+
+[reflection_model 파라미터 - 제안과 비평을 각자 다른 모델로]
+plan_with_reflection()은 내부에서 plan_next_action()(제안)과 _reflect_on_plan()(비평)을
+호출하는데, reflection_model을 통해 이 둘을 서로 다른 모델 객체로 돌릴 수 있다 - 예를
+들어 제안은 planner 전용 LoRA를 얹은 모델로, 비평은 reflector 전용 LoRA를 얹은(또는
+LoRA 없는 base) 모델로 나누는 식. reflection_model을 지정하지 않으면(기본값 None) 예전
+방식 그대로 qwen_model 하나로 제안/비평을 둘 다 돌린다(하위 호환).
+
+이 파일은 qwen_model/reflection_model이 실제로 어댑터를 얹었는지 base인지 전혀 모르고
+신경 쓰지도 않는다 - duck-typing으로 .generate(messages, max_new_tokens=..., temperature=...)
+만 있으면 그대로 동작한다. 즉 "제안/비평 각각 자기 어댑터를 쓸 수도, 어댑터 없이 base로
+돌 수도 있다"는 요구사항은 이 파일이 직접 구현하는 게 아니라, 호출부(agent_loop.py)가
+qwen_model/reflection_model에 뭘 넘기느냐로 결정된다 - 이 파일은 그 결정과 완전히
+무관하게 항상 똑같이 동작한다(이 파일이 어댑터 유무를 분기 처리할 필요가 없다는 뜻).
 
 [reflection 프롬프트 강화 - 1차 버전에서 빠졌던 것들]
 1차 버전은 "모순이 있으면 반려"라는 수동적 비교 위주였고, terminate/click에만 명시적
@@ -111,7 +137,7 @@ if TYPE_CHECKING:
     # 실행하는 걸 전제)를 쓰고 있어서, 여기도 그 스타일로 통일한다.
     from qwen import QwenVLModel
 
-_ACTIONS = ("left_click", "double_click", "right_click", "type", "key", "scroll", "wait", "terminate")
+_ACTIONS = ("left_click", "double_click", "right_click", "drag", "type", "key", "scroll", "wait", "terminate")
 
 _FEWSHOT = """
 Example:
@@ -131,6 +157,9 @@ Available actions: {", ".join(_ACTIONS)}
 - left_click / double_click / right_click: needs "target_description" (a short natural-language
   description of the UI element to interact with, NOT coordinates - e.g. "the search button" or
   "the first result link").
+- drag: needs "target_description" (a short natural-language description of WHERE THE DRAG
+  STARTS, NOT coordinates - e.g. "the fill handle at the bottom-right corner of cell A2") and
+  "text" (a short natural-language description of WHERE THE DRAG ENDS - e.g. "cell A13").
 - type: needs "text" (the string to type into the currently focused input).
 - key: needs "text" (a key name, e.g. "Enter", "Tab", "Escape").
 - scroll: needs "text" ("up" or "down").
@@ -177,6 +206,9 @@ Your job, in order:
    - left_click / double_click / right_click: reject unless target_description maps to exactly one
      clearly identifiable element in your observation. If it's ambiguous (could match more than one
      element) or you cannot locate it at all, reject.
+   - drag: reject unless BOTH target_description (drag start) and text (drag end) map to exactly
+     one clearly identifiable element/location each in your observation. If either endpoint is
+     ambiguous or not visible, reject.
    - type: reject unless your observation shows a text input area that is actually focused/active
      and appropriate for this text.
    - key: reject if the key press assumes a UI state (a focused field, an open menu, etc.) that is
@@ -204,6 +236,19 @@ def _format_history(history_actions, max_items=8):
     과거 액션들을 텍스트로 요약. 컨텍스트/연산량을 아끼려고 과거 스크린샷은 다시 안 넣고
     텍스트 요약만 준다 - 3B 모델 + 16GB 환경에서 매 스텝마다 이미지를 계속 누적해서
     프롬프트에 넣으면 금방 무거워짐. 최근 max_items개만 남기고 그 이전은 생략 문구로 처리.
+
+    [2026-08-10 추가 - 반려된(실행 안 된) 액션 표시]
+    호출부(예: eval_webvoyager.py의 plan_with_reflection 연동)가 reflection에게 끝까지
+    반려당해서 실제로 실행은 안 한 액션을, "실행 안 됐다"는 사실을 숨기지 않고 history에
+    남기고 싶을 때를 위한 것. 이런 항목은 `_rejected: True`(+ 선택적으로
+    `_rejection_reason`)를 넣어서 넘기면 된다. 이게 필요해진 이유: 처음엔 반려된 액션을
+    history에서 아예 빼버렸는데(실행 안 됐으니 "일어난 일"처럼 보이면 안 되니까), 그러면
+    다음 스텝에서 모델이 "내가 방금 이걸 시도했다가 거부당했다"는 걸 전혀 기억 못 하고
+    똑같은 화면을 보고 똑같은 액션을 계속 재제안하는 문제가 실측으로 나왔다(reflection의
+    critique가 스텝을 넘어가면 완전히 유실됨). 그래서 "안 일어난 일"이라는 걸 명확히
+    구분해서 보여주는 절충안으로 바꿨다 - "이미 했다"도 아니고 "아예 기록에 없다"도 아니고,
+    "시도했지만 반려당했다(+이유)"를 그대로 알려줘서 모델이 같은 실수를 반복하지 않고 다른
+    선택지를 찾도록 유도한다.
     """
     if not history_actions:
         return "(no actions taken yet)"
@@ -216,6 +261,8 @@ def _format_history(history_actions, max_items=8):
         act = a.get("action")
         if act in ("left_click", "double_click", "right_click"):
             desc = f'{act} on "{a.get("target_description", "?")}"'
+        elif act == "drag":
+            desc = f'drag from "{a.get("target_description", "?")}" to "{a.get("text", "?")}"'
         elif act == "type":
             desc = f'type "{a.get("text", "")}"'
         elif act == "key":
@@ -226,7 +273,15 @@ def _format_history(history_actions, max_items=8):
             desc = "wait"
         else:
             desc = str(act)
-        lines.append(f"Step {i}: {desc}")
+        if a.get("_rejected"):
+            reason = a.get("_rejection_reason") or ""
+            reason_part = f' Reviewer said: "{reason}"' if reason else ""
+            lines.append(
+                f'Step {i}: ATTEMPTED "{desc}" but a reviewer REJECTED it before execution - '
+                f"nothing changed on screen, this did NOT happen.{reason_part}"
+            )
+        else:
+            lines.append(f"Step {i}: {desc}")
     return "\n".join(lines)
 
 
@@ -244,6 +299,15 @@ def _action_schema_valid(obj: dict) -> bool:
     if action in ("left_click", "double_click", "right_click"):
         target = obj.get("target_description")
         return isinstance(target, str) and target.strip() != ""
+    if action == "drag":
+        # (2026-08-07 추가) drag는 target_description(시작 지점)과 text(끝 지점) 둘 다
+        # 있어야 함 - 둘 중 하나라도 없으면 어디서 어디로 드래그하는지 알 수 없음.
+        target = obj.get("target_description")
+        text = obj.get("text")
+        return (
+            isinstance(target, str) and target.strip() != ""
+            and isinstance(text, str) and text.strip() != ""
+        )
     if action in ("type", "key"):
         text = obj.get("text")
         return isinstance(text, str) and text.strip() != ""
@@ -387,8 +451,11 @@ def _reflect_on_plan(
     temperature: float = 0.4,
 ) -> dict:
     """
-    candidate_plan 하나를 실행 전에 비평한다. planner와 별개 호출(같은 backbone, 다른
-    system prompt) - _REFLECTION_SYSTEM_PROMPT가 "네 판단부터 독립적으로 써라"를 강제함.
+    candidate_plan 하나를 실행 전에 비평한다. planner와 별개 호출(system prompt가 다름) -
+    _REFLECTION_SYSTEM_PROMPT가 "네 판단부터 독립적으로 써라"를 강제함. 여기 넘어오는
+    qwen_model은 plan_with_reflection()이 reflection_model(지정 안 하면 제안과 동일한
+    모델)을 그대로 전달한 것 - 이 함수 자체는 그 모델이 base인지 어떤 LoRA를 얹었는지
+    모른다(duck-typing).
 
     Returns: {"observation": str, "approved": bool, "critique": str, ...}
     """
@@ -423,10 +490,19 @@ def plan_with_reflection(
     planner_temperature: float = 0.0,
     reflection_temperature: float = 0.4,
     max_iterations: int = 2,
+    reflection_model: "QwenVLModel | None" = None,
 ) -> dict:
     """
     plan_next_action() <-> _reflect_on_plan() 루프. 실행 전에 후보 액션을 reflection이
     검토해서, 승인되면 그 액션을 반환하고 반려되면 critique를 planner에 되먹여 재시도한다.
+
+    Args:
+        qwen_model: 제안(plan_next_action) 호출에 쓸 모델.
+        reflection_model: 비평(_reflect_on_plan) 호출에 쓸 모델. None이면(기본값)
+            qwen_model을 그대로 재사용한다 - 제안/비평 둘 다 같은 모델 하나로 도는
+            동작(하위 호환). 제안용 어댑터와 비평용 어댑터를 따로 쓰고 싶을 때(또는 둘 중
+            하나만 어댑터가 있고 나머지는 base일 때)만 명시적으로 넘기면 된다 - 이 함수는
+            qwen_model/reflection_model이 어댑터를 얹었는지 base인지 전혀 모른다.
 
     max_iterations 기본값은 2 - agent_loop.py에서 스텝마다 이 루프를 돌릴 때 "1차 시도 +
     반려시 1번만 수정 재시도"로 쓰기로 합의한 값. agent_loop.py 쪽에서 이 인자로 override
@@ -441,6 +517,8 @@ def plan_with_reflection(
         "_reflection_approved": bool
         "_reflection_log": [{"iteration": int, "plan": dict, "verdict": dict}, ...]
     """
+    reflect_qwen_model = reflection_model if reflection_model is not None else qwen_model
+
     log = []
     candidate = None
     verdict = None
@@ -466,7 +544,7 @@ def plan_with_reflection(
             return candidate
 
         verdict = _reflect_on_plan(
-            qwen_model,
+            reflect_qwen_model,
             task_instruction,
             screenshot,
             history_actions,
@@ -545,6 +623,41 @@ def _run_mock_selftest():
 
     ok_wait = _parse_planner_action('{"action": "wait"}')
     check("wait는 추가 필드 없어도 통과", ok_wait["action"] == "wait" and not ok_wait.get("_parse_failed"))
+
+    # (2026-08-07 추가) drag 액션 - AgentNet 학습 데이터에서 3.9%가 moveTo+dragTo 조합으로
+    # 나왔는데 원래 스키마에 없어서 스킵되던 것을 추가함.
+    ok_drag = _parse_planner_action(
+        '{"reasoning": "r", "action": "drag", "target_description": "the fill handle of cell A2", "text": "cell A13"}'
+    )
+    check("drag: target_description+text 둘 다 있으면 통과", ok_drag["action"] == "drag" and not ok_drag.get("_parse_failed"))
+
+    missing_drag_end = _parse_planner_action('{"action": "drag", "target_description": "the fill handle of cell A2"}')
+    check("drag: text(끝 지점) 없으면 폴백", missing_drag_end["action"] == "terminate")
+
+    missing_drag_start = _parse_planner_action('{"action": "drag", "text": "cell A13"}')
+    check("drag: target_description(시작 지점) 없으면 폴백", missing_drag_start["action"] == "terminate")
+
+    drag_hist = _format_history([{"action": "drag", "target_description": "cell A2 fill handle", "text": "cell A13"}])
+    check("drag 히스토리 포맷", 'drag from "cell A2 fill handle" to "cell A13"' in drag_hist)
+
+    # (2026-08-10 추가) reflection에게 반려당한 액션을 history에 넣을 때 - "이미 했다"가 아니라
+    # "시도했지만 반려당해서 실행 안 됐다"는 게 명확히 드러나야 함(eval_webvoyager.py가 이 형태로
+    # 넘김 - 반려 사실이 스텝을 넘어 유실되면 같은 걸 계속 재제안하는 문제가 실측으로 확인됨).
+    rejected_hist = _format_history([
+        {
+            "action": "left_click",
+            "target_description": "the CAPTCHA checkbox",
+            "_rejected": True,
+            "_rejection_reason": "no CAPTCHA checkbox is visible in the screenshot",
+        }
+    ])
+    check("반려된 액션 -> '실행 안 됐다'는 문구 포함", "did NOT happen" in rejected_hist)
+    check("반려된 액션 -> 원래 액션 설명도 그대로 포함", 'left_click on "the CAPTCHA checkbox"' in rejected_hist)
+    check("반려된 액션 -> 반려 사유(critique)도 포함", "no CAPTCHA checkbox is visible" in rejected_hist)
+
+    # 반려 사유가 없어도(critique가 빈 문자열인 케이스) 에러 없이 동작해야 함
+    rejected_hist_no_reason = _format_history([{"action": "wait", "_rejected": True}])
+    check("반려된 액션(사유 없음) -> 에러 없이 포맷됨", "did NOT happen" in rejected_hist_no_reason)
 
     # plan_next_action: 모델 generate()를 mock으로 대체해서 메시지 조립까지만 검증
     fake_model = MagicMock()
@@ -630,6 +743,38 @@ def _run_mock_selftest():
     result3 = plan_with_reflection(parse_fail_model, "task", Image.new("RGB", (4, 4)), max_iterations=3)
     check("plan_with_reflection -> planner 파싱실패시 reflection 스킵", parse_fail_model.generate.call_count == 1)
     check("plan_with_reflection -> planner 파싱실패시 approved=False", result3["_reflection_approved"] is False)
+
+    # plan_with_reflection: reflection_model을 명시하면 제안/비평이 서로 다른 모델 객체로
+    # 라우팅되는지 - planner 전용 어댑터(propose_model)와 reflector 전용 어댑터(또는 base)
+    # (reflect_model)를 분리해서 쓰는 agent_loop.py 사용 패턴을 재현.
+    propose_model = MagicMock()
+    propose_model.generate.side_effect = [
+        '{"reasoning": "seems closed already", "action": "terminate", "status": "success"}',
+        '{"reasoning": "need to click close first", "action": "left_click", "target_description": "close button"}',
+    ]
+    reflect_model = MagicMock()
+    reflect_model.generate.side_effect = [
+        '{"observation": "a dialog is still open", "approved": false, "critique": "dialog still visible"}',
+        '{"observation": "close button visible", "approved": true, "critique": ""}',
+    ]
+    result4 = plan_with_reflection(
+        propose_model, "close the dialog", Image.new("RGB", (4, 4)),
+        max_iterations=3, reflection_model=reflect_model,
+    )
+    check("reflection_model 지정 -> 최종 승인", result4["_reflection_approved"] is True)
+    check("reflection_model 지정 -> propose_model이 제안 2번 호출됨", propose_model.generate.call_count == 2)
+    check("reflection_model 지정 -> reflect_model이 비평 2번 호출됨", reflect_model.generate.call_count == 2)
+    check(
+        "reflection_model 지정 -> 비평 호출이 propose_model로는 안 감(라우팅 분리 확인)",
+        not any("observation" in str(c) for c in propose_model.generate.call_args_list),
+    )
+
+    # reflection_model을 안 주면(기본값 None) 예전처럼 qwen_model 하나로 제안/비평이 다 감
+    # (하위 호환 확인 - 위의 seq_model 테스트가 이미 이 경로를 검증하지만, 명시적으로 한 번 더)
+    check(
+        "reflection_model 기본값 None -> _reflect_on_plan()에도 qwen_model이 그대로 감(seq_model 재사용 테스트로 이미 확인됨)",
+        seq_model.generate.call_count == 4,
+    )
 
     n_fail = sum(1 for _, ok in checks if not ok)
     for name, ok in checks:
