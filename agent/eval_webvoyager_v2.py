@@ -95,17 +95,73 @@ def dummy_agent_step(screenshot, task_info, history):
 
 
 # ---------------------------------------------------------------------------
+# (2026-08-11 추가 - region focus 재연결) click grounding 백엔드 선택
+# ---------------------------------------------------------------------------
+def _build_click_ground_fn(
+    use_regionfocus: bool = False,
+    regionfocus_debug_image: bool = False,
+    regionfocus_debug_text: bool = False,
+    regionfocus_step1_format: str = "point_text",
+    regionfocus_step4_format: str = "point_text",
+):
+    """
+    click 계열 액션(left_click/double_click/right_click)의 grounding을 무엇으로 할지 정하는
+    factory. eval_webvoyager_v2.py는 지금까지 _convert_planner_action_to_env()가
+    gui_grounding.ground()(초기 grounding 1회)만 직접 import해서 썼는데, 이 프로젝트가 실제로
+    검증/적용한 RegionFocus 재탐색 파이프라인(region_focus.py의 ground_with_regionfocus() -
+    초기 grounding -> judge 판단 -> 오답이면 재탐색 -> crop/zoom 4비율 정밀화 -> 후보 종합,
+    module docstring 참고)이 이 배치 평가 경로에는 연결이 안 되어 있었다. 여기서 다시 연결한다.
+
+    반환하는 ground_fn은 어느 쪽이든 gui_grounding.ground()와 동일한 시그니처
+    ground_fn(model, instruction, screenshot, **kwargs) -> {"result", "point", "raw_response", ...}
+    로 통일되어 있어(region_focus.ground_with_regionfocus() docstring 참고), 호출부
+    (_convert_planner_action_to_env)는 어느 백엔드가 실제로 도는지 몰라도 된다. 두 백엔드가
+    서로 못 알아듣는 kwargs(gui_grounding.ground()는 task_id 개념이 없고, ground_with_regionfocus()는
+    max_new_tokens를 안 받음 - 내부 각 단계가 자체 max_new_tokens를 하드코딩해서 씀)는 여기서
+    조용히 걸러낸다.
+    """
+    if not use_regionfocus:
+        from gui_grounding import ground
+
+        def _ground_fn(model, instruction, screenshot, **kwargs):
+            kwargs.pop("task_id", None)
+            return ground(model, instruction, screenshot, **kwargs)
+
+        return _ground_fn
+
+    from region_focus import ground_with_regionfocus
+
+    def _ground_fn(model, instruction, screenshot, **kwargs):
+        task_id = kwargs.pop("task_id", None)
+        kwargs.pop("max_new_tokens", None)
+        return ground_with_regionfocus(
+            model, instruction, screenshot,
+            debug_image=regionfocus_debug_image,
+            debug_text=regionfocus_debug_text,
+            task_id=task_id,
+            step1_format=regionfocus_step1_format,
+            step4_format=regionfocus_step4_format,
+            **kwargs,  # min_pixels/max_pixels만 남아있으면 그대로 통과
+        )
+
+    return _ground_fn
+
+
+# ---------------------------------------------------------------------------
 # (2026-08-09 추가) 실제 정책: planner LoRA(plan) + grounding LoRA(좌표) 연결
 # ---------------------------------------------------------------------------
-def _convert_planner_action_to_env(plan: dict, grounding_model, screenshot, ground_kwargs: dict):
+def _convert_planner_action_to_env(
+    plan: dict, grounding_model, screenshot, ground_kwargs: dict, ground_fn=None, task_id=None,
+):
     """
     agent/planner.py의 출력 스키마(자연어 target_description/action/text)를
     env_webvoyager.WebVoyagerEnv.execute_action()이 기대하는 스키마(픽셀 coordinate)로
-    변환한다. click류는 gui_grounding.ground()를 호출해서 target_description을 실제
-    좌표로 바꾼다(이 시점에 grounding_model은 이미 grounding LoRA가 활성 상태라고 가정 -
-    agent_loop._AdapterSwitchView.generate()가 planning 호출 뒤 자동으로 default(grounding)로
-    복원해주므로, plan_next_action()/plan_with_reflection() 호출 직후 여기로 넘어올 때는
-    항상 그 상태다).
+    변환한다. click류는 ground_fn(기본은 gui_grounding.ground(), build_planner_grounding_agent_step이
+    use_regionfocus=True로 만들었으면 region_focus.ground_with_regionfocus() - 위
+    _build_click_ground_fn() 참고)을 호출해서 target_description을 실제 좌표로 바꾼다(이 시점에
+    grounding_model은 이미 grounding LoRA가 활성 상태라고 가정 - agent_loop._AdapterSwitchView.
+    generate()가 planning 호출 뒤 자동으로 default(grounding)로 복원해주므로,
+    plan_next_action()/plan_with_reflection() 호출 직후 여기로 넘어올 때는 항상 그 상태다).
 
     (2026-08-11 추가 - 버그 수정) grounding 실패/drag 미구현으로 이 함수가 액션을 no-op(wait)
     으로 "다운그레이드"할 때는, 반환 dict에 내부용 마커 "_downgrade_reason"을 같이 실어 보낸다.
@@ -120,7 +176,8 @@ def _convert_planner_action_to_env(plan: dict, grounding_model, screenshot, grou
     보정한 뒤 반드시 pop해서 지운다(env_webvoyager.execute_action()은 이 키를 모름 - 다만 몰라도
     무시되긴 하니 안 지워도 즉시 깨지진 않는다, 다만 불필요한 키를 env로 흘려보내지 않기 위해 지운다).
     """
-    from gui_grounding import ground
+    if ground_fn is None:
+        ground_fn = _build_click_ground_fn(use_regionfocus=False)
 
     act = plan.get("action")
 
@@ -131,7 +188,7 @@ def _convert_planner_action_to_env(plan: dict, grounding_model, screenshot, grou
 
     if act in ("left_click", "double_click", "right_click"):
         target = plan.get("target_description") or ""
-        g = ground(grounding_model, target, screenshot, **ground_kwargs)
+        g = ground_fn(grounding_model, target, screenshot, task_id=task_id, **ground_kwargs)
         if g["result"] != "positive":
             print(f"[agent_step] grounding 실패(target={target!r}) -> 이번 스텝은 no-op으로 스킵")
             return {
@@ -373,6 +430,11 @@ def build_planner_grounding_agent_step(
     verbose: bool = True,
     debug_dir: str | None = None,
     debug_save_images: bool = True,
+    use_regionfocus: bool = True,
+    regionfocus_debug_image: bool = False,
+    regionfocus_debug_text: bool = False,
+    regionfocus_step1_format: str = "point_text",
+    regionfocus_step4_format: str = "point_text",
 ):
     """
     agent_loop.load_shared_model()이 반환한 (model, planning_view)로 실제 정책 함수를
@@ -398,8 +460,24 @@ def build_planner_grounding_agent_step(
     plan_with_reflection(reflection_model=...) 파라미터가 정확히 이 용도로 만들어져 있었는데
     이 함수가 그동안 안 넘기고 있었다(그래서 propose/reflect 둘 다 조용히 같은 planner
     어댑터로 돌고 있었음).
+
+    [2026-08-11 추가 - region focus 재연결]
+    use_regionfocus=True(기본)면 click 계열 액션의 grounding을 gui_grounding.ground()(초기
+    grounding 1회) 대신 region_focus.ground_with_regionfocus()(재탐색+crop/zoom 정밀화, 이
+    프로젝트가 실제로 grounding 정확도를 끌어올린 것으로 확인한 파이프라인 - region_focus.py
+    module docstring 참고)로 돌린다. click 1회당 모델 호출이 5~9회로 늘어나서 스텝당 훨씬
+    느려지므로, 빠르게 배선만 확인하고 싶으면 use_regionfocus=False(CLI는 --no_regionfocus)로
+    끌 것. _build_click_ground_fn() 참고.
     """
     from planner import plan_next_action, plan_with_reflection
+
+    click_ground_fn = _build_click_ground_fn(
+        use_regionfocus=use_regionfocus,
+        regionfocus_debug_image=regionfocus_debug_image,
+        regionfocus_debug_text=regionfocus_debug_text,
+        regionfocus_step1_format=regionfocus_step1_format,
+        regionfocus_step4_format=regionfocus_step4_format,
+    )
 
     reflection_view = None
     if use_reflection:
@@ -529,7 +607,10 @@ def build_planner_grounding_agent_step(
                 plan = dict(plan)
                 plan["answer"] = extracted
 
-        env_action = _convert_planner_action_to_env(plan, debug_grounding_click_view, screenshot, ground_kwargs)
+        env_action = _convert_planner_action_to_env(
+            plan, debug_grounding_click_view, screenshot, ground_kwargs,
+            ground_fn=click_ground_fn, task_id=(task_info or {}).get("id"),
+        )
 
         # (2026-08-11 추가 - 버그 수정) grounding 실패/drag 미구현으로 위에서 no-op(wait)으로
         # 다운그레이드된 경우, 바로 위 planner_history.append(plan)이 "실제로는 실행되지 않은"
@@ -1222,7 +1303,7 @@ def _run_mock_selftest():
             fake_planning_view = MagicMock()
 
             agent_step_fn = build_planner_grounding_agent_step(
-                fake_model, fake_planning_view, use_reflection=True, verbose=False
+                fake_model, fake_planning_view, use_reflection=True, verbose=False, use_regionfocus=False,
             )
             step1 = agent_step_fn(wide_img, {"instruction": "close the window"}, {"actions": [], "screenshots": []})
             check(
@@ -1257,7 +1338,7 @@ def _run_mock_selftest():
             )
 
             agent_step_fn_no_reflect = build_planner_grounding_agent_step(
-                fake_model, fake_planning_view, use_reflection=False, verbose=False
+                fake_model, fake_planning_view, use_reflection=False, verbose=False, use_regionfocus=False,
             )
             plan_calls.clear()
             agent_step_fn_no_reflect(wide_img, {"instruction": "x"}, {"actions": [], "screenshots": []})
@@ -1270,7 +1351,7 @@ def _run_mock_selftest():
             fake_planner_module.plan_with_reflection = _fake_plan_terminate_no_answer
             fake_model_for_answer = _make_fake_grounding_model("42")
             agent_step_fn2 = build_planner_grounding_agent_step(
-                fake_model_for_answer, fake_planning_view, use_reflection=True, verbose=False
+                fake_model_for_answer, fake_planning_view, use_reflection=True, verbose=False, use_regionfocus=False,
             )
             term_action = agent_step_fn2(wide_img, {"instruction": "what is the answer?"}, {"actions": [], "screenshots": []})
             check(
@@ -1285,7 +1366,7 @@ def _run_mock_selftest():
             fake_planner_module.plan_with_reflection = _fake_plan_terminate_with_answer
             fake_model_should_not_be_called = _make_fake_grounding_model("SHOULD NOT APPEAR")
             agent_step_fn3 = build_planner_grounding_agent_step(
-                fake_model_should_not_be_called, fake_planning_view, use_reflection=True, verbose=False
+                fake_model_should_not_be_called, fake_planning_view, use_reflection=True, verbose=False, use_regionfocus=False,
             )
             term_action2 = agent_step_fn3(wide_img, {"instruction": "x"}, {"actions": [], "screenshots": []})
             check(
@@ -1314,7 +1395,7 @@ def _run_mock_selftest():
             fake_planner_module.plan_with_reflection = _fake_plan_rejected
             fake_model_should_not_ground = _make_fake_grounding_model("SHOULD NOT APPEAR")
             agent_step_fn4 = build_planner_grounding_agent_step(
-                fake_model_should_not_ground, fake_planning_view, use_reflection=True, verbose=False
+                fake_model_should_not_ground, fake_planning_view, use_reflection=True, verbose=False, use_regionfocus=False,
             )
             rejected_action = agent_step_fn4(wide_img, {"instruction": "x"}, {"actions": [], "screenshots": []})
             check(
@@ -1347,7 +1428,7 @@ def _run_mock_selftest():
 
             fake_planner_module.plan_with_reflection = _fake_plan_approved
             agent_step_fn5 = build_planner_grounding_agent_step(
-                fake_model, fake_planning_view, use_reflection=True, verbose=False
+                fake_model, fake_planning_view, use_reflection=True, verbose=False, use_regionfocus=False,
             )
             approved_action = agent_step_fn5(wide_img, {"instruction": "x"}, {"actions": [], "screenshots": []})
             check(
@@ -1369,7 +1450,7 @@ def _run_mock_selftest():
             fake_planner_module.plan_with_reflection = _fake_plan_ground_fail
             plan_calls.clear()
             agent_step_fn6 = build_planner_grounding_agent_step(
-                fake_model, fake_planning_view, use_reflection=True, verbose=False
+                fake_model, fake_planning_view, use_reflection=True, verbose=False, use_regionfocus=False,
             )
             ground_fail_action = agent_step_fn6(wide_img, {"instruction": "x"}, {"actions": [], "screenshots": []})
             check(
@@ -1438,6 +1519,7 @@ def _run_mock_selftest():
         try:
             agent_step_fn_dbg = build_planner_grounding_agent_step(
                 fake_view, fake_view, use_reflection=False, verbose=False, debug_dir=dbg_dir,
+                use_regionfocus=False,
             )
             agent_step_fn_dbg(
                 Image.new("RGB", (200, 100)), {"instruction": "find the button", "id": "task-007"},
@@ -1489,7 +1571,7 @@ def _run_mock_selftest():
         try:
             agent_step_fn_dbg2 = build_planner_grounding_agent_step(
                 fake_view2, fake_view2, use_reflection=False, verbose=False,
-                debug_dir=dbg_dir2, debug_save_images=False,
+                debug_dir=dbg_dir2, debug_save_images=False, use_regionfocus=False,
             )
             agent_step_fn_dbg2(
                 Image.new("RGB", (200, 100)), {"instruction": "find the button", "id": "task-008"},
@@ -1574,6 +1656,26 @@ if __name__ == "__main__":
     ap.add_argument("--no_reflect", dest="use_reflection", action="store_false", default=True,
                      help="plan_with_reflection 대신 plan_next_action만 사용(비평 루프 생략, 스텝당 더 빠름)")
     ap.add_argument("--max_iterations", type=int, default=2, help="--no_reflect가 아닐 때 reflection 최대 재시도")
+    # (2026-08-11 추가 - region focus 재연결) click grounding에 region_focus.ground_with_regionfocus()를
+    # 쓸지 결정. --no_reflect와 같은 패턴(store_false + default=True) - 기본으로 켜져 있고, 빠르게
+    # 배선만 확인하고 싶을 때(또는 VRAM/시간이 부족할 때) --no_regionfocus로 끈다.
+    ap.add_argument("--no_regionfocus", dest="use_regionfocus", action="store_false", default=True,
+                     help="click grounding을 region_focus.ground_with_regionfocus()(재탐색+crop/zoom "
+                          "정밀화) 대신 gui_grounding.ground()(초기 grounding 1회)만 쓰도록 끈다. "
+                          "click 1회당 모델 호출이 5~9회 -> 1회로 줄어 훨씬 빠르지만 grounding 정확도는 "
+                          "떨어짐(module docstring의 RegionFocus uplift 실측 참고).")
+    ap.add_argument("--regionfocus_debug_image", action="store_true",
+                     help="RegionFocus 재탐색 중간 이미지(crop/zoom/판단)를 ./debug/<task_id>/*.png로 저장 "
+                          "(region_focus.py의 --debug_image와 동일한 용도)")
+    ap.add_argument("--regionfocus_debug_text", action="store_true",
+                     help="RegionFocus 각 단계에 실제로 들어간 프롬프트+응답 원문을 "
+                          "./debug/<task_id>/prompt_*.txt로 저장 (region_focus.py의 --debug_text와 동일)")
+    ap.add_argument("--regionfocus_step1_format", choices=["point_text", "toolcall_norm1000", "toolcall_pixel"],
+                     default="point_text", help="RegionFocus Step1(초기 grounding) 좌표 요청 방식 - "
+                     "기본(학습 포맷 그대로) 권장, ablation 실험용으로만 바꿀 것(region_focus.py 참고)")
+    ap.add_argument("--regionfocus_step4_format", choices=["point_text", "toolcall_norm1000", "toolcall_pixel"],
+                     default="point_text", help="RegionFocus Step4(crop/zoom 후 좌표 재추출) 좌표 요청 방식 - "
+                     "기본(학습 포맷 그대로) 권장, ablation 실험용으로만 바꿀 것(region_focus.py 참고)")
     ap.add_argument("--min_pixels", type=int, default=None)
     ap.add_argument("--max_pixels", type=int, default=None)
     ap.add_argument(
@@ -1657,9 +1759,19 @@ if __name__ == "__main__":
                 ground_min_pixels=args.min_pixels, ground_max_pixels=args.max_pixels,
                 debug_dir=None if args.no_debug_dump else args.debug_dir,
                 debug_save_images=not args.no_debug_images,
+                use_regionfocus=args.use_regionfocus,
+                regionfocus_debug_image=args.regionfocus_debug_image,
+                regionfocus_debug_text=args.regionfocus_debug_text,
+                regionfocus_step1_format=args.regionfocus_step1_format,
+                regionfocus_step4_format=args.regionfocus_step4_format,
             )
             if not args.no_debug_dump:
                 print(f"[eval_webvoyager.py] 태스크별 프롬프트/응답 덤프 경로: {os.path.abspath(args.debug_dir)}")
+            print(
+                f"[eval_webvoyager.py] click grounding = "
+                f"{'RegionFocus(재탐색+crop/zoom 정밀화)' if args.use_regionfocus else 'plain gui_grounding.ground()(초기 grounding 1회)'}"
+                + (" - 꺼져 있음(--no_regionfocus)" if not args.use_regionfocus else "")
+            )
         else:
             print(
                 "[eval_webvoyager.py] 주의: --agent_grounding_adapter_dir 미지정 -> agent_step_fn이 "
