@@ -99,6 +99,19 @@ def _convert_planner_action_to_env(plan: dict, grounding_model, screenshot, grou
     agent_loop._AdapterSwitchView.generate()가 planning 호출 뒤 자동으로 default(grounding)로
     복원해주므로, plan_next_action()/plan_with_reflection() 호출 직후 여기로 넘어올 때는
     항상 그 상태다).
+
+    (2026-08-11 추가 - 버그 수정) grounding 실패/drag 미구현으로 이 함수가 액션을 no-op(wait)
+    으로 "다운그레이드"할 때는, 반환 dict에 내부용 마커 "_downgrade_reason"을 같이 실어 보낸다.
+    호출부(build_planner_grounding_agent_step.agent_step_fn)는 이 함수를 부르기 전에 이미
+    planner_history에 원래 액션(예: left_click)을 "정상적으로 실행됐다"는 전제로 append해둔
+    상태라, 이 마커가 없으면 "클릭을 시도했지만 실제로는 화면에서 아무 일도 안 일어났다"는
+    사실이 history에서 사라져 다음 스텝의 planner가 "내가 방금 그 액션을 실행했다"고 착각하게
+    된다 - reflection이 반려한 액션을 history에서 완전히 지웠다가 같은 액션을 계속 재제안하던
+    (Allrecipes CAPTCHA 10스텝 반복) 것과 완전히 같은 실패 패턴이 grounding 실패/drag 경로에서도
+    똑같이 재현될 수 있는 코드 경로라, 그때 쓴 해법(_rejected/_rejection_reason 마커)을 여기도
+    동일하게 적용한다. 이 마커는 env로 그대로 넘어가면 안 되므로 agent_step_fn이 planner_history를
+    보정한 뒤 반드시 pop해서 지운다(env_webvoyager.execute_action()은 이 키를 모름 - 다만 몰라도
+    무시되긴 하니 안 지워도 즉시 깨지진 않는다, 다만 불필요한 키를 env로 흘려보내지 않기 위해 지운다).
     """
     from gui_grounding import ground
 
@@ -114,7 +127,11 @@ def _convert_planner_action_to_env(plan: dict, grounding_model, screenshot, grou
         g = ground(grounding_model, target, screenshot, **ground_kwargs)
         if g["result"] != "positive":
             print(f"[agent_step] grounding 실패(target={target!r}) -> 이번 스텝은 no-op으로 스킵")
-            return {"action": "wait", "time": 0.5}
+            return {
+                "action": "wait",
+                "time": 0.5,
+                "_downgrade_reason": f"grounding failed for target_description={target!r} (result={g.get('result')!r})",
+            }
         w, h = screenshot.size
         x, y = g["point"][0] * w, g["point"][1] * h
         return {"action": act, "coordinate": [x, y]}
@@ -124,7 +141,11 @@ def _convert_planner_action_to_env(plan: dict, grounding_model, screenshot, grou
         # planner LoRA는 drag를 낼 수 있지만 실행부가 못 받으니, 에피소드를 죽이는 대신
         # no-op으로 다운그레이드하고 로그만 남긴다. drag 실제 실행은 다음 작업 범위.
         print("[agent_step] drag 액션은 env_webvoyager.py에 아직 미구현 -> no-op으로 스킵")
-        return {"action": "wait", "time": 0.0}
+        return {
+            "action": "wait",
+            "time": 0.0,
+            "_downgrade_reason": "drag is not implemented in env_webvoyager.py yet",
+        }
 
     if act == "type":
         return {"action": "type", "text": plan.get("text", "")}
@@ -333,7 +354,28 @@ def build_planner_grounding_agent_step(
                 plan = dict(plan)
                 plan["answer"] = extracted
 
-        return _convert_planner_action_to_env(plan, grounding_model, screenshot, ground_kwargs)
+        env_action = _convert_planner_action_to_env(plan, grounding_model, screenshot, ground_kwargs)
+
+        # (2026-08-11 추가 - 버그 수정) grounding 실패/drag 미구현으로 위에서 no-op(wait)으로
+        # 다운그레이드된 경우, 바로 위 planner_history.append(plan)이 "실제로는 실행되지 않은"
+        # 액션(예: left_click)을 마치 실행된 것처럼 남겨버린 상태다 - reflection 최종 반려 케이스와
+        # 똑같은 문제라 똑같은 해법(_rejected/_rejection_reason)으로 그 마지막 항목을 덮어써서
+        # 바로잡는다. _downgrade_reason은 env로 넘길 필요 없는 내부 마커이므로 pop해서 제거한다.
+        downgrade_reason = env_action.pop("_downgrade_reason", None)
+        if downgrade_reason is not None:
+            planner_history[-1] = {
+                "action": plan.get("action"),
+                "target_description": plan.get("target_description"),
+                "text": plan.get("text"),
+                "_rejected": True,
+                "_rejection_reason": downgrade_reason,
+            }
+            print(
+                f"[agent_step] 액션이 실행되지 못하고 no-op으로 다운그레이드됨 -> history에 "
+                f"'반려됨'으로 기록. reason={downgrade_reason}"
+            )
+
+        return env_action
 
     return agent_step_fn
 
@@ -861,6 +903,41 @@ def _run_mock_selftest():
             check(
                 "reflection 승인(True) -> 정상적으로 grounding까지 이어져서 실행됨",
                 approved_action == {"action": "left_click", "coordinate": [50.0, 75.0]},
+            )
+
+            # (2026-08-11 추가 - 회귀 테스트) 버그: grounding 실패로 액션이 no-op(wait)으로
+            # 다운그레이드될 때, planner_history에는 이미 "left_click을 정상 실행했다"는 전제로
+            # plan이 append돼 있어서 다음 스텝의 planner가 실제로는 안 일어난 일을 "일어난 일"로
+            # 착각했었다(reflection 최종 반려 케이스와 동일한 실패 패턴). 이제는 grounding 실패시
+            # 해당 history 항목이 _rejected 마커로 정정되어야 한다.
+            def _fake_plan_ground_fail(planning_view, instruction, screenshot, history_actions=None, **kw):
+                plan_calls.append(
+                    {"history_len": len(history_actions or []), "history": list(history_actions or [])}
+                )
+                return {"reasoning": "r", "action": "left_click", "target_description": "fail me"}
+
+            fake_planner_module.plan_with_reflection = _fake_plan_ground_fail
+            plan_calls.clear()
+            agent_step_fn6 = build_planner_grounding_agent_step(
+                fake_model, fake_planning_view, use_reflection=True, verbose=False
+            )
+            ground_fail_action = agent_step_fn6(wide_img, {"instruction": "x"}, {"actions": [], "screenshots": []})
+            check(
+                "grounding 실패 다운그레이드 -> env로 나가는 액션엔 내부 마커(_downgrade_reason)가 안 남음",
+                "_downgrade_reason" not in ground_fail_action,
+            )
+            check(
+                "grounding 실패 다운그레이드 -> env 액션 자체는 여전히 wait no-op",
+                ground_fail_action["action"] == "wait",
+            )
+            agent_step_fn6(wide_img, {"instruction": "x"}, {"actions": [], "screenshots": []})
+            check(
+                "grounding 실패 다운그레이드 -> 다음 스텝 history에 원래 액션이 '반려됨'으로 정정되어 남음"
+                "(실행된 것처럼 남지 않음)",
+                plan_calls[1]["history"][-1].get("_rejected") is True
+                and plan_calls[1]["history"][-1].get("action") == "left_click"
+                and plan_calls[1]["history"][-1].get("target_description") == "fail me"
+                and "grounding failed" in (plan_calls[1]["history"][-1].get("_rejection_reason") or ""),
             )
         finally:
             del sys.modules["planner"]
