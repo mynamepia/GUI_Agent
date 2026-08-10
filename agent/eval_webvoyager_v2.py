@@ -73,6 +73,8 @@ for _candidate in (os.path.join(_HERE, ".."), os.path.join(_HERE, "..", "vlm_age
 MAX_JUDGE_SCREENSHOTS = 15
 DEFAULT_MAX_STEPS = 15
 DEFAULT_JUDGE_REPEATS = 3
+
+
 # (2026-08-11 추가) 같은 액션이 이만큼 연속으로 반복되면 "막혔다"고 보고 조기 종료한다.
 # CAPTCHA에 걸려서 planner가 같은 걸 계속 재시도하는 경우(Allrecipes 사례, planner.py
 # docstring 참고)의 일반화된 안전장치 - CAPTCHA뿐 아니라 grounding이 계속 같은 지점을
@@ -212,6 +214,153 @@ def _extract_final_answer(grounding_model, instruction: str, screenshot, max_new
     return response
 
 
+# ---------------------------------------------------------------------------
+# (2026-08-11 추가) 태스크별 프롬프트/응답 덤프
+# ---------------------------------------------------------------------------
+# 지금까지는 콘솔에 찍힌 요약 로그(action/target/status 등)만 봤는데, 실제로 모델에 뭐가
+# 들어갔는지(시스템 프롬프트 전문, history 렌더링 결과, reflection critique 원문 등)를
+# 봐야 진단이 되는 경우가 많았다. build_planner_grounding_agent_step()이 쓰는
+# planning_view/reflection_view/grounding_model을 이 얇은 proxy로 감싸서, .generate()가
+# 호출될 때마다 프롬프트(텍스트 부분)와 응답을 <debug_dir>/<태스크>/stepNN_<태그>_NN.txt로
+# 저장한다 - 기존 코드/테스트는 debug_dir=None(기본값)이면 이 경로를 아예 안 타서 안 건드림.
+def _render_messages_for_debug(messages: list, image_filenames: dict | None = None) -> str:
+    """.generate()에 넘어간 messages(Qwen 챗 포맷)를 사람이 읽을 텍스트로 풀어준다.
+    image_filenames는 {id(part): "저장된파일명.png"} 매핑(_PromptRecorder._save_images가
+    만듦) - 주어지면 그 파일명을 같이 적어주고, 없으면(이미지 저장을 껐거나 저장 실패)
+    크기 정보만 남긴다."""
+    image_filenames = image_filenames or {}
+    lines = []
+    for m in messages or []:
+        role = m.get("role", "?")
+        content = m.get("content")
+        if isinstance(content, str):
+            lines.append(f"[{role}]\n{content}")
+            continue
+        for part in content or []:
+            ptype = part.get("type")
+            if ptype == "text":
+                lines.append(f"[{role} text]\n{part.get('text', '')}")
+            elif ptype == "image":
+                img = part.get("image")
+                size = getattr(img, "size", None)
+                fname = image_filenames.get(id(part))
+                if fname:
+                    lines.append(f"[{role} image] size={size} -> 저장됨: {fname}")
+                else:
+                    lines.append(f"[{role} image] <PIL.Image size={size}, 저장 안 함>")
+            elif ptype == "image_url":
+                lines.append(f"[{role} image_url] <생략>")
+            else:
+                lines.append(f"[{role} {ptype}] {part!r}")
+    return "\n\n".join(lines)
+
+
+class _PromptRecorder:
+    """태스크별 폴더(<base_dir>/<태스크 키>/)를 만들어서 각 스텝에서 모델에 실제로 들어간
+    프롬프트(+ 프롬프트에 포함된 스크린샷 이미지)/응답을 남긴다. save_images=True(기본)면
+    프롬프트에 포함된 각 이미지를 stepNN_<태그>_NN_imgK.png로 같이 저장한다 - 나중에 "이
+    스텝에서 모델이 정확히 뭘 보고 이 판단을 했는지" 프롬프트 텍스트와 같이 바로 확인할 수
+    있게 하기 위함."""
+
+    def __init__(self, base_dir: str, save_images: bool = True):
+        self.base_dir = base_dir
+        self.save_images = save_images
+        self.task_dir = None
+        self.step_idx = -1
+        self._counts: dict = {}
+        self._need_new_task = True
+
+    def mark_new_task(self):
+        # agent_step_fn.reset_episode()에서 호출됨 - 실제 폴더 생성은 다음 begin_step()에서
+        # task_info(태스크 id 등)를 받을 때 한다(reset_episode 시점엔 아직 다음 태스크의
+        # task_info를 모름 - run_episode가 reset_episode() 다음에야 env.reset(task)를 부름).
+        self._need_new_task = True
+
+    def begin_step(self, task_info: dict):
+        if self._need_new_task:
+            key = (
+                (task_info or {}).get("id")
+                or (task_info or {}).get("web_name")
+                or (task_info or {}).get("instruction")
+                or "task"
+            )
+            self._start_task(key)
+            self._need_new_task = False
+        else:
+            self.step_idx += 1
+
+    def _start_task(self, key) -> None:
+        safe = re.sub(r"[^A-Za-z0-9._-]+", "_", str(key))[:80] or "task"
+        self.task_dir = os.path.join(self.base_dir, safe)
+        os.makedirs(self.task_dir, exist_ok=True)
+        self.step_idx = 0
+        self._counts = {}
+
+    def _save_images(self, messages: list, base_name: str) -> dict:
+        """messages 안의 PIL.Image 파트들을 <base_name>_imgK.png로 저장하고,
+        {id(part): 파일명} 매핑을 돌려준다. 저장 실패(이미지가 아니거나 I/O 에러)는 그냥
+        건너뛴다 - 프롬프트 텍스트 로그 자체는 그것 때문에 실패하면 안 되니까."""
+        image_filenames: dict = {}
+        if not self.save_images:
+            return image_filenames
+        img_idx = 0
+        for m in messages or []:
+            content = m.get("content")
+            if isinstance(content, str):
+                continue
+            for part in content or []:
+                if part.get("type") != "image":
+                    continue
+                img = part.get("image")
+                if img is None or not hasattr(img, "save"):
+                    continue
+                img_fname = f"{base_name}_img{img_idx}.png"
+                try:
+                    img.save(os.path.join(self.task_dir, img_fname))
+                    image_filenames[id(part)] = img_fname
+                except Exception as e:  # noqa: BLE001 - 이미지 저장 실패로 로그 전체를 죽이지 않음
+                    print(f"[eval_webvoyager.py] 디버그 이미지 저장 실패(무시하고 진행): {e}")
+                img_idx += 1
+        return image_filenames
+
+    def record(self, tag: str, messages: list, response) -> str | None:
+        if self.task_dir is None:
+            return None
+        count_key = (self.step_idx, tag)
+        n = self._counts.get(count_key, 0)
+        self._counts[count_key] = n + 1
+        base_name = f"step{self.step_idx:02d}_{tag}_{n:02d}"
+        image_filenames = self._save_images(messages, base_name)
+        fname = os.path.join(self.task_dir, base_name + ".txt")
+        with open(fname, "w", encoding="utf-8") as f:
+            f.write("=== PROMPT ===\n")
+            f.write(_render_messages_for_debug(messages, image_filenames))
+            f.write("\n\n=== RESPONSE ===\n")
+            f.write(response if response is not None else "")
+        return fname
+
+
+class _DebugModelView:
+    """.generate() 호출을 그대로 통과시키면서 recorder에 프롬프트/응답을 기록하는 얇은
+    proxy. agent_loop._BaseModelView/_AdapterSwitchView와 같은 duck-typing 원칙으로,
+    .model 프로퍼티를 내부 객체에 통과시켜서(disable_adapter() 등 내부에서 .model을 쓰는
+    코드가 그대로 동작하게) 다른 코드는 이게 debug wrapper인지 전혀 모른다."""
+
+    def __init__(self, inner, recorder: _PromptRecorder, tag: str):
+        self._inner = inner
+        self._recorder = recorder
+        self._tag = tag
+
+    @property
+    def model(self):
+        return getattr(self._inner, "model", self._inner)
+
+    def generate(self, messages, **kwargs):
+        response = self._inner.generate(messages, **kwargs)
+        self._recorder.record(self._tag, messages, response)
+        return response
+
+
 def build_planner_grounding_agent_step(
     grounding_model,
     planning_view,
@@ -222,6 +371,8 @@ def build_planner_grounding_agent_step(
     ground_min_pixels: int | None = None,
     ground_max_pixels: int | None = None,
     verbose: bool = True,
+    debug_dir: str | None = None,
+    debug_save_images: bool = True,
 ):
     """
     agent_loop.load_shared_model()이 반환한 (model, planning_view)로 실제 정책 함수를
@@ -263,6 +414,22 @@ def build_planner_grounding_agent_step(
 
     planner_history: list = []
 
+    # (2026-08-11 추가) debug_dir가 주어지면 planning/reflection/grounding 각각의 .generate()를
+    # _DebugModelView로 감싼다 - 실제로 뭘 호출하는지는 그대로, 프롬프트/응답만 옆에서 기록.
+    recorder = _PromptRecorder(debug_dir, save_images=debug_save_images) if debug_dir else None
+    if recorder is not None:
+        debug_planning_view = _DebugModelView(planning_view, recorder, "planner")
+        debug_reflection_view = (
+            _DebugModelView(reflection_view, recorder, "reflection") if reflection_view is not None else None
+        )
+        debug_grounding_click_view = _DebugModelView(grounding_model, recorder, "grounding")
+        debug_grounding_answer_view = _DebugModelView(grounding_model, recorder, "answer_extraction")
+    else:
+        debug_planning_view = planning_view
+        debug_reflection_view = reflection_view
+        debug_grounding_click_view = grounding_model
+        debug_grounding_answer_view = grounding_model
+
     ground_kwargs = {"max_new_tokens": ground_max_new_tokens}
     if ground_min_pixels is not None:
         ground_kwargs["min_pixels"] = ground_min_pixels
@@ -270,18 +437,21 @@ def build_planner_grounding_agent_step(
         ground_kwargs["max_pixels"] = ground_max_pixels
 
     def agent_step_fn(screenshot, task_info, history):
+        if recorder is not None:
+            recorder.begin_step(task_info)
+
         instruction = task_info["instruction"]
         if use_reflection:
             plan = plan_with_reflection(
-                planning_view, instruction, screenshot,
+                debug_planning_view, instruction, screenshot,
                 history_actions=planner_history,
                 max_new_tokens=planner_max_new_tokens,
                 max_iterations=max_iterations,
-                reflection_model=reflection_view,
+                reflection_model=debug_reflection_view,
             )
         else:
             plan = plan_next_action(
-                planning_view, instruction, screenshot,
+                debug_planning_view, instruction, screenshot,
                 history_actions=planner_history,
                 max_new_tokens=planner_max_new_tokens,
             )
@@ -351,7 +521,7 @@ def build_planner_grounding_agent_step(
         # 이미 걸러졌으니, 여기 도달하는 terminate는 (reflection이 껐거나) 승인된 것만 남는다.
         if plan.get("action") == "terminate" and not plan.get("answer"):
             try:
-                extracted = _extract_final_answer(grounding_model, instruction, screenshot)
+                extracted = _extract_final_answer(debug_grounding_answer_view, instruction, screenshot)
             except Exception as e:  # noqa: BLE001 - 최종 답변 추출 실패로 에피소드 전체를 죽이지 않음
                 print(f"[agent_step] answer 추출 실패(무시하고 진행): {e}")
                 extracted = None
@@ -359,7 +529,7 @@ def build_planner_grounding_agent_step(
                 plan = dict(plan)
                 plan["answer"] = extracted
 
-        env_action = _convert_planner_action_to_env(plan, grounding_model, screenshot, ground_kwargs)
+        env_action = _convert_planner_action_to_env(plan, debug_grounding_click_view, screenshot, ground_kwargs)
 
         # (2026-08-11 추가 - 버그 수정) grounding 실패/drag 미구현으로 위에서 no-op(wait)으로
         # 다운그레이드된 경우, 바로 위 planner_history.append(plan)이 "실제로는 실행되지 않은"
@@ -381,6 +551,24 @@ def build_planner_grounding_agent_step(
             )
 
         return env_action
+
+    # (2026-08-11 추가 - 버그 수정) planner_history는 이 클로저가 빌드될 때 딱 한 번만 만들어지는데,
+    # agent_step_fn 자체는 run_batch()가 여러 태스크에 걸쳐 재사용한다 - 그래서 task 1이 끝날 때
+    # 남긴 마지막 기록(예: "terminate: success")이 지워지지 않고 task 2의 첫 스텝 컨텍스트로 그대로
+    # 새어 들어갔다(실측: task 1은 6스텝 정상 진행 후 성공, task 2~10은 전부 1스텝만에 바로
+    # terminate/success -> "나 방금 이미 끝냈잖아"로 착각한 것과 정확히 일치하는 패턴).
+    # agent_step_fn에 넘어오는 history 인자(actions/screenshots)를 보고 "비어있으면 새 에피소드"로
+    # 추론하는 방법도 있지만, 이 함수의 unit test들이 전부 매 호출마다 history를 {"actions": [],
+    # "screenshots": []}로 단순화해서 넘기고 있어서(실제 run_episode처럼 스텝마다 채워 넣지 않음)
+    # 그 추론 방식은 기존 테스트들과 의미가 충돌한다. 대신 명시적인 reset_episode() 훅을 붙여서
+    # run_batch()/run_episode()가 매 태스크 시작 시점에 직접 부르게 한다 - 더 명확하고, 기존
+    # history 인자의 의미도 안 건드린다.
+    def _reset_episode():
+        planner_history.clear()
+        if recorder is not None:
+            recorder.mark_new_task()
+
+    agent_step_fn.reset_episode = _reset_episode
 
     return agent_step_fn
 
@@ -441,6 +629,15 @@ def run_episode(
         "blocked_reason": str | None,
     }
     """
+    # (2026-08-11 추가 - 버그 수정) agent_step_fn이 build_planner_grounding_agent_step()으로
+    # 만들어진 경우, 그 안의 planner_history는 여러 태스크에 걸쳐 재사용되는 클로저 변수라 매
+    # 에피소드 시작 시점에 명시적으로 비워줘야 한다(자세한 설명은 build_planner_grounding_
+    # agent_step()의 reset_episode 주석 참고) - dummy_agent_step처럼 이 훅이 없는 함수는
+    # hasattr로 걸러서 그냥 넘어간다.
+    reset_episode = getattr(agent_step_fn, "reset_episode", None)
+    if callable(reset_episode):
+        reset_episode()
+
     screenshot, task_info = env.reset(task)
     screenshots = [screenshot]
     actions = []
@@ -732,6 +929,28 @@ def _run_mock_selftest():
     check("계속 진행 -> screenshots 개수 = n_steps+1(초기 포함)", len(traj2["screenshots"]) == 5)
     check("계속 진행 -> blocked 아님", traj2["blocked"] is False)
 
+    # --- (2026-08-11 추가) run_episode가 agent_step_fn.reset_episode()를 매 에피소드마다 호출하는지 ---
+    fake_env_reset_hook = MagicMock()
+    fake_env_reset_hook.reset.return_value = (fake_img, {"instruction": "do RH", "url": "http://rh"})
+    fake_env_reset_hook.detect_bot_check.return_value = None
+    agent_with_reset_hook = MagicMock(return_value={"action": "terminate", "status": "success"})
+    agent_with_reset_hook.reset_episode = MagicMock()
+    run_episode(fake_env_reset_hook, {"web": "http://rh", "ques": "do RH"}, agent_with_reset_hook, max_steps=5)
+    check(
+        "run_episode -> agent_step_fn.reset_episode()가 에피소드 시작 시점에 호출됨",
+        agent_with_reset_hook.reset_episode.called,
+    )
+
+    # reset_episode 훅이 없는(dummy_agent_step 같은) 함수는 에러 없이 그냥 넘어가야 함
+    fake_env_no_hook = MagicMock()
+    fake_env_no_hook.reset.return_value = (fake_img, {"instruction": "do NH", "url": "http://nh"})
+    fake_env_no_hook.detect_bot_check.return_value = None
+    try:
+        run_episode(fake_env_no_hook, {"web": "http://nh", "ques": "do NH"}, dummy_agent_step, max_steps=1)
+        check("run_episode -> reset_episode 훅 없어도 에러 없음", True)
+    except Exception:
+        check("run_episode -> reset_episode 훅 없어도 에러 없음", False)
+
     # --- (2026-08-11 추가) run_episode: reset 시점부터 bot-check 감지된 경우 ---
     fake_env_blocked_at_reset = MagicMock()
     fake_env_blocked_at_reset.reset.return_value = (
@@ -1013,6 +1232,17 @@ def _run_mock_selftest():
             step2 = agent_step_fn(wide_img, {"instruction": "close the window"}, {"actions": [], "screenshots": []})
             check("agent_step_fn -> 두 번째 호출에서 history_actions에 이전 plan이 누적됨", plan_calls[1]["history_len"] == 1)
 
+            # (2026-08-11 추가 - 버그 수정 검증) 새 태스크로 넘어갈 때(reset_episode() 호출)
+            # planner_history가 비워져서, 이전 태스크의 기록이 다음 태스크로 새지 않아야 함.
+            check("agent_step_fn.reset_episode 훅이 존재함", callable(getattr(agent_step_fn, "reset_episode", None)))
+            agent_step_fn.reset_episode()
+            step3 = agent_step_fn(wide_img, {"instruction": "a new task"}, {"actions": [], "screenshots": []})
+            check(
+                "reset_episode() 호출 후 다음 태스크의 첫 스텝은 history_len=0으로 시작함"
+                "(이전 태스크 기록이 새지 않음)",
+                plan_calls[2]["history_len"] == 0,
+            )
+
             # (2026-08-10 추가) reflection_model이 plan_with_reflection에 넘어가는지, 그리고 그게
             # planning_view(planner 어댑터)가 아니라 grounding_model을 감싼 base view인지 확인 -
             # reflection이 planner LoRA 포맷 헛소리를 냈던 버그의 재발 방지 검증.
@@ -1164,6 +1394,119 @@ def _run_mock_selftest():
     finally:
         del sys.modules["gui_grounding"]
 
+    # --- (2026-08-11 추가) 태스크별 프롬프트/응답 덤프(--debug_dir) 배선 확인 ---
+    # 위쪽 테스트들의 fake plan_next_action/ground()는 model.generate()를 아예 안 부르고
+    # 결과만 바로 반환하는 "완전히 껍데기"라서(그래서 각 액션 변환 로직만 빠르게 테스트할 수
+    # 있었음), _DebugModelView가 실제로 .generate() 호출을 가로채서 기록하는지는 그걸로 검증이
+    # 안 된다 - 이 블록은 fake들이 model.generate()를 실제로 호출하게 만들어서 배선을 끝까지
+    # 확인한다.
+    import shutil
+    import tempfile
+
+    dbg_dir = tempfile.mkdtemp(prefix="ewv2_debug_dump_")
+    try:
+        fake_view = MagicMock()
+        fake_view.generate.return_value = (
+            '{"reasoning": "r", "action": "left_click", "target_description": "the X button"}'
+        )
+
+        def _fake_plan_calls_generate(planning_view, instruction, screenshot, history_actions=None, **kw):
+            messages = [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "image", "image": screenshot},
+                        {"type": "text", "text": f"task: {instruction}"},
+                    ],
+                }
+            ]
+            planning_view.generate(messages, max_new_tokens=kw.get("max_new_tokens", 10), temperature=0.0)
+            return {"reasoning": "r", "action": "left_click", "target_description": "the X button"}
+
+        def _fake_ground_calls_generate(model, instruction, screenshot, **kwargs):
+            messages = [{"role": "user", "content": [{"type": "text", "text": f"ground: {instruction}"}]}]
+            model.generate(messages, max_new_tokens=kwargs.get("max_new_tokens", 10))
+            return {"result": "positive", "point": [0.25, 0.75], "raw_response": "(250,750)"}
+
+        dbg_planner_module = types.ModuleType("planner")
+        dbg_planner_module.plan_next_action = _fake_plan_calls_generate
+        dbg_planner_module.plan_with_reflection = _fake_plan_calls_generate
+        dbg_gui_grounding_module = types.ModuleType("gui_grounding")
+        dbg_gui_grounding_module.ground = _fake_ground_calls_generate
+        sys.modules["planner"] = dbg_planner_module
+        sys.modules["gui_grounding"] = dbg_gui_grounding_module
+        try:
+            agent_step_fn_dbg = build_planner_grounding_agent_step(
+                fake_view, fake_view, use_reflection=False, verbose=False, debug_dir=dbg_dir,
+            )
+            agent_step_fn_dbg(
+                Image.new("RGB", (200, 100)), {"instruction": "find the button", "id": "task-007"},
+                {"actions": [], "screenshots": []},
+            )
+
+            task_dir = os.path.join(dbg_dir, "task-007")
+            check("--debug_dir -> 태스크 폴더가 task id 기준으로 생성됨", os.path.isdir(task_dir))
+            dumped = os.listdir(task_dir) if os.path.isdir(task_dir) else []
+            check("--debug_dir -> planner 프롬프트 파일 생성됨", "step00_planner_00.txt" in dumped)
+            check("--debug_dir -> grounding 프롬프트 파일 생성됨", "step00_grounding_00.txt" in dumped)
+            check(
+                "--debug_dir(기본) -> 프롬프트에 포함된 스크린샷이 png로도 저장됨",
+                "step00_planner_00_img0.png" in dumped,
+            )
+            if "step00_planner_00.txt" in dumped:
+                with open(os.path.join(task_dir, "step00_planner_00.txt"), encoding="utf-8") as fh:
+                    dumped_content = fh.read()
+                check(
+                    "--debug_dir -> 저장된 파일에 PROMPT/RESPONSE 섹션과 실제 프롬프트 텍스트가 담김",
+                    "=== PROMPT ===" in dumped_content
+                    and "=== RESPONSE ===" in dumped_content
+                    and "task: find the button" in dumped_content,
+                )
+                check(
+                    "--debug_dir -> 프롬프트 텍스트에 저장된 이미지 파일명이 같이 적힘",
+                    "step00_planner_00_img0.png" in dumped_content,
+                )
+        finally:
+            del sys.modules["planner"]
+            del sys.modules["gui_grounding"]
+    finally:
+        shutil.rmtree(dbg_dir, ignore_errors=True)
+
+    # --- (2026-08-11 추가) --no_debug_images(debug_save_images=False) -> 이미지 저장 안 함 ---
+    dbg_dir2 = tempfile.mkdtemp(prefix="ewv2_debug_dump_noimg_")
+    try:
+        fake_view2 = MagicMock()
+        fake_view2.generate.return_value = (
+            '{"reasoning": "r", "action": "left_click", "target_description": "the X button"}'
+        )
+        dbg_planner_module2 = types.ModuleType("planner")
+        dbg_planner_module2.plan_next_action = _fake_plan_calls_generate
+        dbg_planner_module2.plan_with_reflection = _fake_plan_calls_generate
+        dbg_gui_grounding_module2 = types.ModuleType("gui_grounding")
+        dbg_gui_grounding_module2.ground = _fake_ground_calls_generate
+        sys.modules["planner"] = dbg_planner_module2
+        sys.modules["gui_grounding"] = dbg_gui_grounding_module2
+        try:
+            agent_step_fn_dbg2 = build_planner_grounding_agent_step(
+                fake_view2, fake_view2, use_reflection=False, verbose=False,
+                debug_dir=dbg_dir2, debug_save_images=False,
+            )
+            agent_step_fn_dbg2(
+                Image.new("RGB", (200, 100)), {"instruction": "find the button", "id": "task-008"},
+                {"actions": [], "screenshots": []},
+            )
+            task_dir2 = os.path.join(dbg_dir2, "task-008")
+            dumped2 = os.listdir(task_dir2) if os.path.isdir(task_dir2) else []
+            check(
+                "debug_save_images=False -> png 파일은 안 생기고 txt만 남음",
+                "step00_planner_00.txt" in dumped2 and not any(fn.endswith(".png") for fn in dumped2),
+            )
+        finally:
+            del sys.modules["planner"]
+            del sys.modules["gui_grounding"]
+    finally:
+        shutil.rmtree(dbg_dir2, ignore_errors=True)
+
     n_fail = sum(1 for _, ok in checks if not ok)
     for name, ok in checks:
         print(("[OK]  " if ok else "[FAIL]") + " " + name)
@@ -1185,6 +1528,15 @@ if __name__ == "__main__":
     ap.add_argument("--judge_repeats", type=int, default=DEFAULT_JUDGE_REPEATS)
     ap.add_argument("--limit", type=int, default=None)
     ap.add_argument("--out", default=None)
+    # (2026-08-11 추가) 태스크별 폴더에 스텝별 프롬프트/응답 원문을 txt로 저장. --log_file(콘솔
+    # 전체 흐름)과는 별개로, "그 스텝에서 모델에 정확히 뭐가 들어갔는지"를 태스크/스텝 단위로
+    # 찾아보기 쉽게 구조화한 것 - build_planner_grounding_agent_step()의 _PromptRecorder 참고.
+    ap.add_argument("--debug_dir", default="debug",
+                     help="태스크별 폴더(<debug_dir>/<태스크id>/stepNN_<planner|reflection|"
+                          "grounding|answer_extraction>_NN.txt)에 프롬프트/응답 저장(기본 './debug').")
+    ap.add_argument("--no_debug_dump", action="store_true", help="태스크별 프롬프트/응답 덤프를 끔")
+    ap.add_argument("--no_debug_images", action="store_true",
+                     help="프롬프트에 포함된 스크린샷을 png로 같이 저장하지 않음(텍스트만 저장, 용량 절약)")
     # (2026-08-11 추가) CAPTCHA/bot-check 대응. env_webvoyager.WebVoyagerEnv.detect_bot_check()/
     # run_episode() docstring 참고 - CAPTCHA를 풀거나 우회하지 않고, 감지 시 정직하게 blocked로
     # 표기하고 조기 종료해서 max_steps/judge 비용을 낭비하지 않게 하는 것까지만 한다.
@@ -1215,7 +1567,11 @@ if __name__ == "__main__":
     ap.add_argument("--planner_api_key", default=None, help="미지정시 환경변수 OPENAI_API_KEY 사용")
     ap.add_argument("--planner_api_base_url", default=None,
                      help="OpenAI 호환 엔드포인트(vLLM 등)를 쓸 때 지정 - 미지정시 OpenAI 공식 엔드포인트")
-    ap.add_argument("--no_reflect", dest="use_reflection", action="store_false", default=False,
+    # (2026-08-11 수정 - 버그) default=False로 돼 있었던 걸 True로 고침. --no_reflect는
+    # action="store_false"라 "플래그를 주면 끈다"는 의미인데, default까지 False였던 탓에
+    # 플래그를 주든 안 주든 reflection이 항상 꺼진 채로 돌고 있었다(실측: 실제 실행 로그에
+    # _reflection_log가 한 번도 안 남음 - CLI로는 reflection을 켤 방법 자체가 없었음).
+    ap.add_argument("--no_reflect", dest="use_reflection", action="store_false", default=True,
                      help="plan_with_reflection 대신 plan_next_action만 사용(비평 루프 생략, 스텝당 더 빠름)")
     ap.add_argument("--max_iterations", type=int, default=2, help="--no_reflect가 아닐 때 reflection 최대 재시도")
     ap.add_argument("--min_pixels", type=int, default=None)
@@ -1299,7 +1655,11 @@ if __name__ == "__main__":
                 agent_model, planning_view,
                 use_reflection=args.use_reflection, max_iterations=args.max_iterations,
                 ground_min_pixels=args.min_pixels, ground_max_pixels=args.max_pixels,
+                debug_dir=None if args.no_debug_dump else args.debug_dir,
+                debug_save_images=not args.no_debug_images,
             )
+            if not args.no_debug_dump:
+                print(f"[eval_webvoyager.py] 태스크별 프롬프트/응답 덤프 경로: {os.path.abspath(args.debug_dir)}")
         else:
             print(
                 "[eval_webvoyager.py] 주의: --agent_grounding_adapter_dir 미지정 -> agent_step_fn이 "
@@ -1338,9 +1698,11 @@ if __name__ == "__main__":
         else:
             judge_fn = make_openai_judge(model=args.openai_model)
 
-        run_batch(
-            tasks, env, agent_step_fn, judge_fn,
-            max_steps=args.max_steps, judge_repeats=args.judge_repeats, out_path=args.out,
-            stuck_repeat_threshold=args.stuck_repeat_threshold,
-        )
-        env.close()
+        try:
+            run_batch(
+                tasks, env, agent_step_fn, judge_fn,
+                max_steps=args.max_steps, judge_repeats=args.judge_repeats, out_path=args.out,
+                stuck_repeat_threshold=args.stuck_repeat_threshold,
+            )
+        finally:
+            env.close()
