@@ -51,6 +51,23 @@ DEFAULT_USER_AGENT = (
     "Chrome/124.0.0.0 Safari/537.36"
 )
 
+# (2026-08-11 추가) detect_bot_check()가 title/URL에서 찾는 흔한 CAPTCHA/bot-check 신호들.
+# 완벽한 목록이 아니라 보수적인 휴리스틱 - 여기 없는 문구를 쓰는 차단 페이지는 못 잡지만,
+# eval_webvoyager_v2.run_episode()의 stuck-repeat 안전장치가 그런 경우도 결국 잡아낸다
+# (같은 액션이 계속 반복되면 원인 불문 조기 종료).
+_BOT_CHECK_KEYWORDS = (
+    "captcha",
+    "recaptcha",
+    "hcaptcha",
+    "cloudflare",
+    "just a moment",
+    "checking your browser",
+    "verify you are human",
+    "unusual traffic",
+    "access denied",
+    "사람인지 확인",
+)
+
 
 def _make_driver(window_size, headless=True, user_agent=None):
     from selenium import webdriver
@@ -110,11 +127,22 @@ class WebVoyagerEnv:
     terminate는 execute_action으로 보내지 말 것 - agent_loop가 처리(driver에 안 보냄).
     """
 
-    def __init__(self, window_size=DEFAULT_WINDOW_SIZE, headless=True, page_load_timeout=20, user_agent=None):
+    def __init__(self, window_size=DEFAULT_WINDOW_SIZE, headless=True, page_load_timeout=20, user_agent=None,
+                 captcha_reset_retries=0):
+        """
+        captcha_reset_retries: (2026-08-11 추가) reset() 직후 detect_bot_check()에
+            걸리면 driver.get(url)을 다시 시도하는 횟수. CAPTCHA는 자동화로 못 풀지만,
+            reset 시점 감지는 가끔 "아직 페이지가 다 안 뜬 상태에서의 순간적인 로딩
+            인터스티셜"일 수도 있어서(Cloudflare "Just a moment..." 류) 재시도 여지를
+            둔다 - 그래도 계속 감지되면 진짜 CAPTCHA로 보고 포기한다(task_info에
+            "_bot_check_at_reset" 마킹, eval_webvoyager_v2.run_episode()가 이 신호를
+            보고 첫 스텝도 안 밟고 바로 blocked 처리).
+        """
         self.window_size = window_size
         self.headless = headless
         self.page_load_timeout = page_load_timeout
         self.user_agent = user_agent
+        self.captcha_reset_retries = captcha_reset_retries
         self.driver = None
         self.task_info = None
 
@@ -136,7 +164,56 @@ class WebVoyagerEnv:
         time.sleep(1.0)  # 초기 렌더/스크립트 실행 여유
 
         self.task_info = {"instruction": instruction, "url": url, **extra}
+
+        # (2026-08-11 추가) reset 직후 bot-check 감지되면 captcha_reset_retries만큼 재로드
+        # 시도. 다 써도 여전히 감지되면 포기하고 "_bot_check_at_reset" 마커를 남긴다 - CAPTCHA를
+        # 이 코드가 풀어주지는 않는다(그건 이 프로젝트 범위 밖), 정직하게 막혔다고 보고할 뿐.
+        bot_check = self.detect_bot_check()
+        retries_left = self.captcha_reset_retries
+        while bot_check and retries_left > 0:
+            print(
+                f"[env_webvoyager.py] reset 직후 bot-check 감지({bot_check['reason']}) -> "
+                f"재로드 재시도(남은 횟수={retries_left})"
+            )
+            retries_left -= 1
+            try:
+                self.driver.get(url)
+            except Exception as e:
+                print(f"[env_webvoyager.py] 재시도 중 driver.get({url!r}) 예외(무시하고 진행): {e}")
+            time.sleep(1.5)
+            bot_check = self.detect_bot_check()
+        if bot_check:
+            self.task_info["_bot_check_at_reset"] = bot_check
+
         return self._screenshot(), dict(self.task_info)
+
+    # ------------------------------------------------------------------
+    def detect_bot_check(self):
+        """
+        (2026-08-11 추가) 현재 페이지가 CAPTCHA/bot-check 화면인지 title/URL 기준으로
+        저렴하게 확인하는 보수적인 휴리스틱(완벽한 탐지 아님 - _BOT_CHECK_KEYWORDS 참고).
+        eval_webvoyager_v2.run_episode()가 reset 직후와 매 스텝 이후 duck-typing으로
+        호출한다(구버전 env나 mock처럼 이 메서드가 없어도 호출부는 정상 동작함).
+
+        Returns: None(정상으로 보임) 또는 {"reason": str}(감지됨)
+        """
+        if self.driver is None:
+            return None
+        try:
+            title = (self.driver.title or "").lower()
+            url = (self.driver.current_url or "").lower()
+        except Exception:
+            # driver가 죽었거나 페이지 전환 중이라 title/url을 못 읽는 경우 - bot-check
+            # 여부를 판단할 수 없으니 안전하게 "모르겠다"(None)로 처리, 호출부의 stuck-repeat
+            # 안전장치가 결국 잡아낼 것.
+            return None
+        for kw in _BOT_CHECK_KEYWORDS:
+            if kw in title:
+                return {"reason": f"title contains {kw!r}"}
+        for kw in _BOT_CHECK_KEYWORDS:
+            if kw in url:
+                return {"reason": f"url contains {kw!r}"}
+        return None
 
     def _parse_task(self, task):
         if isinstance(task, dict):
@@ -409,6 +486,28 @@ def _run_mock_selftest():
     # 스크린샷 PNG bytes -> PIL 변환
     img = env._screenshot()
     check("screenshot PNG -> PIL.Image", img.size == (2, 2))
+
+    # --- (2026-08-11 추가) detect_bot_check() ---
+    env.driver.title = "Just a moment..."
+    env.driver.current_url = "http://example.com/"
+    r = env.detect_bot_check()
+    check("detect_bot_check -> title 매칭시 감지됨", r is not None and "just a moment" in r["reason"])
+
+    env.driver.title = "Example Domain"
+    env.driver.current_url = "http://example.com/recaptcha/challenge"
+    r2 = env.detect_bot_check()
+    # "recaptcha"는 "captcha"를 부분문자열로 포함하므로("captcha"가 키워드 목록에서 먼저
+    # 매치될 수 있음) 정확히 어느 키워드로 잡혔는지보다 "url 쪽에서 잡혔다"는 것만 확인.
+    check("detect_bot_check -> url 매칭도 감지됨", r2 is not None and "url contains" in r2["reason"] and "captcha" in r2["reason"])
+
+    env.driver.title = "Example Domain"
+    env.driver.current_url = "http://example.com/"
+    r3 = env.detect_bot_check()
+    check("detect_bot_check -> 정상 페이지는 None", r3 is None)
+
+    env_no_driver = WebVoyagerEnv.__new__(WebVoyagerEnv)
+    env_no_driver.driver = None
+    check("detect_bot_check -> driver 없으면 예외 없이 None", env_no_driver.detect_bot_check() is None)
 
     # task 파싱 (dict / tuple 둘 다)
     dummy = WebVoyagerEnv.__new__(WebVoyagerEnv)

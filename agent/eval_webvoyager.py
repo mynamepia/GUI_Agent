@@ -377,6 +377,19 @@ def build_planner_grounding_agent_step(
 
         return env_action
 
+    # (2026-08-11 추가 - 버그 수정) planner_history는 이 클로저가 빌드될 때 딱 한 번만 만들어지는데,
+    # agent_step_fn 자체는 run_batch()가 여러 태스크에 걸쳐 재사용한다 - 그래서 task 1이 끝날 때
+    # 남긴 마지막 기록(예: "terminate: success")이 지워지지 않고 task 2의 첫 스텝 컨텍스트로 그대로
+    # 새어 들어갔다(실측: task 1은 6스텝 정상 진행 후 성공, task 2~10은 전부 1스텝만에 바로
+    # terminate/success -> "나 방금 이미 끝냈잖아"로 착각한 것과 정확히 일치하는 패턴).
+    # agent_step_fn에 넘어오는 history 인자(actions/screenshots)를 보고 "비어있으면 새 에피소드"로
+    # 추론하는 방법도 있지만, 이 함수의 unit test들이 전부 매 호출마다 history를 {"actions": [],
+    # "screenshots": []}로 단순화해서 넘기고 있어서(실제 run_episode처럼 스텝마다 채워 넣지 않음)
+    # 그 추론 방식은 기존 테스트들과 의미가 충돌한다. 대신 명시적인 reset_episode() 훅을 붙여서
+    # run_batch()/run_episode()가 매 태스크 시작 시점에 직접 부르게 한다 - 더 명확하고, 기존
+    # history 인자의 의미도 안 건드린다.
+    agent_step_fn.reset_episode = lambda: planner_history.clear()
+
     return agent_step_fn
 
 
@@ -402,6 +415,15 @@ def run_episode(env: WebVoyagerEnv, task, agent_step_fn, max_steps=DEFAULT_MAX_S
         "hit_max_steps": bool,
     }
     """
+    # (2026-08-11 추가 - 버그 수정) agent_step_fn이 build_planner_grounding_agent_step()으로
+    # 만들어진 경우, 그 안의 planner_history는 여러 태스크에 걸쳐 재사용되는 클로저 변수라 매
+    # 에피소드 시작 시점에 명시적으로 비워줘야 한다(자세한 설명은 build_planner_grounding_
+    # agent_step()의 reset_episode 주석 참고) - dummy_agent_step처럼 이 훅이 없는 함수는
+    # hasattr로 걸러서 그냥 넘어간다.
+    reset_episode = getattr(agent_step_fn, "reset_episode", None)
+    if callable(reset_episode):
+        reset_episode()
+
     screenshot, task_info = env.reset(task)
     screenshots = [screenshot]
     actions = []
@@ -626,6 +648,23 @@ def _run_mock_selftest():
     check("계속 진행 -> hit_max_steps=True", traj2["hit_max_steps"] is True)
     check("계속 진행 -> screenshots 개수 = n_steps+1(초기 포함)", len(traj2["screenshots"]) == 5)
 
+    # --- (2026-08-11 추가) run_episode가 agent_step_fn.reset_episode()를 매 에피소드마다 호출하는지 ---
+    fake_env3 = MagicMock()
+    fake_env3.reset.return_value = (fake_img, {"instruction": "do Z", "url": "http://z"})
+    agent_with_reset_hook = MagicMock(return_value={"action": "terminate", "status": "success"})
+    agent_with_reset_hook.reset_episode = MagicMock()
+    run_episode(fake_env3, {"web": "http://z", "ques": "do Z"}, agent_with_reset_hook, max_steps=5)
+    check("run_episode -> agent_step_fn.reset_episode()가 에피소드 시작 시점에 호출됨", agent_with_reset_hook.reset_episode.called)
+
+    # reset_episode 훅이 없는(dummy_agent_step 같은) 함수는 에러 없이 그냥 넘어가야 함
+    fake_env4 = MagicMock()
+    fake_env4.reset.return_value = (fake_img, {"instruction": "do W", "url": "http://w"})
+    try:
+        run_episode(fake_env4, {"web": "http://w", "ques": "do W"}, dummy_agent_step, max_steps=1)
+        check("run_episode -> reset_episode 훅 없어도 에러 없음", True)
+    except Exception:
+        check("run_episode -> reset_episode 훅 없어도 에러 없음", False)
+
     # --- run_judge_with_repeats: 다수결 ---
     seq = iter([True, False, True])  # 2:1 -> True로 다수결
     judge_fn = lambda instruction, screenshots, final_answer: {"success": next(seq), "raw_response": "r"}
@@ -792,6 +831,17 @@ def _run_mock_selftest():
             )
             step2 = agent_step_fn(wide_img, {"instruction": "close the window"}, {"actions": [], "screenshots": []})
             check("agent_step_fn -> 두 번째 호출에서 history_actions에 이전 plan이 누적됨", plan_calls[1]["history_len"] == 1)
+
+            # (2026-08-11 추가 - 버그 수정 검증) 새 태스크로 넘어갈 때(reset_episode() 호출)
+            # planner_history가 비워져서, 이전 태스크의 기록이 다음 태스크로 새지 않아야 함.
+            check("agent_step_fn.reset_episode 훅이 존재함", callable(getattr(agent_step_fn, "reset_episode", None)))
+            agent_step_fn.reset_episode()
+            step3 = agent_step_fn(wide_img, {"instruction": "a new task"}, {"actions": [], "screenshots": []})
+            check(
+                "reset_episode() 호출 후 다음 태스크의 첫 스텝은 history_len=0으로 시작함"
+                "(이전 태스크 기록이 새지 않음)",
+                plan_calls[2]["history_len"] == 0,
+            )
 
             # (2026-08-10 추가) reflection_model이 plan_with_reflection에 넘어가는지, 그리고 그게
             # planning_view(planner 어댑터)가 아니라 grounding_model을 감싼 base view인지 확인 -
