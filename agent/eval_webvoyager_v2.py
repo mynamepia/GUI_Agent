@@ -38,9 +38,13 @@ dummy_agent_step()(항상 즉시 terminate)만 있고, planner/agent_loop.py가 
   다수결로 정하고, judge별 개별 응답도 다 로그에 남겨서 나중에 judge 자체의 변동성을 따로
   볼 수 있게 함).
 
-[아직 없는 것 - 다음 단계]
---resume 지원(eval_regionfocus.py에는 있음)은 아직 없음. 태스크 수가 많아지고 오래
-걸리기 시작하면 그때 같은 방식으로 추가할 것.
+[--resume - 2026-08-11 추가]
+API 비용(GPT-4o planner/judge) 때문에 중간에 죽으면(개인 PC 장시간 무중단 실행 리스크 -
+드라이버 행/절전/네트워크 끊김 등) 이미 끝낸 태스크까지 다시 도는 걸 막아야 해서 추가.
+--out 파일에 매 태스크 결과가 즉시 flush되므로(run_batch 참고) 죽어도 그때까지 결과는
+안 날아간다 - --resume은 그 파일을 읽어서 이미 있는 task_id는 건너뛰고 이어서 append하는
+것만 담당. 태스크 식별은 WebVoyager jsonl의 "id" 필드(예: "Amazon--16") 기준(_task_key()
+참고) - 없으면 url+instruction 조합으로 폴백.
 """
 
 import argparse
@@ -925,16 +929,73 @@ def run_judge_with_repeats(judge_fn, instruction, screenshots, final_answer, n_r
 
 
 # ---------------------------------------------------------------------------
-# 배치 실행 (eval_regionfocus.py와 유사한 구조 - --resume은 아직 미구현)
+# 배치 실행 (eval_regionfocus.py와 유사한 구조 - --resume 지원, 2026-08-11 추가)
 # ---------------------------------------------------------------------------
+def _task_key(task) -> str:
+    """
+    (2026-08-11 추가 - --resume) 태스크를 고유하게 식별하는 키. WebVoyager jsonl 레코드는
+    보통 "id"(예: "Amazon--16")를 갖고 있어서 있으면 그걸 그대로 쓴다 - 이미 끝난 태스크인지
+    판단하는 기준이라, 실행할 때마다 안정적으로 같은 값이 나와야 한다(instruction 텍스트만
+    쓰면 같은 문구의 태스크가 우연히 여러 개일 때 잘못 스킵될 수 있어서 id를 우선함). "id"가
+    없는 구버전 jsonl이나 (url, instruction) 튜플 태스크는 url+instruction 조합으로 폴백.
+    """
+    if isinstance(task, dict):
+        tid = task.get("id")
+        if tid:
+            return str(tid)
+        url = task.get("web") or task.get("url") or ""
+        instruction = task.get("ques") or task.get("instruction") or ""
+        return f"{url}|{instruction}"
+    if isinstance(task, (list, tuple)) and len(task) == 2:
+        return f"{task[0]}|{task[1]}"
+    return str(task)
+
+
 def run_batch(tasks, env, agent_step_fn, judge_fn, max_steps=DEFAULT_MAX_STEPS,
               judge_repeats=DEFAULT_JUDGE_REPEATS, out_path=None,
               stuck_repeat_threshold=DEFAULT_STUCK_REPEAT_THRESHOLD,
-              stuck_repeat_window=None):
+              stuck_repeat_window=None, resume=False):
+    """
+    (2026-08-11 추가 - resume 파라미터) resume=True면 out_path에 이미 있는 결과(이전
+    실행이 중간에 죽었거나 사용자가 일부러 끊은 경우)를 읽어서, task_id가 이미 있는 태스크는
+    건너뛰고 파일에 이어서(append) 쓴다. rows(최종 요약에 쓰이는 리스트)에는 이전 실행
+    결과도 합쳐 넣어서, 성공률 등 요약이 "이번 실행분만"이 아니라 "전체 누적"을 반영하게
+    한다. resume=False(기본)면 예전과 동일하게 매번 out_path를 덮어쓰고 처음부터 전부
+    돈다 - 하위 호환.
+    """
     rows = []
-    out_f = open(out_path, "w", encoding="utf-8") if out_path else None
+    done_keys = set()
+    file_exists = bool(out_path and os.path.exists(out_path))
+    if resume and file_exists:
+        with open(out_path, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    prev_row = json.loads(line)
+                except json.JSONDecodeError:
+                    # (2026-08-11) 직전 실행이 write 도중(예: flush 전 프로세스 강제 종료)
+                    # 죽었으면 마지막 줄이 반쯤 쓰였을 수 있다 - 그런 손상된 줄은 무시하고
+                    # 계속 진행(그 태스크는 done_keys에 안 들어가므로 이번 실행에서 다시 돈다 -
+                    # 데이터 손실보다 중복 재실행 쪽이 안전한 폴백).
+                    continue
+                rows.append(prev_row)
+                key = prev_row.get("task_id")
+                if key:
+                    done_keys.add(key)
+        print(
+            f"[run_batch] --resume: {out_path}에서 기존 결과 {len(rows)}개 발견 "
+            f"(이미 끝난 태스크 {len(done_keys)}개는 건너뜀)"
+        )
+
+    out_mode = "a" if (resume and file_exists) else "w"
+    out_f = open(out_path, out_mode, encoding="utf-8") if out_path else None
     try:
         for i, task in enumerate(tasks):
+            task_id = _task_key(task)
+            if resume and task_id in done_keys:
+                continue
             t0 = time.time()
             traj = run_episode(
                 env, task, agent_step_fn, max_steps=max_steps, stuck_repeat_threshold=stuck_repeat_threshold,
@@ -956,6 +1017,7 @@ def run_batch(tasks, env, agent_step_fn, judge_fn, max_steps=DEFAULT_MAX_STEPS,
                 )
             row = {
                 "idx": i,
+                "task_id": task_id,
                 "instruction": traj["instruction"],
                 "url": traj["url"],
                 "n_steps": traj["n_steps"],
@@ -1249,6 +1311,68 @@ def _run_mock_selftest():
         check("run_batch -> blocked 태스크의 blocked=True + blocked_reason 존재", all(r["blocked"] is True and r["blocked_reason"] for r in rows_blocked))
         check("run_batch -> blocked 태스크는 judge_votes가 빈 리스트(판단 자체를 안 했다는 표시)", all(r["judge_votes"] == [] for r in rows_blocked))
         check("run_batch -> 전체 success_rate=0.0", rate_blocked == 0.0)
+
+    # --- (2026-08-11 추가) _task_key ---
+    check("_task_key -> id 필드가 있으면 그걸 그대로 씀", _task_key({"id": "Amazon--16", "web": "http://a", "ques": "q"}) == "Amazon--16")
+    check(
+        "_task_key -> id 없으면 url+instruction 조합으로 폴백",
+        _task_key({"web": "http://a", "ques": "q"}) == "http://a|q",
+    )
+    check("_task_key -> 튜플 태스크도 지원", _task_key(("http://b", "do B")) == "http://b|do B")
+
+    # --- (2026-08-11 추가) run_batch: --resume - 이미 끝난 task_id는 건너뛰고 이어서 씀 ---
+    fake_env_resume = MagicMock()
+    fake_env_resume.reset.return_value = (fake_img, {"instruction": "resumed", "url": "http://r"})
+    fake_env_resume.detect_bot_check.return_value = None
+    resume_agent_calls = {"n": 0}
+
+    def _counting_agent(screenshot, task_info, history):
+        resume_agent_calls["n"] += 1
+        return {"action": "terminate", "status": "success"}
+
+    with tempfile.TemporaryDirectory() as d:
+        out_path3 = os.path.join(d, "out3.jsonl")
+        # 직전 실행이 T1/T2까지 끝내고 죽었다고 가정 - 결과 파일을 직접 만들어둠.
+        with open(out_path3, "w", encoding="utf-8") as f:
+            f.write(json.dumps({"task_id": "T1", "success": True, "blocked": False}) + "\n")
+            f.write(json.dumps({"task_id": "T2", "success": False, "blocked": False}) + "\n")
+
+        tasks_resume = [
+            {"id": "T1", "web": "http://r", "ques": "task 1"},
+            {"id": "T2", "web": "http://r", "ques": "task 2"},
+            {"id": "T3", "web": "http://r", "ques": "task 3"},
+        ]
+        rows_resume, rate_resume = run_batch(
+            tasks_resume, fake_env_resume, _counting_agent, always_success_judge,
+            judge_repeats=1, out_path=out_path3, resume=True,
+        )
+        check("--resume -> 이미 끝난 T1/T2는 다시 안 돎(agent_step_fn 1번만 호출)", resume_agent_calls["n"] == 1)
+        check("--resume -> rows에 이전 2개 + 새로 돈 1개 = 3개", len(rows_resume) == 3)
+        check(
+            "--resume -> 새로 돈 태스크는 T3(안 끝난 것만)",
+            any(r.get("task_id") == "T3" for r in rows_resume),
+        )
+        with open(out_path3, encoding="utf-8") as f:
+            saved_resume = [json.loads(line) for line in f]
+        check("--resume -> 파일에도 기존 2줄 + 새 1줄 = 3줄로 append됨(덮어쓰기 아님)", len(saved_resume) == 3)
+        check(
+            "--resume -> 전체 success_rate가 이전 결과까지 합쳐서 계산됨(1승1패 + 새로 1승 = 2/3)",
+            abs(rate_resume - 2 / 3) < 1e-6,
+        )
+
+    # resume=False(기본)면 기존 파일이 있어도 그냥 덮어쓰고 처음부터 다 돎 - 하위 호환 확인
+    resume_agent_calls["n"] = 0
+    with tempfile.TemporaryDirectory() as d:
+        out_path4 = os.path.join(d, "out4.jsonl")
+        with open(out_path4, "w", encoding="utf-8") as f:
+            f.write(json.dumps({"task_id": "T1", "success": True, "blocked": False}) + "\n")
+        rows_no_resume, _ = run_batch(
+            [{"id": "T1", "web": "http://r", "ques": "task 1"}],
+            fake_env_resume, _counting_agent, always_success_judge,
+            judge_repeats=1, out_path=out_path4, resume=False,
+        )
+        check("resume=False(기본) -> 이미 있던 결과 무시하고 다시 돎(하위 호환)", resume_agent_calls["n"] == 1)
+        check("resume=False -> rows도 이번에 새로 돈 1개뿐(파일 덮어씀)", len(rows_no_resume) == 1)
 
     # --- _convert_planner_action_to_env / build_planner_grounding_agent_step ---
     import sys
@@ -1790,6 +1914,12 @@ if __name__ == "__main__":
     ap.add_argument("--judge_repeats", type=int, default=DEFAULT_JUDGE_REPEATS)
     ap.add_argument("--limit", type=int, default=None)
     ap.add_argument("--out", default=None)
+    # (2026-08-11 추가 - API 비용 보호) --out 파일에 이미 있는 task_id는 건너뛰고 이어서
+    # 돌린다. 장시간 무중단 실행(개인 PC로 수백 개 태스크) 중 죽었을 때 이미 낸 GPT-4o
+    # planner/judge API 비용이 낭비되지 않도록 하는 게 목적 - run_batch()/_task_key() 참고.
+    ap.add_argument("--resume", action="store_true",
+                     help="--out에 이미 있는 결과(task_id 기준)는 건너뛰고 이어서 실행. "
+                          "--out 미지정이면 의미 없음(재개할 파일이 없으므로).")
     # (2026-08-11 추가) 태스크별 폴더에 스텝별 프롬프트/응답 원문을 txt로 저장. --log_file(콘솔
     # 전체 흐름)과는 별개로, "그 스텝에서 모델에 정확히 뭐가 들어갔는지"를 태스크/스텝 단위로
     # 찾아보기 쉽게 구조화한 것 - build_planner_grounding_agent_step()의 _PromptRecorder 참고.
@@ -2015,6 +2145,7 @@ if __name__ == "__main__":
                 max_steps=args.max_steps, judge_repeats=args.judge_repeats, out_path=args.out,
                 stuck_repeat_threshold=args.stuck_repeat_threshold,
                 stuck_repeat_window=args.stuck_repeat_window,
+                resume=args.resume,
             )
         finally:
             env.close()
