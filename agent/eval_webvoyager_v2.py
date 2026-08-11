@@ -75,11 +75,20 @@ DEFAULT_MAX_STEPS = 15
 DEFAULT_JUDGE_REPEATS = 3
 
 
-# (2026-08-11 추가) 같은 액션이 이만큼 연속으로 반복되면 "막혔다"고 보고 조기 종료한다.
+# (2026-08-11 추가) 같은 액션이 이만큼 반복되면 "막혔다"고 보고 조기 종료한다.
 # CAPTCHA에 걸려서 planner가 같은 걸 계속 재시도하는 경우(Allrecipes 사례, planner.py
 # docstring 참고)의 일반화된 안전장치 - CAPTCHA뿐 아니라 grounding이 계속 같은 지점을
 # 잘못 찍는 등 "어떤 이유로든 진행이 안 되는" 상황을 폭넓게 잡는다.
 DEFAULT_STUCK_REPEAT_THRESHOLD = 5
+
+# (2026-08-11 수정 - 뺑뺑이/오실레이션 탐지) 원래는 "바로 직전과 연속으로 같은가"만 봤는데,
+# 이러면 검색 버튼을 못 찾고 두세 개 다른 액션을 번갈아 시도하는(A -> B -> A -> B) 패턴은
+# 못 잡는다(매 스텝 직전 액션과 다르므로 연속 카운트가 계속 리셋됨) - planner.py의
+# REPEAT_WARNING_WINDOW와 동일한 문제/동일한 해법. "연속" 대신 "최근
+# STUCK_REPEAT_WINDOW개 안에서의 빈도"로 조기종료를 판단하도록 바꿨다. 윈도우 크기는
+# 임계값의 2배 - 2-사이클(A/B가 절반씩 번갈아 나오는 최악의 경우)도 윈도우가 다 차면
+# 반드시 걸리도록 하기 위함.
+DEFAULT_STUCK_REPEAT_WINDOW = DEFAULT_STUCK_REPEAT_THRESHOLD * 2
 
 
 # ---------------------------------------------------------------------------
@@ -400,17 +409,29 @@ class _PromptRecorder:
 class _DebugModelView:
     """.generate() 호출을 그대로 통과시키면서 recorder에 프롬프트/응답을 기록하는 얇은
     proxy. agent_loop._BaseModelView/_AdapterSwitchView와 같은 duck-typing 원칙으로,
-    .model 프로퍼티를 내부 객체에 통과시켜서(disable_adapter() 등 내부에서 .model을 쓰는
-    코드가 그대로 동작하게) 다른 코드는 이게 debug wrapper인지 전혀 모른다."""
+    .model/.processor 등 내부 객체의 속성을 그대로 통과시켜서(disable_adapter() 등 내부에서
+    .model을 쓰는 코드, region_focus.py처럼 .generate()를 거치지 않고 .model/.processor를
+    직접 꺼내 쓰는 코드 모두) 다른 코드는 이게 debug wrapper인지 전혀 모른다.
+
+    (2026-08-11 추가 - 버그 수정) 처음엔 .model만 명시적으로 통과시켰는데, RegionFocus
+    재연결 이후 region_focus.py의 judge_inference()가 .generate()가 아니라
+    qwen_model.model / qwen_model.processor를 직접 꺼내서 쓰는 걸 실제로 돌려보고서야
+    발견했다(AttributeError: '_DebugModelView' object has no attribute 'processor').
+    앞으로 또 이런 식으로 직접 접근하는 속성이 나올 수 있으니, 개별 프로퍼티를 하나씩
+    추가하는 대신 __getattr__로 알려지지 않은 속성 전부를 내부 객체에 위임한다 - generate()
+    처럼 가로채서 기록해야 하는 것만 이 클래스에 명시적으로 정의하고, 나머지는 전부
+    통과시키는 게 이런 종류의 버그를 구조적으로 막는다.
+    """
 
     def __init__(self, inner, recorder: _PromptRecorder, tag: str):
         self._inner = inner
         self._recorder = recorder
         self._tag = tag
 
-    @property
-    def model(self):
-        return getattr(self._inner, "model", self._inner)
+    def __getattr__(self, name):
+        # generate()는 아래 명시적으로 정의돼 있어서 여기로 안 옴 - 그 외 모든 속성/메서드
+        # 접근(.model, .processor, .device, 앞으로 생길 수 있는 것들)은 내부 객체로 위임.
+        return getattr(self._inner, name)
 
     def generate(self, messages, **kwargs):
         response = self._inner.generate(messages, **kwargs)
@@ -672,6 +693,7 @@ def _action_fingerprint(action: dict) -> tuple:
 def run_episode(
     env: WebVoyagerEnv, task, agent_step_fn, max_steps=DEFAULT_MAX_STEPS,
     stuck_repeat_threshold=DEFAULT_STUCK_REPEAT_THRESHOLD,
+    stuck_repeat_window=None,
 ):
     """
     task를 env에 reset하고, agent_step_fn이 "terminate"를 낼 때까지(또는 max_steps
@@ -691,9 +713,12 @@ def run_episode(
     1) env.detect_bot_check() (env_webvoyager.WebVoyagerEnv에 있으면) - title/URL/iframe
        기준으로 CAPTCHA/bot-check 페이지인지 저렴하게 확인. reset() 직후와 매 스텝 이후
        모두 확인한다(reset 시점엔 없다가 특정 페이지로 이동하면서 나타나는 경우도 있어서).
-    2) 같은 액션이 stuck_repeat_threshold회 연속 반복되면 원인(CAPTCHA든 다른 이유든)과
-       무관하게 "멈췄다"고 보고 종료 - detect_bot_check()가 못 잡는 케이스(알려지지 않은
-       문구를 쓰는 봇 차단 페이지 등)까지 잡아내는 일반화된 안전장치.
+    2) 최근 stuck_repeat_window개 액션 안에서 같은 액션이 stuck_repeat_threshold회 이상
+       등장하면 원인(CAPTCHA든 다른 이유든)과 무관하게 "멈췄다"고 보고 종료 -
+       detect_bot_check()가 못 잡는 케이스(알려지지 않은 문구를 쓰는 봇 차단 페이지 등)까지
+       잡아내는 일반화된 안전장치. (2026-08-11 수정) 원래는 "연속"만 봤는데, 이러면 두세 개
+       액션을 번갈아 반복하는 뺑뺑이(A -> B -> A -> B)를 못 잡아서 윈도우 내 빈도 기반으로
+       바꿨다 - planner.py의 REPETITION WARNING과 동일한 문제의식/해법.
 
     env가 detect_bot_check()를 제공하지 않아도(구버전 env, 또는 테스트용 mock) 그냥
     건너뛰고 정상 동작한다 - 이 함수가 env_webvoyager.WebVoyagerEnv 전용으로 굳어지지
@@ -736,7 +761,9 @@ def run_episode(
         blocked_reason = f"reset 시점부터 bot-check 감지: {initial_bot_check.get('reason')}"
         hit_max_steps = False
 
-    fingerprint_streak: list = []
+    if stuck_repeat_window is None:
+        stuck_repeat_window = stuck_repeat_threshold * 2
+    fingerprint_history: list = []
     if not blocked:
         for _ in range(max_steps):
             action = agent_step_fn(screenshot, task_info, {"actions": actions, "screenshots": screenshots})
@@ -758,13 +785,14 @@ def run_episode(
                 break
 
             fp = _action_fingerprint(action)
-            if fingerprint_streak and fingerprint_streak[-1] == fp:
-                fingerprint_streak.append(fp)
-            else:
-                fingerprint_streak = [fp]
-            if len(fingerprint_streak) >= stuck_repeat_threshold:
+            fingerprint_history.append(fp)
+            window = fingerprint_history[-stuck_repeat_window:]
+            fp_count = window.count(fp)
+            if fp_count >= stuck_repeat_threshold:
                 blocked = True
-                blocked_reason = f"같은 액션이 {stuck_repeat_threshold}회 연속 반복됨(멈춘 것으로 판단): {fp}"
+                blocked_reason = (
+                    f"최근 {len(window)}개 액션 중 같은 액션이 {fp_count}회 반복 등장(뺑뺑이/정체로 판단): {fp}"
+                )
                 hit_max_steps = False
                 break
 
@@ -896,7 +924,8 @@ def run_judge_with_repeats(judge_fn, instruction, screenshots, final_answer, n_r
 # ---------------------------------------------------------------------------
 def run_batch(tasks, env, agent_step_fn, judge_fn, max_steps=DEFAULT_MAX_STEPS,
               judge_repeats=DEFAULT_JUDGE_REPEATS, out_path=None,
-              stuck_repeat_threshold=DEFAULT_STUCK_REPEAT_THRESHOLD):
+              stuck_repeat_threshold=DEFAULT_STUCK_REPEAT_THRESHOLD,
+              stuck_repeat_window=None):
     rows = []
     out_f = open(out_path, "w", encoding="utf-8") if out_path else None
     try:
@@ -904,6 +933,7 @@ def run_batch(tasks, env, agent_step_fn, judge_fn, max_steps=DEFAULT_MAX_STEPS,
             t0 = time.time()
             traj = run_episode(
                 env, task, agent_step_fn, max_steps=max_steps, stuck_repeat_threshold=stuck_repeat_threshold,
+                stuck_repeat_window=stuck_repeat_window,
             )
 
             if traj["blocked"]:
@@ -1101,6 +1131,38 @@ def _run_mock_selftest():
         max_steps=10, stuck_repeat_threshold=3,
     )
     check("10px 이내로 흔들리는 좌표도 '같은 시도'로 잡혀서 stuck 처리됨", traj_jitter["blocked"] is True)
+
+    # --- (2026-08-11 추가 - 뺑뺑이/오실레이션 탐지) 두 액션을 번갈아 반복해도(연속 아님) 잡혀야 함 ---
+    # 예전 "연속 반복" 방식은 이 패턴(A -> B -> A -> B...)을 절대 못 잡았음(매 스텝 직전과
+    # 다르므로 연속 카운트가 계속 리셋됨) - 검색 버튼을 못 찾고 이것저것 번갈아 시도하는
+    # 실제 관찰 사례를 재현.
+    def oscillating_agent(screenshot, task_info, history):
+        n = len(history["actions"])
+        return (
+            {"action": "left_click", "coordinate": [100, 200]}
+            if n % 2 == 0
+            else {"action": "left_click", "coordinate": [300, 400]}
+        )
+
+    traj_osc = run_episode(
+        fake_env_stuck, {"web": "http://u", "ques": "do U"}, oscillating_agent,
+        max_steps=10, stuck_repeat_threshold=3,
+    )
+    check("A-B 번갈아 반복(뺑뺑이) -> blocked=True(예전엔 절대 못 잡던 케이스)", traj_osc["blocked"] is True)
+    check("뺑뺑이 -> reason에 '반복' 언급", "반복" in traj_osc["blocked_reason"])
+    # threshold=3 -> A(짝수 스텝마다)가 세 번째로 나오는 5번째 스텝(A,B,A,B,A)에서 바로 종료
+    check("뺑뺑이 -> A가 3번째 등장하는 5스텝만에 종료", traj_osc["n_steps"] == 5)
+
+    # stuck_repeat_window를 명시적으로 좁히면(예: 2) 애초에 직전 액션 1개랑만 비교하는 셈이라
+    # 서로 다른 A/B가 매번 갈아치워져서 threshold(3)에 절대 못 도달 -> 안 잡힘(max_steps까지 감)
+    traj_osc_narrow_window = run_episode(
+        fake_env_stuck, {"web": "http://u", "ques": "do U"}, oscillating_agent,
+        max_steps=6, stuck_repeat_threshold=3, stuck_repeat_window=2,
+    )
+    check(
+        "stuck_repeat_window을 좁히면 뺑뺑이를 못 잡음(윈도우가 threshold보다 작아서)",
+        traj_osc_narrow_window["blocked"] is False,
+    )
 
     # --- env가 detect_bot_check()를 아예 제공하지 않는 경우(구버전 env) -> 에러 없이 정상 동작 ---
     class _EnvWithoutBotCheck:
@@ -1475,6 +1537,111 @@ def _run_mock_selftest():
     finally:
         del sys.modules["gui_grounding"]
 
+    # --- (2026-08-11 추가 - RegionFocus 재연결 배선 검증) _build_click_ground_fn 단위 테스트 ---
+    # click grounding을 gui_grounding.ground()(초기 1회) 대신 region_focus.ground_with_regionfocus()
+    # (재탐색+crop/zoom 정밀화)로 돌리도록 재연결한 부분 - 새로 생긴 기본 경로(use_regionfocus=True)가
+    # 실제로 region_focus를 타는지, 끄면(off) 여전히 예전 경로(gui_grounding.ground())를 타는지,
+    # task_id/옵션들이 올바르게 전달되고 두 백엔드가 서로 모르는 kwargs(task_id/max_new_tokens)는
+    # 조용히 걸러지는지 확인한다.
+    small_img = Image.new("RGB", (200, 100))
+    rf_calls = []
+
+    def _fake_ground_with_regionfocus(model, instruction, screenshot, **kw):
+        rf_calls.append(kw)
+        return {"result": "positive", "point": [0.5, 0.5], "raw_response": "(500,500)"}
+
+    fake_region_focus_module = types.ModuleType("region_focus")
+    fake_region_focus_module.ground_with_regionfocus = _fake_ground_with_regionfocus
+    sys.modules["region_focus"] = fake_region_focus_module
+    try:
+        # --- off: 예전 경로(gui_grounding.ground()) 그대로 ---
+        plain_calls = []
+
+        def _fake_plain_ground(model, instruction, screenshot, **kw):
+            plain_calls.append(kw)
+            return {"result": "positive", "point": [0.1, 0.1], "raw_response": "(100,100)"}
+
+        fake_gui_grounding_module_rf = types.ModuleType("gui_grounding")
+        fake_gui_grounding_module_rf.ground = _fake_plain_ground
+        sys.modules["gui_grounding"] = fake_gui_grounding_module_rf
+        try:
+            click_fn_off = _build_click_ground_fn(use_regionfocus=False)
+            r_off = click_fn_off(MagicMock(), "click X", small_img, task_id="t1", max_new_tokens=128)
+            check("_build_click_ground_fn(off) -> gui_grounding.ground() 호출됨", len(plain_calls) == 1)
+            check(
+                "_build_click_ground_fn(off) -> task_id는 gui_grounding.ground()로 안 넘어감(모르는 kwarg라 걸러짐)",
+                "task_id" not in plain_calls[0],
+            )
+            check("_build_click_ground_fn(off) -> 결과 그대로 반환", r_off["point"] == [0.1, 0.1])
+        finally:
+            del sys.modules["gui_grounding"]
+
+        # --- on(RegionFocus): region_focus.ground_with_regionfocus() 경로 ---
+        click_fn_on = _build_click_ground_fn(
+            use_regionfocus=True, regionfocus_debug_image=True, regionfocus_debug_text=False,
+            regionfocus_step1_format="point_text", regionfocus_step4_format="toolcall_pixel",
+        )
+        rf_calls.clear()
+        r_on = click_fn_on(MagicMock(), "click Y", small_img, task_id="task-42", max_new_tokens=128, min_pixels=100)
+        check("_build_click_ground_fn(on) -> region_focus.ground_with_regionfocus() 호출됨", len(rf_calls) == 1)
+        check("_build_click_ground_fn(on) -> task_id 전달됨", rf_calls[0].get("task_id") == "task-42")
+        check(
+            "_build_click_ground_fn(on) -> debug_image/step1_format/step4_format 옵션 전달됨",
+            rf_calls[0].get("debug_image") is True
+            and rf_calls[0].get("step1_format") == "point_text"
+            and rf_calls[0].get("step4_format") == "toolcall_pixel",
+        )
+        check("_build_click_ground_fn(on) -> max_new_tokens는 안 넘어감(내부에서 자체 처리)", "max_new_tokens" not in rf_calls[0])
+        check("_build_click_ground_fn(on) -> min_pixels는 그대로 통과", rf_calls[0].get("min_pixels") == 100)
+        check("_build_click_ground_fn(on) -> 결과 그대로 반환", r_on["point"] == [0.5, 0.5])
+
+        # --- build_planner_grounding_agent_step 기본값(use_regionfocus=True)이 실제로 RegionFocus를 탐 ---
+        fake_planner_module_rf = types.ModuleType("planner")
+
+        def _fake_plan_click(planning_view, instruction, screenshot, history_actions=None, **kw):
+            return {"reasoning": "r", "action": "left_click", "target_description": "the X button"}
+
+        fake_planner_module_rf.plan_next_action = _fake_plan_click
+        fake_planner_module_rf.plan_with_reflection = _fake_plan_click
+        sys.modules["planner"] = fake_planner_module_rf
+        try:
+            rf_calls.clear()
+            fake_model_rf = MagicMock()
+            agent_step_fn_rf = build_planner_grounding_agent_step(
+                fake_model_rf, fake_model_rf, use_reflection=False, verbose=False,
+            )  # use_regionfocus 인자를 안 줌 -> 기본값(True) 그대로 검증
+            agent_step_fn_rf(small_img, {"instruction": "x", "id": "task-99"}, {"actions": [], "screenshots": []})
+            check(
+                "build_planner_grounding_agent_step 기본값 -> click 액션이 RegionFocus 경로를 탐"
+                "(재연결 배선 확인)",
+                len(rf_calls) == 1 and rf_calls[0].get("task_id") == "task-99",
+            )
+        finally:
+            del sys.modules["planner"]
+    finally:
+        del sys.modules["region_focus"]
+
+    # --- (2026-08-11 추가 - 버그 수정 검증) _DebugModelView가 .generate() 말고 다른 속성/메서드도
+    # 내부 객체로 위임하는지 - region_focus.py의 judge_inference()가 .generate()를 거치지 않고
+    # qwen_model.model / qwen_model.processor를 직접 꺼내 쓰다가 실제로 AttributeError가 났었음
+    # (처음엔 .model 프로퍼티만 명시적으로 통과시켜서 .processor는 안 뚫려 있었음).
+    class _FakeInnerModel:
+        def __init__(self):
+            self.model = "the-underlying-peft-model"
+            self.processor = "the-underlying-processor"
+            self.device = "cuda:0"
+
+        def generate(self, messages, **kwargs):
+            return "raw response"
+
+    fake_inner = _FakeInnerModel()
+    fake_recorder = _PromptRecorder(base_dir="/tmp/unused")  # generate() 기록 대상 - 이 테스트에선 안 씀
+    debug_view = _DebugModelView(fake_inner, fake_recorder, "test-tag")
+    check("_DebugModelView -> .model 속성이 내부 객체로 위임됨", debug_view.model == "the-underlying-peft-model")
+    check("_DebugModelView -> .processor 속성이 내부 객체로 위임됨(region_focus.py 버그 재발 방지)", debug_view.processor == "the-underlying-processor")
+    check("_DebugModelView -> .device처럼 임의의 다른 속성도 위임됨", debug_view.device == "cuda:0")
+    check("_DebugModelView -> .generate()는 위임 안 되고 이 클래스가 직접 처리(기록용으로 오버라이드됨)", debug_view.generate([]) == "raw response")
+
     # --- (2026-08-11 추가) 태스크별 프롬프트/응답 덤프(--debug_dir) 배선 확인 ---
     # 위쪽 테스트들의 fake plan_next_action/ground()는 model.generate()를 아예 안 부르고
     # 결과만 바로 반환하는 "완전히 껍데기"라서(그래서 각 액션 변환 로직만 빠르게 테스트할 수
@@ -1602,8 +1769,12 @@ if __name__ == "__main__":
     ap.add_argument("--selftest", action="store_true", help="실제 브라우저/모델/API 없이 제어 흐름만 mock으로 검증")
     ap.add_argument("--tasks_jsonl", default=None, help="WebVoyager 태스크 jsonl 경로")
     ap.add_argument("--web_name", default=None)
-    ap.add_argument("--judge", choices=["qwen", "openai"], default="qwen")
-    ap.add_argument("--openai_model", default="gpt-4o")
+    # (2026-08-11 수정 - --judge -> --judge_backend, --openai_model -> --judge_api_model 개명)
+    # planner 쪽 옵션 이름(--planner_backend {local,openai} / --planner_api_model)과 짝이
+    # 안 맞아서 헷갈린다는 지적에 따라 동일한 네이밍 패턴으로 맞췄다. 값(choices)과 동작은
+    # 그대로("qwen"/"openai"), 이름만 바꿈.
+    ap.add_argument("--judge_backend", choices=["qwen", "openai"], default="qwen")
+    ap.add_argument("--judge_api_model", default="gpt-4o", help="--judge_backend openai일 때 쓸 모델 이름")
     ap.add_argument("--adapter_dir", default=None,
                      help="Qwen judge용 LoRA 어댑터 (선택). --reuse_agent_model_for_judge를 켜면 무시됨.")
     ap.add_argument("--max_steps", type=int, default=DEFAULT_MAX_STEPS)
@@ -1625,9 +1796,19 @@ if __name__ == "__main__":
     ap.add_argument("--captcha_reset_retries", type=int, default=1,
                      help="reset() 직후 bot-check가 감지되면 새 브라우저 세션으로 몇 번 더 재시도할지 "
                           "(기본 1회 = 최초 시도 포함 총 2회). env_webvoyager.WebVoyagerEnv 생성자로 전달됨.")
+    # (2026-08-11 추가 - 태스크 간 지연 단축) 기본은 브라우저 재사용(빠름). 태스크 간 격리를
+    # 더 강하게 보장하고 싶으면(드라이버가 불안정해지는 게 의심될 때 등) 끌 것 - 예전처럼
+    # 매 태스크마다 Chrome을 통째로 재기동한다(느림).
+    ap.add_argument("--no_reuse_driver", dest="reuse_driver", action="store_false", default=True,
+                     help="태스크마다 브라우저를 재사용하지 않고 매번 새로 켠다(느려짐, 격리는 더 강함). "
+                          "기본은 재사용(쿠키만 초기화).")
     ap.add_argument("--stuck_repeat_threshold", type=int, default=DEFAULT_STUCK_REPEAT_THRESHOLD,
-                     help="같은 액션이 이만큼 연속 반복되면(bot-check 신호 유무와 무관하게) 멈춘 것으로 "
-                          "보고 조기 종료한다(기본 4).")
+                     help="최근 --stuck_repeat_window개 액션 안에 같은 액션이 이만큼 등장하면 "
+                          "(bot-check 신호 유무와 무관하게) 멈춘 것으로 보고 조기 종료한다(기본 5). "
+                          "연속일 필요 없음 - 두세 개 액션을 번갈아 반복하는 뺑뺑이도 잡는다.")
+    ap.add_argument("--stuck_repeat_window", type=int, default=None,
+                     help="위 반복 감지에 사용할 윈도우 크기(최근 몇 개 액션 안에서 셀지). "
+                          "생략하면 --stuck_repeat_threshold의 2배로 자동 설정된다.")
     # (2026-08-09 추가) 실제 planner+grounding 정책. --agent_grounding_adapter_dir를 안 주면
     # 기존처럼 dummy_agent_step(즉시 실패)로 동작 - 파이프라인 배선만 확인하고 싶을 때는 그대로 둘 것.
     ap.add_argument("--agent_grounding_adapter_dir", default=None,
@@ -1646,9 +1827,18 @@ if __name__ == "__main__":
                           "openai: api_planner.OpenAIPlannerModel로 OpenAI API 호출해서 planning "
                           "(grounding은 그대로 로컬 LoRA).")
     ap.add_argument("--planner_api_model", default="gpt-4o", help="--planner_backend openai일 때 쓸 모델 이름")
-    ap.add_argument("--planner_api_key", default=None, help="미지정시 환경변수 OPENAI_API_KEY 사용")
+    # (2026-08-11 수정 - --planner_api_key -> --api_key로 개명 + judge에도 적용) 원래는
+    # planner(OpenAIPlannerModel)에만 넘어가고 judge(make_openai_judge)는 이 값을 안 보고
+    # 환경변수 OPENAI_API_KEY만 봐서, --planner_api_key로 키를 넘겨도 judge 단계에서
+    # "api_key must be set" 에러가 나는 문제가 실측으로 확인됐다(에이전트 루프는 끝까지
+    # 돌고 judge 호출 직전에만 죽음). planner/judge가 같은 OpenAI 계정 키를 쓰는 게 보통이라
+    # 이름을 --api_key로 통일하고, judge 쪽(--judge openai)에도 그대로 전달되도록 배선했다.
+    ap.add_argument("--api_key", default=None,
+                     help="OpenAI API 키. --planner_backend openai(planner)와 --judge_backend openai(judge) "
+                          "양쪽 다 이 값을 쓴다. 미지정시 환경변수 OPENAI_API_KEY 사용.")
     ap.add_argument("--planner_api_base_url", default=None,
-                     help="OpenAI 호환 엔드포인트(vLLM 등)를 쓸 때 지정 - 미지정시 OpenAI 공식 엔드포인트")
+                     help="OpenAI 호환 엔드포인트(vLLM 등)를 쓸 때 지정 - 미지정시 OpenAI 공식 엔드포인트. "
+                          "planner 전용(judge에는 base_url 옵션이 없음).")
     # (2026-08-11 수정 - 버그) default=False로 돼 있었던 걸 True로 고침. --no_reflect는
     # action="store_false"라 "플래그를 주면 끈다"는 의미인데, default까지 False였던 탓에
     # 플래그를 주든 안 주든 reflection이 항상 꺼진 채로 돌고 있었다(실측: 실제 실행 로그에
@@ -1708,7 +1898,7 @@ if __name__ == "__main__":
         if not tasks:
             raise SystemExit(f"{args.tasks_jsonl}에서 태스크를 하나도 못 찾음 (파일이 비었거나 경로 확인 필요)")
 
-        env = WebVoyagerEnv(captcha_reset_retries=args.captcha_reset_retries)
+        env = WebVoyagerEnv(captcha_reset_retries=args.captcha_reset_retries, reuse_driver=args.reuse_driver)
 
         if args.planner_backend == "openai" and args.agent_planner_adapter_dir:
             raise SystemExit(
@@ -1734,7 +1924,7 @@ if __name__ == "__main__":
                 agent_model = QwenVLModel(adapter_dir=args.agent_grounding_adapter_dir, **model_kwargs)
                 planning_view = OpenAIPlannerModel(
                     model=args.planner_api_model,
-                    api_key=args.planner_api_key,
+                    api_key=args.api_key,
                     base_url=args.planner_api_base_url,
                 )
                 print(
@@ -1780,7 +1970,7 @@ if __name__ == "__main__":
             )
             agent_step_fn = dummy_agent_step
 
-        if args.judge == "qwen":
+        if args.judge_backend == "qwen":
             if args.reuse_agent_model_for_judge:
                 if agent_model is None:
                     raise SystemExit(
@@ -1808,13 +1998,14 @@ if __name__ == "__main__":
                 judge_model = QwenVLModel(adapter_dir=args.adapter_dir)
             judge_fn = make_qwen_judge(judge_model)
         else:
-            judge_fn = make_openai_judge(model=args.openai_model)
+            judge_fn = make_openai_judge(model=args.judge_api_model, api_key=args.api_key)
 
         try:
             run_batch(
                 tasks, env, agent_step_fn, judge_fn,
                 max_steps=args.max_steps, judge_repeats=args.judge_repeats, out_path=args.out,
                 stuck_repeat_threshold=args.stuck_repeat_threshold,
+                stuck_repeat_window=args.stuck_repeat_window,
             )
         finally:
             env.close()
