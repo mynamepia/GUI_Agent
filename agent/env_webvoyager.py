@@ -226,7 +226,7 @@ class WebVoyagerEnv:
     """
 
     def __init__(self, window_size=DEFAULT_WINDOW_SIZE, headless=True, page_load_timeout=20, user_agent=None,
-                 captcha_reset_retries=0):
+                 captcha_reset_retries=0, reuse_driver=True):
         """
         captcha_reset_retries: (2026-08-11 추가) reset() 직후 detect_bot_check()에
             걸리면 driver.get(url)을 다시 시도하는 횟수. CAPTCHA는 자동화로 못 풀지만,
@@ -235,21 +235,41 @@ class WebVoyagerEnv:
             둔다 - 그래도 계속 감지되면 진짜 CAPTCHA로 보고 포기한다(task_info에
             "_bot_check_at_reset" 마킹, eval_webvoyager_v2.run_episode()가 이 신호를
             보고 첫 스텝도 안 밟고 바로 blocked 처리).
+
+        reuse_driver: (2026-08-11 추가 - 태스크 간 지연 단축) 실측으로 태스크 사이 텀이
+            길다는 지적이 있어서 확인해보니, 매 reset()마다 Chrome 드라이버를 통째로
+            close()+재생성하고 있었다(브라우저 프로세스 재기동 자체가 태스크당 몇 초씩
+            추가됨). True(기본)면 첫 reset()에서만 드라이버를 만들고 이후로는 같은
+            드라이버를 재사용하며 delete_all_cookies()로 이전 태스크의 세션/로케인 쿠키만
+            지운다 - CDP 로케일 오버라이드(_apply_locale_overrides)는 드라이버(브라우저
+            세션) 단위 설정이라 _make_driver() 안에서 한 번만 걸면 재사용해도 계속
+            유지된다(재적용 불필요). False로 주면 예전처럼 매 태스크마다 완전히 새
+            브라우저를 띄운다 - 태스크 간 격리를 더 강하게 보장하고 싶을 때(예: 드라이버가
+            불안정해지는 게 의심될 때) 쓸 것.
         """
         self.window_size = window_size
         self.headless = headless
         self.page_load_timeout = page_load_timeout
         self.user_agent = user_agent
         self.captcha_reset_retries = captcha_reset_retries
+        self.reuse_driver = reuse_driver
         self.driver = None
         self.task_info = None
 
     # ------------------------------------------------------------------
     def reset(self, task):
-        if self.driver is not None:
+        if self.driver is None:
+            self.driver = _make_driver(self.window_size, headless=self.headless, user_agent=self.user_agent)
+            self.driver.set_page_load_timeout(self.page_load_timeout)
+        elif self.reuse_driver:
+            try:
+                self.driver.delete_all_cookies()
+            except Exception as e:  # noqa: BLE001 - 쿠키 초기화 실패해도 나머지 흐름은 계속되어야 함
+                print(f"[env_webvoyager.py] 태스크 간 쿠키 초기화 실패(무시하고 진행): {e}")
+        else:
             self.close()
-        self.driver = _make_driver(self.window_size, headless=self.headless, user_agent=self.user_agent)
-        self.driver.set_page_load_timeout(self.page_load_timeout)
+            self.driver = _make_driver(self.window_size, headless=self.headless, user_agent=self.user_agent)
+            self.driver.set_page_load_timeout(self.page_load_timeout)
 
         url, instruction, extra = self._parse_task(task)
         try:
@@ -741,6 +761,96 @@ def _run_mock_selftest():
         check("_force_site_locale -> 쿠키 심기 실패해도 예외 안 남", True)
     except Exception:
         check("_force_site_locale -> 쿠키 심기 실패해도 예외 안 남", False)
+
+    # --- (2026-08-11 추가 - 태스크 간 지연 단축) reset()의 드라이버 재사용 로직 ---
+    # 실측 지적: 태스크 사이 텀이 길다 -> 원인은 매 reset()마다 Chrome을 통째로 재기동하던
+    # 것. reuse_driver=True(기본)면 기존 드라이버를 유지하고 쿠키만 지우는지, False면 예전
+    # 처럼 close()+새 드라이버로 교체하는지 확인.
+    import sys
+
+    orig_sleep = time.sleep
+    time.sleep = lambda *a, **k: None  # reset() 안의 고정 sleep들 때문에 테스트가 느려지는 것 방지
+    try:
+        reuse_env = WebVoyagerEnv.__new__(WebVoyagerEnv)
+        reuse_env.window_size = (1280, 800)
+        reuse_env.headless = True
+        reuse_env.page_load_timeout = 20
+        reuse_env.user_agent = None
+        reuse_env.captcha_reset_retries = 0
+        reuse_env.reuse_driver = True
+        first_driver = MagicMock()
+        first_driver.title = "Example Domain"
+        first_driver.current_url = "http://example.com/"
+        first_driver.get_screenshot_as_png.return_value = _fake_png_bytes()
+        reuse_env.driver = first_driver
+        reuse_env.task_info = None
+
+        reuse_env.reset({"web": "http://example.com/a", "ques": "do A"})
+        check("reuse_driver=True -> 기존 드라이버 객체를 그대로 재사용(재생성 안 함)", reuse_env.driver is first_driver)
+        check("reuse_driver=True -> delete_all_cookies 호출됨", first_driver.delete_all_cookies.called)
+        check("reuse_driver=True -> 기존 드라이버 quit() 호출 안 됨", not first_driver.quit.called)
+
+        # reuse_driver=False -> 예전처럼 매번 close()+새 드라이버로 교체돼야 함
+        no_reuse_env = WebVoyagerEnv.__new__(WebVoyagerEnv)
+        no_reuse_env.window_size = (1280, 800)
+        no_reuse_env.headless = True
+        no_reuse_env.page_load_timeout = 20
+        no_reuse_env.user_agent = None
+        no_reuse_env.captcha_reset_retries = 0
+        no_reuse_env.reuse_driver = False
+        old_driver = MagicMock()
+        old_driver.title = "Example Domain"
+        old_driver.current_url = "http://example.com/"
+        no_reuse_env.driver = old_driver
+        no_reuse_env.task_info = None
+
+        new_driver = MagicMock()
+        new_driver.title = "Example Domain"
+        new_driver.current_url = "http://example.com/"
+        new_driver.get_screenshot_as_png.return_value = _fake_png_bytes()
+
+        this_module = sys.modules[__name__]
+        orig_make_driver = this_module._make_driver
+        this_module._make_driver = lambda *a, **k: new_driver
+        try:
+            no_reuse_env.reset({"web": "http://example.com/b", "ques": "do B"})
+        finally:
+            this_module._make_driver = orig_make_driver
+
+        check("reuse_driver=False -> 기존 드라이버 quit() 호출됨(close)", old_driver.quit.called)
+        check("reuse_driver=False -> 새 드라이버 객체로 교체됨", no_reuse_env.driver is new_driver)
+        check(
+            "reuse_driver=False -> 새 드라이버라 delete_all_cookies는 호출 안 함",
+            not new_driver.delete_all_cookies.called,
+        )
+
+        # driver가 아예 None인 최초 1회는 reuse_driver 값과 무관하게 새로 만들어져야 함
+        first_reset_env = WebVoyagerEnv.__new__(WebVoyagerEnv)
+        first_reset_env.window_size = (1280, 800)
+        first_reset_env.headless = True
+        first_reset_env.page_load_timeout = 20
+        first_reset_env.user_agent = None
+        first_reset_env.captcha_reset_retries = 0
+        first_reset_env.reuse_driver = True
+        first_reset_env.driver = None
+        first_reset_env.task_info = None
+
+        fresh_driver = MagicMock()
+        fresh_driver.title = "Example Domain"
+        fresh_driver.current_url = "http://example.com/"
+        fresh_driver.get_screenshot_as_png.return_value = _fake_png_bytes()
+        this_module._make_driver = lambda *a, **k: fresh_driver
+        try:
+            first_reset_env.reset({"web": "http://example.com/c", "ques": "do C"})
+        finally:
+            this_module._make_driver = orig_make_driver
+        check("driver=None인 최초 reset -> _make_driver로 새로 생성됨", first_reset_env.driver is fresh_driver)
+        check(
+            "driver=None인 최초 reset -> delete_all_cookies는 호출 안 함(재사용할 기존 드라이버가 없음)",
+            not fresh_driver.delete_all_cookies.called,
+        )
+    finally:
+        time.sleep = orig_sleep
 
     n_fail = sum(1 for _, ok in checks if not ok)
     for name, ok in checks:

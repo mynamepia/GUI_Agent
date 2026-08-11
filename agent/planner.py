@@ -239,11 +239,20 @@ English, even if the task description is given in another language.
 """
 
 
-# (2026-08-11 추가) 이 이상 "사실상 같은" 액션이 연속되면 _format_history()가 경고 문구를
+# (2026-08-11 추가) 이 이상 "사실상 같은" 액션이 나오면 _format_history()가 경고 문구를
 # 끼워 넣는다. eval_webvoyager_v2.py의 stuck_repeat_threshold(하드 조기종료, 기본 5)보다
 # 낮게 잡아서 - 하드 조기종료로 에피소드 자체가 끊기기 전에 planner가 먼저 스스로 전략을
 # 바꿀 기회를 준다. 사용자 요청대로 3회로 설정(= 4번째 제안 시점에 경고가 뜸).
 REPEAT_WARNING_STREAK = 3
+
+# (2026-08-11 수정 - 뺑뺑이/오실레이션 탐지) 원래는 "바로 직전과 연속으로 같은가"만 봤는데,
+# 실측 우려대로 이러면 A -> B -> A -> B처럼 두세 개 액션을 번갈아 반복하는 패턴을 못 잡는다
+# (매번 직전 액션과 다르므로 streak가 계속 1로 리셋됨). 그래서 "바로 직전 연속"이 아니라
+# "최근 REPEAT_WARNING_WINDOW개 안에 같은 시도가 몇 번 있었는가"로 바꿨다 - 순서 상관없이
+# 빈도만 본다. 윈도우 크기는 임계값의 2배로 잡아서, A/B 두 액션이 절반씩 번갈아 나오는
+# 최악의 경우(2-사이클)도 윈도우가 다 차면 반드시 걸리도록 함(예: threshold=3, window=6이면
+# A,B,A,B,A,B 상황에서 마지막 액션 기준 카운트가 3에 도달).
+REPEAT_WARNING_WINDOW = REPEAT_WARNING_STREAK * 2
 
 
 def _describe_action(a: dict) -> str:
@@ -297,9 +306,16 @@ def _is_similar_action(a: dict, b: dict) -> bool:
 
 def _trailing_repeat_streak(history_actions: list):
     """
-    (2026-08-11 추가) history_actions 끝에서부터 거꾸로 훑어서 "사실상 같은" 액션이 몇 번
-    연속됐는지 센다. 도중에 다른 액션이 하나라도 끼면 그 지점에서 멈춘다(= 최신 연속
-    구간만 본다 - 예전에 반복했다가 다른 걸 시도한 이력까지 반복으로 잘못 세지 않기 위함).
+    (2026-08-11 추가, 같은 날 -윈도우 방식으로 대체됨) history_actions 끝에서부터 거꾸로
+    훑어서 "사실상 같은" 액션이 몇 번 연속됐는지 센다. 도중에 다른 액션이 하나라도 끼면 그
+    지점에서 멈춘다(= 최신 연속 구간만 본다).
+
+    [한계 - 왜 _format_history()가 이제 이 함수 대신 _windowed_repeat_count()를 쓰는가]
+    이 "연속(streak)" 방식은 A -> B -> A -> B처럼 두세 개 액션을 번갈아 반복하는 뺑뺑이
+    패턴을 못 잡는다 - 매 스텝 직전 액션과 다르므로 streak가 계속 1로 리셋되기 때문. 실측
+    우려(WebVoyager 실행에서 검색 버튼을 못 찾고 이것저것 번갈아 시도하며 진행이 없는 케이스)
+    로 이 한계가 지적되어 _windowed_repeat_count()로 교체했다. 이 함수 자체는 하위호환/단독
+    테스트 목적으로 남겨둔다.
 
     Returns: (streak: int, action: dict | None) - streak는 마지막 액션 자신을 포함한 개수
         (즉 streak=1이면 반복 없음, streak=3이면 마지막 3개가 전부 같은 시도). history_actions가
@@ -317,7 +333,28 @@ def _trailing_repeat_streak(history_actions: list):
     return streak, last
 
 
-def _format_history(history_actions, max_items=8, repeat_warning_streak=REPEAT_WARNING_STREAK):
+def _windowed_repeat_count(history_actions: list, window_size: int):
+    """
+    (2026-08-11 추가 - 뺑뺑이/오실레이션 탐지) 최근 window_size개 액션 중, 마지막 액션과
+    "사실상 같은" 시도가 몇 번 있었는지 순서 무관하게 센다(빈도 기반). _trailing_repeat_streak()
+    와 달리 중간에 다른 액션이 끼어도 카운트가 리셋되지 않는다 - 그래서 A -> B -> A -> B처럼
+    번갈아 반복하는 패턴도, 같은 시도가 윈도우 안에서 threshold번 이상 나오면 잡힌다.
+
+    Returns: (count: int, action: dict | None) - count는 마지막 액션 자신을 포함한 개수.
+        history_actions가 비어있으면 (0, None).
+    """
+    if not history_actions:
+        return 0, None
+    last = history_actions[-1]
+    window = history_actions[-window_size:] if window_size else history_actions
+    count = sum(1 for a in window if _is_similar_action(a, last))
+    return count, last
+
+
+def _format_history(
+    history_actions, max_items=8, repeat_warning_streak=REPEAT_WARNING_STREAK,
+    repeat_warning_window=None,
+):
     """
     과거 액션들을 텍스트로 요약. 컨텍스트/연산량을 아끼려고 과거 스크린샷은 다시 안 넣고
     텍스트 요약만 준다 - 3B 모델 + 16GB 환경에서 매 스텝마다 이미지를 계속 누적해서
@@ -342,10 +379,16 @@ def _format_history(history_actions, max_items=8, repeat_warning_streak=REPEAT_W
     계속 반복하면서 진전이 없는 경우였다(WebVoyager 평가에서 필터를 못 찾고 계속
     스크롤하다가 eval_webvoyager_v2.py의 stuck_repeat_threshold에 걸려 조기종료된 사례
     다수 - idx 4/6/9). 그 하드 조기종료는 "더 못 하게 막는" 안전장치일 뿐 "다른 걸
-    시도해보라"고 알려주진 않는다. 여기서는 history 끝에 같은 시도가
-    repeat_warning_streak번 이상 연속되면(_trailing_repeat_streak) 명시적인 경고 문구를
+    시도해보라"고 알려주진 않는다. 여기서는 최근 repeat_warning_window개 액션 안에 같은
+    시도가 repeat_warning_streak번 이상 있으면(_windowed_repeat_count) 명시적인 경고 문구를
     history 텍스트 끝에 붙여서, 하드 조기종료가 걸리기 전에 planner가 스스로 전략을
     바꿀 기회를 준다.
+
+    [2026-08-11 추가 - 연속(streak) 대신 윈도우(window) 방식으로 변경]
+    처음엔 "바로 직전 액션과 연속으로 같은가"만 봤는데, 이러면 A -> B -> A -> B처럼 두세 개
+    액션을 번갈아 반복하는 뺑뺑이 패턴을 못 잡는다(매번 직전과 다르므로 streak가 계속
+    리셋됨). 그래서 "직전과 연속"이 아니라 "최근 N개 안에서의 빈도"로 바꿔서, 순서와
+    무관하게 같은 시도가 반복되면 잡히도록 했다.
     """
     if not history_actions:
         return "(no actions taken yet)"
@@ -367,12 +410,15 @@ def _format_history(history_actions, max_items=8, repeat_warning_streak=REPEAT_W
             lines.append(f"Step {i}: {desc}")
     text = "\n".join(lines)
 
-    streak, last_action = _trailing_repeat_streak(history_actions)
-    if streak >= repeat_warning_streak and last_action is not None:
+    if repeat_warning_window is None:
+        repeat_warning_window = repeat_warning_streak * 2
+    count, last_action = _windowed_repeat_count(history_actions, repeat_warning_window)
+    if count >= repeat_warning_streak and last_action is not None:
         desc = _describe_action(last_action)
         text += (
-            f'\n\n*** REPETITION WARNING: you have proposed the SAME action ("{desc}") {streak} times '
-            "in a row and it has NOT made progress. Do NOT propose it again. Actively try a genuinely "
+            f'\n\n*** REPETITION WARNING: you have proposed the SAME action ("{desc}") {count} times '
+            f"within your last {repeat_warning_window} attempts and it has NOT made progress. "
+            "Do NOT propose it again. Actively try a genuinely "
             "different approach instead - for example: look for a different UI element or navigation "
             "path (e.g. a filters/sidebar panel instead of scrolling further, a different button or "
             "link), reconsider whether your assumption about what's currently on screen is correct, or "
@@ -813,6 +859,36 @@ def _run_mock_selftest():
     streak_rej, _ = _trailing_repeat_streak(rejected_streak)
     check("_trailing_repeat_streak -> _rejected 항목도 반복 스트릭에 포함됨", streak_rej == 3)
 
+    # --- (2026-08-11 추가) _windowed_repeat_count ---
+    wc0, wa0 = _windowed_repeat_count([], 6)
+    check("_windowed_repeat_count -> 빈 히스토리는 (0, None)", wc0 == 0 and wa0 is None)
+
+    wc_consec, _ = _windowed_repeat_count(same3, 6)
+    check("_windowed_repeat_count -> 연속 반복도 그대로 카운트됨(streak와 동일 결과)", wc_consec == 3)
+
+    # 핵심: A -> B -> A -> B 뺑뺑이 - streak 방식은 절대 못 잡지만(매번 직전과 다름),
+    # 윈도우 방식은 마지막 액션(A)이 윈도우 안에서 몇 번 나왔는지로 세므로 잡힌다.
+    oscillating = [
+        {"action": "left_click", "target_description": "search icon"},
+        {"action": "left_click", "target_description": "back button"},
+        {"action": "left_click", "target_description": "search icon"},
+        {"action": "left_click", "target_description": "back button"},
+        {"action": "left_click", "target_description": "search icon"},
+    ]
+    streak_osc, _ = _trailing_repeat_streak(oscillating)
+    check("뺑뺑이 패턴 -> _trailing_repeat_streak는 못 잡음(streak=1)", streak_osc == 1)
+    wc_osc, wa_osc = _windowed_repeat_count(oscillating, 6)
+    check(
+        "뺑뺑이 패턴 -> _windowed_repeat_count는 잡음(윈도우 안 'search icon' 3회)",
+        wc_osc == 3 and wa_osc["target_description"] == "search icon",
+    )
+
+    interrupted_window = _windowed_repeat_count(interrupted, 6)
+    check(
+        "_windowed_repeat_count -> 중간에 다른 액션이 껴도 윈도우 안이면 카운트에 포함(streak와의 차이)",
+        interrupted_window[0] == 3,
+    )
+
     # --- (2026-08-11 추가) _format_history의 REPETITION WARNING 삽입 ---
     below_threshold = _format_history(
         [{"action": "scroll", "text": "down"}, {"action": "scroll", "text": "down"}]
@@ -834,15 +910,42 @@ def _run_mock_selftest():
         ]
     )
     check(
-        "중간에 다른 액션이 끼면 경고 없음(최신 구간만 봄)",
+        "중간에 다른 액션이 껴도 윈도우 안에서 임계값 미달이면 경고 없음",
         "REPETITION WARNING" not in reset_by_different_action,
     )
+
+    # 뺑뺑이(A-B-A-B-A-B) 케이스 -> 기본 window(=streak*2=6)가 다 찰 때 경고 발생해야 함
+    oscillating_hist = _format_history(
+        [
+            {"action": "scroll", "text": "down"},
+            {"action": "left_click", "target_description": "filters"},
+            {"action": "scroll", "text": "down"},
+            {"action": "left_click", "target_description": "filters"},
+            {"action": "scroll", "text": "down"},
+            {"action": "left_click", "target_description": "filters"},
+        ]
+    )
+    check("뺑뺑이(A-B 번갈아 6회) -> 경고 발생", "REPETITION WARNING" in oscillating_hist)
 
     custom_threshold = _format_history(
         [{"action": "wait"}, {"action": "wait"}],
         repeat_warning_streak=2,
     )
     check("repeat_warning_streak 인자로 임계값을 낮추면 2회에도 경고 발생", "REPETITION WARNING" in custom_threshold)
+
+    custom_window = _format_history(
+        [
+            {"action": "left_click", "target_description": "x"},
+            {"action": "left_click", "target_description": "y"},
+            {"action": "left_click", "target_description": "x"},
+        ],
+        repeat_warning_streak=2,
+        repeat_warning_window=2,
+    )
+    check(
+        "repeat_warning_window을 좁히면 윈도우 밖의 과거 반복은 안 잡힘",
+        "REPETITION WARNING" not in custom_window,
+    )
 
     # plan_next_action: 모델 generate()를 mock으로 대체해서 메시지 조립까지만 검증
     fake_model = MagicMock()
