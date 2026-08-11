@@ -169,6 +169,14 @@ Available actions: {", ".join(_ACTIONS)}
 
 {_FEWSHOT}
 
+Before deciding, check the action history: if you have already tried the same or a very similar
+action recently without making progress, do not propose it again - repeating an ineffective action
+will not suddenly start working. Instead actively look for a different approach (a different UI
+element, a different navigation path such as a filters/sidebar panel instead of scrolling further,
+or reconsidering whether your assumption about the current screen is correct). If the history shows
+you are stuck in this way, it will be called out explicitly with a "REPETITION WARNING" - treat that
+as a hard requirement to change strategy, not a suggestion.
+
 Reply with ONLY a single JSON object with these fields (omit fields that don't apply to your
 chosen action): {{"reasoning": "...", "action": "...", "target_description": "...", "text": "...",
 "status": "...", "answer": "..."}}
@@ -231,7 +239,85 @@ English, even if the task description is given in another language.
 """
 
 
-def _format_history(history_actions, max_items=8):
+# (2026-08-11 추가) 이 이상 "사실상 같은" 액션이 연속되면 _format_history()가 경고 문구를
+# 끼워 넣는다. eval_webvoyager_v2.py의 stuck_repeat_threshold(하드 조기종료, 기본 5)보다
+# 낮게 잡아서 - 하드 조기종료로 에피소드 자체가 끊기기 전에 planner가 먼저 스스로 전략을
+# 바꿀 기회를 준다. 사용자 요청대로 3회로 설정(= 4번째 제안 시점에 경고가 뜸).
+REPEAT_WARNING_STREAK = 3
+
+
+def _describe_action(a: dict) -> str:
+    """액션 dict 하나를 사람이 읽는 한 줄 설명으로 바꾼다. _format_history()의 히스토리
+    라인 렌더링과 반복 경고 문구 둘 다 이 설명을 재사용한다(같은 액션을 두 군데서 다르게
+    묘사하면 "REPETITION WARNING에 적힌 그 행동"과 "history 줄에 적힌 그 행동"이 서로 다른
+    문구로 보여서 모델이 둘을 같은 것으로 못 알아볼 위험이 있음)."""
+    act = a.get("action")
+    if act in ("left_click", "double_click", "right_click"):
+        return f'{act} on "{a.get("target_description", "?")}"'
+    if act == "drag":
+        return f'drag from "{a.get("target_description", "?")}" to "{a.get("text", "?")}"'
+    if act == "type":
+        return f'type "{a.get("text", "")}"'
+    if act == "key":
+        return f'press key "{a.get("text", "")}"'
+    if act == "scroll":
+        return f'scroll {a.get("text", "down")}'
+    if act == "wait":
+        return "wait"
+    return str(act)
+
+
+def _is_similar_action(a: dict, b: dict) -> bool:
+    """
+    (2026-08-11 추가 - 반복 행동 경고) 두 액션이 "사실상 같은 시도"인지 비교한다.
+    eval_webvoyager_v2._action_fingerprint()와 같은 목적이지만, 이 파일의 planner 스키마는
+    좌표가 없고 target_description/text(자연어)만 있어서 좌표 버킷 비교 대신 문자열을
+    대소문자 무시하고 비교하는 것으로 충분하다 - 같은 문구로 같은 요소/텍스트를 반복
+    지목한다는 건 사실상 같은 시도라는 뜻이라서. _rejected 마커 유무는 비교에서 무시한다 -
+    "시도했지만 반려당함"도 "같은 걸 또 시도하려 한다"는 패턴의 일부로 쳐야 함.
+    """
+    if a.get("action") != b.get("action"):
+        return False
+    act = a.get("action")
+    if act in ("left_click", "double_click", "right_click"):
+        return (a.get("target_description") or "").strip().lower() == (b.get("target_description") or "").strip().lower()
+    if act == "drag":
+        return (
+            (a.get("target_description") or "").strip().lower() == (b.get("target_description") or "").strip().lower()
+            and (a.get("text") or "").strip().lower() == (b.get("text") or "").strip().lower()
+        )
+    if act in ("type", "key"):
+        return (a.get("text") or "").strip().lower() == (b.get("text") or "").strip().lower()
+    if act == "scroll":
+        return (a.get("text") or "down").strip().lower() == (b.get("text") or "down").strip().lower()
+    if act == "wait":
+        return True
+    return False
+
+
+def _trailing_repeat_streak(history_actions: list):
+    """
+    (2026-08-11 추가) history_actions 끝에서부터 거꾸로 훑어서 "사실상 같은" 액션이 몇 번
+    연속됐는지 센다. 도중에 다른 액션이 하나라도 끼면 그 지점에서 멈춘다(= 최신 연속
+    구간만 본다 - 예전에 반복했다가 다른 걸 시도한 이력까지 반복으로 잘못 세지 않기 위함).
+
+    Returns: (streak: int, action: dict | None) - streak는 마지막 액션 자신을 포함한 개수
+        (즉 streak=1이면 반복 없음, streak=3이면 마지막 3개가 전부 같은 시도). history_actions가
+        비어있으면 (0, None).
+    """
+    if not history_actions:
+        return 0, None
+    last = history_actions[-1]
+    streak = 1
+    for prev in reversed(history_actions[:-1]):
+        if _is_similar_action(prev, last):
+            streak += 1
+        else:
+            break
+    return streak, last
+
+
+def _format_history(history_actions, max_items=8, repeat_warning_streak=REPEAT_WARNING_STREAK):
     """
     과거 액션들을 텍스트로 요약. 컨텍스트/연산량을 아끼려고 과거 스크린샷은 다시 안 넣고
     텍스트 요약만 준다 - 3B 모델 + 16GB 환경에서 매 스텝마다 이미지를 계속 누적해서
@@ -249,6 +335,17 @@ def _format_history(history_actions, max_items=8):
     구분해서 보여주는 절충안으로 바꿨다 - "이미 했다"도 아니고 "아예 기록에 없다"도 아니고,
     "시도했지만 반려당했다(+이유)"를 그대로 알려줘서 모델이 같은 실수를 반복하지 않고 다른
     선택지를 찾도록 유도한다.
+
+    [2026-08-11 추가 - 반복 행동 경고]
+    위 _rejected 마커는 "reflection이 실행 전에 막은" 경우만 커버한다. 실측으로 더 흔한
+    실패 패턴은 reflection이 꺼져 있거나 승인해준 액션(예: scroll down)을 여러 스텝에 걸쳐
+    계속 반복하면서 진전이 없는 경우였다(WebVoyager 평가에서 필터를 못 찾고 계속
+    스크롤하다가 eval_webvoyager_v2.py의 stuck_repeat_threshold에 걸려 조기종료된 사례
+    다수 - idx 4/6/9). 그 하드 조기종료는 "더 못 하게 막는" 안전장치일 뿐 "다른 걸
+    시도해보라"고 알려주진 않는다. 여기서는 history 끝에 같은 시도가
+    repeat_warning_streak번 이상 연속되면(_trailing_repeat_streak) 명시적인 경고 문구를
+    history 텍스트 끝에 붙여서, 하드 조기종료가 걸리기 전에 planner가 스스로 전략을
+    바꿀 기회를 준다.
     """
     if not history_actions:
         return "(no actions taken yet)"
@@ -258,21 +355,7 @@ def _format_history(history_actions, max_items=8):
         lines.append(f"...({len(history_actions) - max_items}개 이전 스텝 생략)")
     start_idx = len(history_actions) - len(shown) + 1
     for i, a in enumerate(shown, start=start_idx):
-        act = a.get("action")
-        if act in ("left_click", "double_click", "right_click"):
-            desc = f'{act} on "{a.get("target_description", "?")}"'
-        elif act == "drag":
-            desc = f'drag from "{a.get("target_description", "?")}" to "{a.get("text", "?")}"'
-        elif act == "type":
-            desc = f'type "{a.get("text", "")}"'
-        elif act == "key":
-            desc = f'press key "{a.get("text", "")}"'
-        elif act == "scroll":
-            desc = f'scroll {a.get("text", "down")}'
-        elif act == "wait":
-            desc = "wait"
-        else:
-            desc = str(act)
+        desc = _describe_action(a)
         if a.get("_rejected"):
             reason = a.get("_rejection_reason") or ""
             reason_part = f' Reviewer said: "{reason}"' if reason else ""
@@ -282,7 +365,21 @@ def _format_history(history_actions, max_items=8):
             )
         else:
             lines.append(f"Step {i}: {desc}")
-    return "\n".join(lines)
+    text = "\n".join(lines)
+
+    streak, last_action = _trailing_repeat_streak(history_actions)
+    if streak >= repeat_warning_streak and last_action is not None:
+        desc = _describe_action(last_action)
+        text += (
+            f'\n\n*** REPETITION WARNING: you have proposed the SAME action ("{desc}") {streak} times '
+            "in a row and it has NOT made progress. Do NOT propose it again. Actively try a genuinely "
+            "different approach instead - for example: look for a different UI element or navigation "
+            "path (e.g. a filters/sidebar panel instead of scrolling further, a different button or "
+            "link), reconsider whether your assumption about what's currently on screen is correct, or "
+            "change direction/strategy entirely. If after trying different approaches this still seems "
+            'impossible, terminate with status "failure" rather than repeating the same action again. ***'
+        )
+    return text
 
 
 def _action_schema_valid(obj: dict) -> bool:
@@ -623,6 +720,129 @@ def _run_mock_selftest():
 
     ok_wait = _parse_planner_action('{"action": "wait"}')
     check("wait는 추가 필드 없어도 통과", ok_wait["action"] == "wait" and not ok_wait.get("_parse_failed"))
+
+    # (2026-08-07 추가) drag 액션 - AgentNet 학습 데이터에서 3.9%가 moveTo+dragTo 조합으로
+    # 나왔는데 원래 스키마에 없어서 스킵되던 것을 추가함.
+    ok_drag = _parse_planner_action(
+        '{"reasoning": "r", "action": "drag", "target_description": "the fill handle of cell A2", "text": "cell A13"}'
+    )
+    check("drag: target_description+text 둘 다 있으면 통과", ok_drag["action"] == "drag" and not ok_drag.get("_parse_failed"))
+
+    missing_drag_end = _parse_planner_action('{"action": "drag", "target_description": "the fill handle of cell A2"}')
+    check("drag: text(끝 지점) 없으면 폴백", missing_drag_end["action"] == "terminate")
+
+    missing_drag_start = _parse_planner_action('{"action": "drag", "text": "cell A13"}')
+    check("drag: target_description(시작 지점) 없으면 폴백", missing_drag_start["action"] == "terminate")
+
+    drag_hist = _format_history([{"action": "drag", "target_description": "cell A2 fill handle", "text": "cell A13"}])
+    check("drag 히스토리 포맷", 'drag from "cell A2 fill handle" to "cell A13"' in drag_hist)
+
+    # (2026-08-10 추가) reflection에게 반려당한 액션을 history에 넣을 때 - "이미 했다"가 아니라
+    # "시도했지만 반려당해서 실행 안 됐다"는 게 명확히 드러나야 함(eval_webvoyager.py가 이 형태로
+    # 넘김 - 반려 사실이 스텝을 넘어 유실되면 같은 걸 계속 재제안하는 문제가 실측으로 확인됨).
+    rejected_hist = _format_history([
+        {
+            "action": "left_click",
+            "target_description": "the CAPTCHA checkbox",
+            "_rejected": True,
+            "_rejection_reason": "no CAPTCHA checkbox is visible in the screenshot",
+        }
+    ])
+    check("반려된 액션 -> '실행 안 됐다'는 문구 포함", "did NOT happen" in rejected_hist)
+    check("반려된 액션 -> 원래 액션 설명도 그대로 포함", 'left_click on "the CAPTCHA checkbox"' in rejected_hist)
+    check("반려된 액션 -> 반려 사유(critique)도 포함", "no CAPTCHA checkbox is visible" in rejected_hist)
+
+    # 반려 사유가 없어도(critique가 빈 문자열인 케이스) 에러 없이 동작해야 함
+    rejected_hist_no_reason = _format_history([{"action": "wait", "_rejected": True}])
+    check("반려된 액션(사유 없음) -> 에러 없이 포맷됨", "did NOT happen" in rejected_hist_no_reason)
+
+    # --- (2026-08-11 추가) _is_similar_action ---
+    check(
+        "_is_similar_action -> 같은 target의 click은 동일 취급(대소문자 무시)",
+        _is_similar_action(
+            {"action": "left_click", "target_description": "the Add to Cart button"},
+            {"action": "left_click", "target_description": "THE ADD TO CART BUTTON"},
+        ),
+    )
+    check(
+        "_is_similar_action -> target이 다른 click은 다름",
+        not _is_similar_action(
+            {"action": "left_click", "target_description": "the Add to Cart button"},
+            {"action": "left_click", "target_description": "the Buy Now button"},
+        ),
+    )
+    check(
+        "_is_similar_action -> action 종류 자체가 다르면 다름",
+        not _is_similar_action({"action": "left_click", "target_description": "x"}, {"action": "scroll", "text": "down"}),
+    )
+    check(
+        "_is_similar_action -> scroll은 방향까지 같아야 동일",
+        _is_similar_action({"action": "scroll", "text": "down"}, {"action": "scroll", "text": "DOWN"})
+        and not _is_similar_action({"action": "scroll", "text": "down"}, {"action": "scroll", "text": "up"}),
+    )
+    check(
+        "_is_similar_action -> type은 text까지 같아야 동일",
+        _is_similar_action({"action": "type", "text": "cats"}, {"action": "type", "text": "cats"})
+        and not _is_similar_action({"action": "type", "text": "cats"}, {"action": "type", "text": "dogs"}),
+    )
+    check("_is_similar_action -> wait끼리는 항상 동일 취급", _is_similar_action({"action": "wait"}, {"action": "wait"}))
+
+    # --- (2026-08-11 추가) _trailing_repeat_streak ---
+    streak0, action0 = _trailing_repeat_streak([])
+    check("_trailing_repeat_streak -> 빈 히스토리는 (0, None)", streak0 == 0 and action0 is None)
+
+    same3 = [{"action": "scroll", "text": "down"} for _ in range(3)]
+    streak3, _ = _trailing_repeat_streak(same3)
+    check("_trailing_repeat_streak -> 연속 3회 반복 -> streak=3", streak3 == 3)
+
+    interrupted = [
+        {"action": "scroll", "text": "down"},
+        {"action": "scroll", "text": "down"},
+        {"action": "left_click", "target_description": "filters"},  # 중간에 다른 액션 -> 스트릭 끊김
+        {"action": "scroll", "text": "down"},
+    ]
+    streak_interrupted, _ = _trailing_repeat_streak(interrupted)
+    check("_trailing_repeat_streak -> 중간에 다른 액션이 끼면 최신 구간만 셈(streak=1)", streak_interrupted == 1)
+
+    # _rejected 마커가 붙어 있어도 반복으로 셈(반려당했어도 "같은 시도"라는 신호는 유효)
+    rejected_streak = [
+        {"action": "left_click", "target_description": "the CAPTCHA checkbox", "_rejected": True, "_rejection_reason": "not visible"},
+        {"action": "left_click", "target_description": "the CAPTCHA checkbox", "_rejected": True, "_rejection_reason": "not visible"},
+        {"action": "left_click", "target_description": "the CAPTCHA checkbox"},
+    ]
+    streak_rej, _ = _trailing_repeat_streak(rejected_streak)
+    check("_trailing_repeat_streak -> _rejected 항목도 반복 스트릭에 포함됨", streak_rej == 3)
+
+    # --- (2026-08-11 추가) _format_history의 REPETITION WARNING 삽입 ---
+    below_threshold = _format_history(
+        [{"action": "scroll", "text": "down"}, {"action": "scroll", "text": "down"}]
+    )
+    check("반복 2회(임계값 미만) -> 경고 없음", "REPETITION WARNING" not in below_threshold)
+
+    at_threshold = _format_history(
+        [{"action": "scroll", "text": "down"} for _ in range(3)]
+    )
+    check("반복 3회(기본 임계값) -> 경고 발생", "REPETITION WARNING" in at_threshold)
+    check("경고 문구에 반복 횟수 포함", "3 times" in at_threshold)
+    check("경고 문구에 반복된 행동 설명 포함", "scroll down" in at_threshold)
+
+    reset_by_different_action = _format_history(
+        [
+            {"action": "scroll", "text": "down"},
+            {"action": "scroll", "text": "down"},
+            {"action": "left_click", "target_description": "filters"},
+        ]
+    )
+    check(
+        "중간에 다른 액션이 끼면 경고 없음(최신 구간만 봄)",
+        "REPETITION WARNING" not in reset_by_different_action,
+    )
+
+    custom_threshold = _format_history(
+        [{"action": "wait"}, {"action": "wait"}],
+        repeat_warning_streak=2,
+    )
+    check("repeat_warning_streak 인자로 임계값을 낮추면 2회에도 경고 발생", "REPETITION WARNING" in custom_threshold)
 
     # plan_next_action: 모델 generate()를 mock으로 대체해서 메시지 조립까지만 검증
     fake_model = MagicMock()

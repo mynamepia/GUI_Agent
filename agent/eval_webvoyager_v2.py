@@ -79,7 +79,7 @@ DEFAULT_JUDGE_REPEATS = 3
 # CAPTCHA에 걸려서 planner가 같은 걸 계속 재시도하는 경우(Allrecipes 사례, planner.py
 # docstring 참고)의 일반화된 안전장치 - CAPTCHA뿐 아니라 grounding이 계속 같은 지점을
 # 잘못 찍는 등 "어떤 이유로든 진행이 안 되는" 상황을 폭넓게 잡는다.
-DEFAULT_STUCK_REPEAT_THRESHOLD = 4
+DEFAULT_STUCK_REPEAT_THRESHOLD = 5
 
 
 # ---------------------------------------------------------------------------
