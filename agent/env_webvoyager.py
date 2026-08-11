@@ -222,6 +222,7 @@ class WebVoyagerEnv:
         {"action": "key", "text": "Enter"}                     # Selenium Keys 이름 or 단일 문자
         {"action": "scroll", "coordinate": [x, y], "text": "down", "amount": 300}
         {"action": "wait", "time": 1.0}
+        {"action": "back"}                                      # (2026-08-11 추가) 브라우저 뒤로가기
     terminate는 execute_action으로 보내지 말 것 - agent_loop가 처리(driver에 안 보냄).
     """
 
@@ -411,6 +412,7 @@ class WebVoyagerEnv:
             "type": self._type,
             "key": self._key,
             "wait": self._wait,
+            "back": self._back,
         }
         fn = dispatch.get(act_type)
         if fn is None:
@@ -509,6 +511,16 @@ class WebVoyagerEnv:
 
     def _wait(self, action):
         time.sleep(float(action.get("time", 1.0)))
+
+    def _back(self, action):
+        # (2026-08-11 추가) 브라우저 히스토리 뒤로가기. 지금까지 액션 스키마에 없어서, 잘못된
+        # 페이지로 들어갔을 때 화면 안에서 뒤로가기 버튼/로고를 못 찾으면 그 자리에서 뺑뺑이
+        # 돌 수밖에 없었다(뺑뺑이 조기종료/경고 로직은 이걸 감지는 하지만 대안을 주진 못했다).
+        # driver.back()은 CDP가 아니라 Selenium의 표준 WebDriver 히스토리 내비게이션 - 브라우저
+        # 크롬(주소창) 레벨 동작이라 CDP Input 이벤트로는 못 흉내내던 것.
+        self.driver.back()
+        time.sleep(0.5)  # 페이지 전환 렌더 여유(다른 액션들과 달리 즉시 스크린샷을 찍으면
+        # 이전 페이지가 찍힐 수 있어서 짧게 대기)
 
     # ------------------------------------------------------------------
     def close(self):
@@ -628,6 +640,15 @@ def _run_mock_selftest():
         check("left_click_drag -> NotImplementedError", False)
     except NotImplementedError:
         check("left_click_drag -> NotImplementedError", True)
+
+    # (2026-08-11 추가) back -> driver.back() 호출됨(CDP 아닌 Selenium 표준 히스토리 내비게이션)
+    orig_sleep_back = time.sleep
+    time.sleep = lambda *a, **k: None
+    try:
+        env.execute_action({"action": "back"})
+        check("back -> driver.back() 호출됨", env.driver.back.called)
+    finally:
+        time.sleep = orig_sleep_back
 
     # terminate는 execute_action에서 거부
     try:

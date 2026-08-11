@@ -232,6 +232,11 @@ def _convert_planner_action_to_env(
     if act == "wait":
         return {"action": "wait", "time": 1.0}
 
+    if act == "back":
+        # (2026-08-11 추가) 브라우저 히스토리 뒤로가기 - grounding이 필요 없는 액션이라
+        # 그대로 통과. env_webvoyager.WebVoyagerEnv._back()이 실제 driver.back()을 호출.
+        return {"action": "back"}
+
     # 알 수 없는 action(이론상 _parse_planner_action이 이미 걸러서 여기 안 와야 하지만,
     # 방어적으로) -> 안전하게 종료
     print(f"[agent_step] 알 수 없는 action={act!r} -> terminate/failure로 안전 종료")
@@ -1309,6 +1314,10 @@ def _run_mock_selftest():
         check(
             "wait -> 기본 1.0초",
             _convert_planner_action_to_env({"action": "wait"}, None, wide_img, {}) == {"action": "wait", "time": 1.0},
+        )
+        check(
+            "back 패스스루(2026-08-11 추가 - 뒤로가기)",
+            _convert_planner_action_to_env({"action": "back"}, None, wide_img, {}) == {"action": "back"},
         )
 
         # 알 수 없는 action -> 안전하게 terminate/failure
