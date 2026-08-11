@@ -30,6 +30,17 @@ MiniWob과 달리 패키징된 gymnasium 라이브러리가 없어서 Selenium�
 Chrome+chromedriver 있는 로컬 환경에서 최종 확인 필요 - env_miniwob.py는 이미 그
 환경에서 성공했으니 Chrome/chromedriver 설치 자체는 문제 없을 것으로 예상.
 
+[위치/통화 강제 영미권 고정 - 2026-08-11 추가]
+실행 환경(IP)이 한국이면 브라우저가 별다른 설정 없이는 한국어/원화(KRW)로 페이지를 보여주는
+게 실측으로 확인됐다(Amazon - WebVoyager 평가 결과에서 달러 가격 조건 태스크의 답이 원화로
+나와서 judge가 조건 대조를 못 하고 오탐한 사례). _make_driver()가 Accept-Language 헤더/
+navigator.language/타임존/위치를 en-US·뉴욕 기준으로 CDP로 고정하고(_apply_locale_overrides()),
+그걸로도 못 이기는 사이트(쿠키로 언어/통화를 우선 판단하는 Amazon 등)는 reset()이
+WebVoyagerEnv._force_site_locale()로 사이트별 쿠키를 한 번 더 심는다(_SITE_LOCALE_COOKIES).
+단, 이건 전부 브라우저/쿠키 시그널이고 실제 접속 IP 자체를 바꾸는 게 아니라서, 서버가 쿠키도
+없이 순수 IP 지리위치만으로 지역을 판단하는 사이트까지는 완전히 못 이길 수 있음 - 그런 경우
+확인되면 실제 미국 리전 프록시가 필요하고 이건 이 파일의 책임 범위 밖이다.
+
 필요 패키지: pip install selenium pillow (miniwob 설치 때 selenium은 이미 같이 깔렸을 것)
 """
 
@@ -50,6 +61,27 @@ DEFAULT_USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) "
     "Chrome/124.0.0.0 Safari/537.36"
 )
+
+# (2026-08-11 추가 - 위치/통화 강제 영미권 고정) 실측: 이 프로젝트를 돌리는 환경(한국 IP)에서
+# Amazon 같은 사이트에 접속하면 브라우저가 별다른 설정 없이는 한국어/원화(KRW)로 페이지를
+# 보여준다 - WebVoyager 평가 결과 jsonl에서 "50~75달러 사이" 같은 가격 조건 태스크의
+# final_answer가 "KRW 28,343"처럼 원화로 나와서 judge가 달러 조건과 대조를 못 하고 오탐(success)
+# 처리한 게 확인됨. _make_driver()가 이 상수들로 Accept-Language/navigator.language/타임존/
+# 위치를 en-US·뉴욕 기준으로 강제 고정한다(_apply_locale_overrides() 참고).
+DEFAULT_ACCEPT_LANGUAGE = "en-US,en;q=0.9"
+DEFAULT_TIMEZONE_ID = "America/New_York"
+DEFAULT_GEOLOCATION = {"latitude": 40.7128, "longitude": -74.0060, "accuracy": 100}  # New York, US
+
+# (2026-08-11 추가) 사이트별로 언어/통화 쿠키를 우선적으로 신뢰하는 경우가 있어서(Amazon이 그런
+# 케이스로 확인됨 - _force_site_locale() 참고), 브라우저 시그널만으로 안 잡히면 사이트별로
+# 쿠키를 직접 심어서 한 번 더 보정한다. 키는 URL에 부분 매칭시킬 문자열(소문자), 값은
+# (쿠키 dict, ...) 튜플. 다른 WebVoyager 사이트에서 같은 증상이 확인되면 여기 추가하면 됨.
+_SITE_LOCALE_COOKIES = {
+    "amazon": (
+        {"name": "i18n-prefs", "value": "USD"},
+        {"name": "lc-main", "value": "en_US"},
+    ),
+}
 
 # (2026-08-11 추가) detect_bot_check()가 title/URL에서 찾는 흔한 CAPTCHA/bot-check 신호들.
 # 완벽한 목록이 아니라 보수적인 휴리스틱 - 여기 없는 문구를 쓰는 차단 페이지는 못 잡지만,
@@ -93,6 +125,12 @@ def _make_driver(window_size, headless=True, user_agent=None):
     options.add_experimental_option("excludeSwitches", ["enable-automation"])
     options.add_experimental_option("useAutomationExtension", False)
     options.add_argument(f"--user-agent={user_agent or DEFAULT_USER_AGENT}")
+    # (2026-08-11 추가 - 위치/통화 강제 영미권 고정) Chrome이 기본적으로 시스템 로케일을
+    # 그대로 따라가는 게 한국어/원화로 보이는 원인 중 하나라, 브라우저 UI 언어 자체를
+    # en-US로 고정한다. 나머지(Accept-Language 헤더, navigator.language, 타임존/위치)는
+    # 드라이버 생성 후 _apply_locale_overrides()에서 CDP로 마저 고정한다.
+    options.add_argument("--lang=en-US")
+    options.add_experimental_option("prefs", {"intl.accept_languages": "en-US,en"})
     driver = webdriver.Chrome(options=options)
     driver.set_window_size(w, h)
     # (2026-08-10 추가) navigator.webdriver 프로퍼티를 자바스크립트 레벨에서 지운다 -
@@ -106,7 +144,67 @@ def _make_driver(window_size, headless=True, user_agent=None):
         )
     except Exception as e:  # noqa: BLE001 - 이 우회가 실패해도 브라우저 자체는 계속 쓸 수 있어야 함
         print(f"[env_webvoyager.py] navigator.webdriver 우회 스크립트 등록 실패(무시하고 진행): {e}")
+    _apply_locale_overrides(driver)
     return driver
+
+
+def _apply_locale_overrides(driver, accept_language=DEFAULT_ACCEPT_LANGUAGE,
+                             timezone_id=DEFAULT_TIMEZONE_ID, geolocation=DEFAULT_GEOLOCATION):
+    """
+    (2026-08-11 추가 - 위치/통화 강제 영미권 고정) --lang=en-US 옵션만으로는 안 잡히는
+    시그널들을 CDP로 추가 고정한다. navigator.webdriver 우회와 같은 패턴으로 각 CDP 명령을
+    개별 try/except로 감싼다 - Chrome/chromedriver 버전에 따라 일부 명령(특히
+    Emulation.setLocaleOverride는 비교적 최근에 추가된 CDP 메서드라 구버전엔 없을 수 있음)이
+    실패해도 나머지는 계속 적용되고 브라우저 자체는 계속 쓸 수 있어야 한다.
+
+    - Network.setExtraHTTPHeaders: 모든 요청에 Accept-Language: en-US를 강제(서버가 언어를
+      판단하는 가장 흔한 경로).
+    - Page.addScriptToEvaluateOnNewDocument: navigator.language/navigator.languages를
+      JS 레벨에서 en-US로 고정(헤더 대신 이 값을 읽는 사이트 대비).
+    - Emulation.setLocaleOverride: 있으면 Intl API 등 브라우저 엔진 로케일까지 통째로
+      en-US로 고정(가장 강력하지만 CDP 버전 의존적).
+    - Emulation.setTimezoneOverride / setGeolocationOverride: 타임존/위경도로 지역을
+      판단하는 사이트에 대한 추가 방어선(뉴욕 기준 좌표).
+
+    [한계] 전부 브라우저 쪽 시그널이라, 접속 IP 자체로 지역/통화를 판단하는 서버까지는 못
+    이긴다(실측: Amazon이 이 케이스로 보임 - 이 헤더/스크립트 오버라이드만으론 여전히 원화가
+    나올 수 있음) - IP 지리위치 자체를 바꾸려면 실제 미국 리전 프록시가 필요하고 이건 이
+    함수의 책임 범위 밖이다. 쿠키로 언어/통화를 우선 판단하는 사이트(Amazon 확인됨)는
+    WebVoyagerEnv._force_site_locale()에서 사이트별 쿠키로 한 번 더 보정한다.
+    """
+    try:
+        driver.execute_cdp_cmd("Network.enable", {})
+        driver.execute_cdp_cmd("Network.setExtraHTTPHeaders", {"headers": {"Accept-Language": accept_language}})
+    except Exception as e:  # noqa: BLE001
+        print(f"[env_webvoyager.py] Accept-Language 헤더 강제 실패(무시하고 진행): {e}")
+
+    try:
+        driver.execute_cdp_cmd(
+            "Page.addScriptToEvaluateOnNewDocument",
+            {
+                "source": (
+                    "Object.defineProperty(navigator, 'language', {get: () => 'en-US'});"
+                    "Object.defineProperty(navigator, 'languages', {get: () => ['en-US', 'en']});"
+                )
+            },
+        )
+    except Exception as e:  # noqa: BLE001
+        print(f"[env_webvoyager.py] navigator.language 오버라이드 등록 실패(무시하고 진행): {e}")
+
+    try:
+        driver.execute_cdp_cmd("Emulation.setLocaleOverride", {"locale": "en-US"})
+    except Exception as e:  # noqa: BLE001
+        print(f"[env_webvoyager.py] Emulation.setLocaleOverride 실패(CDP 버전 이슈일 수 있음, 무시): {e}")
+
+    try:
+        driver.execute_cdp_cmd("Emulation.setTimezoneOverride", {"timezoneId": timezone_id})
+    except Exception as e:  # noqa: BLE001
+        print(f"[env_webvoyager.py] Emulation.setTimezoneOverride 실패(무시하고 진행): {e}")
+
+    try:
+        driver.execute_cdp_cmd("Emulation.setGeolocationOverride", dict(geolocation))
+    except Exception as e:  # noqa: BLE001
+        print(f"[env_webvoyager.py] Emulation.setGeolocationOverride 실패(무시하고 진행): {e}")
 
 
 class WebVoyagerEnv:
@@ -163,6 +261,11 @@ class WebVoyagerEnv:
             print(f"[env_webvoyager.py] driver.get({url!r}) 중 예외(무시하고 진행): {e}")
         time.sleep(1.0)  # 초기 렌더/스크립트 실행 여유
 
+        # (2026-08-11 추가 - 위치/통화 강제 영미권 고정) _apply_locale_overrides()의 브라우저
+        # 시그널(Accept-Language 등)만으론 IP 기반 지역판단을 못 이기는 사이트(Amazon 확인됨)에
+        # 대한 2차 방어선 - 사이트가 우선적으로 신뢰하는 쿠키를 직접 심고 한 번 더 로드한다.
+        self._force_site_locale(url)
+
         self.task_info = {"instruction": instruction, "url": url, **extra}
 
         # (2026-08-11 추가) reset 직후 bot-check 감지되면 captcha_reset_retries만큼 재로드
@@ -214,6 +317,43 @@ class WebVoyagerEnv:
             if kw in url:
                 return {"reason": f"url contains {kw!r}"}
         return None
+
+    # ------------------------------------------------------------------
+    def _force_site_locale(self, url):
+        """
+        (2026-08-11 추가 - 위치/통화 강제 영미권 고정) _apply_locale_overrides()가 건 Accept-
+        Language/navigator.language/타임존/위치 오버라이드는 전부 브라우저 쪽 시그널이라,
+        서버가 접속 IP로 지역/통화를 판단하면 못 이긴다 - 실측으로 Amazon이 이 케이스임을
+        확인했다(한국 IP에서 접속하면 저 오버라이드를 다 걸어도 여전히 원화(KRW)로 가격이
+        표시됨. WebVoyager 결과 jsonl에서 "50~75달러 사이" 태스크의 final_answer가 "KRW
+        28,343"으로 나와서 judge가 달러 조건과 대조를 못 하고 오탐한 사례로 발견).
+
+        Amazon은 i18n-prefs(통화)/lc-main(언어) 쿠키를 IP 기반 추정보다 우선적으로 읽는
+        것으로 확인되어, 해당 쿠키를 직접 심고 페이지를 한 번 더 로드해서 반영시킨다(쿠키는
+        새로고침 전까지는 적용 안 됨). _SITE_LOCALE_COOKIES에 등록된 사이트만 대상 - 지금은
+        Amazon만 확인된 문제라 그것만 있고, 다른 WebVoyager 사이트에서 같은 증상이 확인되면
+        거기 추가하면 이 함수는 그대로 재사용된다.
+
+        driver.add_cookie()는 Selenium 특성상 "현재 그 도메인의 페이지에 있어야" 동작해서,
+        reset()이 최초 driver.get(url) + sleep을 마친 직후(= 이미 해당 도메인 페이지에 있는
+        상태)에만 호출해야 한다 - 호출 순서를 reset()이 보장한다.
+        """
+        try:
+            current = (self.driver.current_url or url or "").lower()
+        except Exception:
+            current = (url or "").lower()
+
+        for site_kw, cookies in _SITE_LOCALE_COOKIES.items():
+            if site_kw not in current:
+                continue
+            try:
+                for cookie in cookies:
+                    self.driver.add_cookie(dict(cookie))
+                self.driver.get(url)
+                time.sleep(1.0)
+            except Exception as e:  # noqa: BLE001 - 쿠키 보정 실패해도 나머지 흐름은 계속되어야 함
+                print(f"[env_webvoyager.py] {site_kw!r} locale 쿠키 강제 실패(무시하고 진행): {e}")
+            break
 
     def _parse_task(self, task):
         if isinstance(task, dict):
@@ -515,6 +655,92 @@ def _run_mock_selftest():
     check("task dict 파싱", url == "http://x.com" and instr == "do X" and extra == {"web_name": "X", "id": "X--0"})
     url2, instr2, extra2 = dummy._parse_task(("http://y.com", "do Y"))
     check("task tuple 파싱", url2 == "http://y.com" and instr2 == "do Y" and extra2 == {})
+
+    # --- (2026-08-11 추가) _apply_locale_overrides(): CDP 호출 배선 + 개별 실패 시 예외 안 남 ---
+    locale_driver = MagicMock()
+    _apply_locale_overrides(locale_driver)
+    cdp_calls = {c.args[0]: c.args[1] for c in locale_driver.execute_cdp_cmd.call_args_list}
+    check(
+        "_apply_locale_overrides -> Accept-Language 헤더 강제",
+        cdp_calls.get("Network.setExtraHTTPHeaders", {}).get("headers", {}).get("Accept-Language")
+        == DEFAULT_ACCEPT_LANGUAGE,
+    )
+    check(
+        "_apply_locale_overrides -> navigator.language/languages 오버라이드 스크립트 등록",
+        any(
+            c.args[0] == "Page.addScriptToEvaluateOnNewDocument"
+            and "navigator, 'language'" in c.args[1]["source"]
+            and "navigator, 'languages'" in c.args[1]["source"]
+            for c in locale_driver.execute_cdp_cmd.call_args_list
+        ),
+    )
+    check(
+        "_apply_locale_overrides -> Emulation.setLocaleOverride(en-US)",
+        cdp_calls.get("Emulation.setLocaleOverride", {}).get("locale") == "en-US",
+    )
+    check(
+        "_apply_locale_overrides -> Emulation.setTimezoneOverride",
+        cdp_calls.get("Emulation.setTimezoneOverride", {}).get("timezoneId") == DEFAULT_TIMEZONE_ID,
+    )
+    check(
+        "_apply_locale_overrides -> Emulation.setGeolocationOverride(뉴욕 좌표)",
+        cdp_calls.get("Emulation.setGeolocationOverride") == DEFAULT_GEOLOCATION,
+    )
+
+    # 일부 CDP 명령이 구버전이라 실패해도(예: Emulation.setLocaleOverride 미지원) 나머지는
+    # 계속 적용되고 예외가 밖으로 안 새야 함(navigator.webdriver 우회와 같은 원칙).
+    flaky_driver = MagicMock()
+    def _flaky_execute_cdp_cmd(cmd, params):
+        if cmd == "Emulation.setLocaleOverride":
+            raise Exception("이 Chrome 버전엔 없는 CDP 메서드")
+        return MagicMock()
+    flaky_driver.execute_cdp_cmd.side_effect = _flaky_execute_cdp_cmd
+    try:
+        _apply_locale_overrides(flaky_driver)
+        check("_apply_locale_overrides -> 일부 CDP 명령 실패해도 예외 안 남", True)
+    except Exception:
+        check("_apply_locale_overrides -> 일부 CDP 명령 실패해도 예외 안 남", False)
+    check(
+        "_apply_locale_overrides -> 실패한 명령 이후({}) 명령도 계속 시도됨".format("Emulation.setLocaleOverride"),
+        any(c.args[0] == "Emulation.setTimezoneOverride" for c in flaky_driver.execute_cdp_cmd.call_args_list),
+    )
+
+    # --- (2026-08-11 추가) _force_site_locale(): Amazon 쿠키 강제 + 비-Amazon 사이트는 no-op ---
+    amazon_env = WebVoyagerEnv.__new__(WebVoyagerEnv)
+    amazon_env.driver = MagicMock()
+    amazon_env.driver.current_url = "https://www.amazon.com/s?k=xbox+controller"
+    amazon_env._force_site_locale("https://www.amazon.com/s?k=xbox+controller")
+    cookie_calls = [c.args[0] for c in amazon_env.driver.add_cookie.call_args_list]
+    check(
+        "_force_site_locale -> amazon.com에서 i18n-prefs/lc-main 쿠키 심음",
+        {"name": "i18n-prefs", "value": "USD"} in cookie_calls
+        and {"name": "lc-main", "value": "en_US"} in cookie_calls,
+    )
+    check(
+        "_force_site_locale -> 쿠키 반영 위해 같은 url로 재로드",
+        amazon_env.driver.get.call_args_list[-1].args == ("https://www.amazon.com/s?k=xbox+controller",),
+    )
+
+    non_amazon_env = WebVoyagerEnv.__new__(WebVoyagerEnv)
+    non_amazon_env.driver = MagicMock()
+    non_amazon_env.driver.current_url = "https://en.wikipedia.org/wiki/Python"
+    non_amazon_env._force_site_locale("https://en.wikipedia.org/wiki/Python")
+    check(
+        "_force_site_locale -> 등록 안 된 사이트는 쿠키/재로드 둘 다 안 함(no-op)",
+        not non_amazon_env.driver.add_cookie.called and not non_amazon_env.driver.get.called,
+    )
+
+    # 쿠키 심기 자체가 실패해도(예: 도메인 불일치로 InvalidCookieDomainException) 예외가 밖으로
+    # 새면 안 됨 - reset() 흐름 전체를 죽이면 안 되는 부수적인 보정 로직이라서.
+    failing_cookie_env = WebVoyagerEnv.__new__(WebVoyagerEnv)
+    failing_cookie_env.driver = MagicMock()
+    failing_cookie_env.driver.current_url = "https://www.amazon.com/"
+    failing_cookie_env.driver.add_cookie.side_effect = Exception("InvalidCookieDomainException")
+    try:
+        failing_cookie_env._force_site_locale("https://www.amazon.com/")
+        check("_force_site_locale -> 쿠키 심기 실패해도 예외 안 남", True)
+    except Exception:
+        check("_force_site_locale -> 쿠키 심기 실패해도 예외 안 남", False)
 
     n_fail = sum(1 for _, ok in checks if not ok)
     for name, ok in checks:
