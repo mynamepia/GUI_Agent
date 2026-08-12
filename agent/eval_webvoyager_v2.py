@@ -38,9 +38,13 @@ dummy_agent_step()(항상 즉시 terminate)만 있고, planner/agent_loop.py가 
   다수결로 정하고, judge별 개별 응답도 다 로그에 남겨서 나중에 judge 자체의 변동성을 따로
   볼 수 있게 함).
 
-[아직 없는 것 - 다음 단계]
---resume 지원(eval_regionfocus.py에는 있음)은 아직 없음. 태스크 수가 많아지고 오래
-걸리기 시작하면 그때 같은 방식으로 추가할 것.
+[--resume - 2026-08-11 추가]
+API 비용(GPT-4o planner/judge) 때문에 중간에 죽으면(개인 PC 장시간 무중단 실행 리스크 -
+드라이버 행/절전/네트워크 끊김 등) 이미 끝낸 태스크까지 다시 도는 걸 막아야 해서 추가.
+--out 파일에 매 태스크 결과가 즉시 flush되므로(run_batch 참고) 죽어도 그때까지 결과는
+안 날아간다 - --resume은 그 파일을 읽어서 이미 있는 task_id는 건너뛰고 이어서 append하는
+것만 담당. 태스크 식별은 WebVoyager jsonl의 "id" 필드(예: "Amazon--16") 기준(_task_key()
+참고) - 없으면 url+instruction 조합으로 폴백.
 """
 
 import argparse
@@ -231,6 +235,11 @@ def _convert_planner_action_to_env(
 
     if act == "wait":
         return {"action": "wait", "time": 1.0}
+
+    if act == "back":
+        # (2026-08-11 추가) 브라우저 히스토리 뒤로가기 - grounding이 필요 없는 액션이라
+        # 그대로 통과. env_webvoyager.WebVoyagerEnv._back()이 실제 driver.back()을 호출.
+        return {"action": "back"}
 
     # 알 수 없는 action(이론상 _parse_planner_action이 이미 걸러서 여기 안 와야 하지만,
     # 방어적으로) -> 안전하게 종료
@@ -779,10 +788,23 @@ def run_episode(
             detect_fn = getattr(env, "detect_bot_check", None)
             bot_check = detect_fn() if callable(detect_fn) else None
             if bot_check:
-                blocked = True
-                blocked_reason = f"스텝 진행 중 bot-check 감지: {bot_check.get('reason')}"
-                hit_max_steps = False
-                break
+                # (2026-08-11 추가 - 수동 CAPTCHA 통과) env가 wait_for_manual_captcha()를
+                # 제공하면(env_webvoyager.WebVoyagerEnv, manual_captcha_wait=True일 때만
+                # 실제로 멈춤) 사람이 직접 풀 기회를 준다 - duck-typing이라 이 메서드가 없는
+                # 구버전 env/mock은 그냥 기존처럼 즉시 blocked 처리된다. "is True"로 엄격하게
+                # 비교하는 이유: 테스트에서 env를 MagicMock()으로만 만들면 존재하지 않는
+                # 속성 접근도 전부 자동으로 또 다른 MagicMock을 만들어내서(auto-speccing),
+                # wait_for_manual_captcha()도 "그냥 호출 가능하고 뭔가를 반환하는" 것처럼
+                # 보여 truthy 체크로는 실수로 "풀렸다"고 오판할 수 있다 - 실제 True를
+                # 명시적으로 반환하는 경우(env_webvoyager.WebVoyagerEnv.wait_for_manual_captcha()
+                # 또는 그렇게 설계된 테스트용 mock)만 인정한다.
+                manual_wait_fn = getattr(env, "wait_for_manual_captcha", None)
+                resolved_manually = callable(manual_wait_fn) and manual_wait_fn() is True
+                if not resolved_manually:
+                    blocked = True
+                    blocked_reason = f"스텝 진행 중 bot-check 감지: {bot_check.get('reason')}"
+                    hit_max_steps = False
+                    break
 
             fp = _action_fingerprint(action)
             fingerprint_history.append(fp)
@@ -869,17 +891,24 @@ def make_qwen_judge(qwen_model, max_new_tokens=256):
     return judge_fn
 
 
-def make_openai_judge(model="gpt-4o", api_key=None, max_tokens=300):
+def make_openai_judge(model="gpt-4o", api_key=None, max_tokens=300, max_retries=5, retry_base_delay=1.0):
     """
     OpenAI vision API(GPT-4V/GPT-4o 등)를 judge로 쓰는 judge_fn을 만들어 반환.
     WebVoyager/RegionFocus 논문과 동일한 방식. api_key=None이면 환경변수 OPENAI_API_KEY를
     사용(openai 클라이언트 기본 동작). openai 패키지는 반환된 judge_fn을 실제로 호출하는
     시점에만 필요 - make_openai_judge() 자체나 이 파일 import는 openai 미설치 환경에서도
     문제없다.
+
+    (2026-08-11 추가 - 실측 크래시 대응) 실제 실행에서 TPM(분당 토큰) rate limit(HTTP 429)에
+    걸려서 배치 전체가 죽는 걸 확인했다(judge는 이미지를 최대 MAX_JUDGE_SCREENSHOTS장씩
+    보내서 planner보다도 토큰을 더 많이 씀 - rate limit에 걸리기 더 쉽다). api_planner.py의
+    _call_with_retry/_is_rate_limit_error를 그대로 재사용해서, 429만 지수 백오프로 자동
+    재시도하고 다른 에러/재시도 소진시엔 그대로 예외를 올린다.
     """
 
     def judge_fn(instruction, screenshots, final_answer):
         from openai import OpenAI  # 실제 호출 시점에만 필요 (lazy import)
+        from api_planner import _call_with_retry
 
         client = OpenAI(api_key=api_key) if api_key else OpenAI()
         imgs = screenshots[-MAX_JUDGE_SCREENSHOTS:]
@@ -892,10 +921,16 @@ def make_openai_judge(model="gpt-4o", api_key=None, max_tokens=300):
             b64 = base64.b64encode(buf.getvalue()).decode("utf-8")
             content.append({"type": "image_url", "image_url": {"url": f"data:image/png;base64,{b64}"}})
 
-        resp = client.chat.completions.create(
-            model=model,
-            messages=[{"role": "user", "content": content}],
-            max_tokens=max_tokens,
+        def _on_retry(attempt, delay, exc):
+            print(f"[eval_webvoyager_v2.py] judge rate limit(429) 감지 - {delay:.1f}초 대기 후 재시도 ({attempt}/{max_retries}): {exc}")
+
+        resp = _call_with_retry(
+            lambda: client.chat.completions.create(
+                model=model,
+                messages=[{"role": "user", "content": content}],
+                max_tokens=max_tokens,
+            ),
+            max_retries=max_retries, base_delay=retry_base_delay, on_retry=_on_retry,
         )
         response_text = resp.choices[0].message.content
         success, reason = _parse_success_verdict(response_text)
@@ -904,15 +939,37 @@ def make_openai_judge(model="gpt-4o", api_key=None, max_tokens=300):
     return judge_fn
 
 
-def run_judge_with_repeats(judge_fn, instruction, screenshots, final_answer, n_repeats=DEFAULT_JUDGE_REPEATS):
+def run_judge_with_repeats(
+    judge_fn, instruction, screenshots, final_answer, n_repeats=DEFAULT_JUDGE_REPEATS, max_workers=1,
+):
     """
     judge_fn을 n_repeats번 호출해서 다수결로 최종 success를 정한다(RegionFocus 논문이
     "GPT judge를 3회 돌려 평균/표준편차 보고"한 것의 실용적 버전). 개별 판정도 다 보존해서
     나중에 judge 자체의 변동성(분산)을 따로 분석할 수 있게 한다.
 
+    (2026-08-11 추가 - 태스크 간 지연 단축) 실측 지적: 태스크가 끝나고 다음 태스크로
+    넘어가기까지 텀이 길다. 원인은 run_episode() 자체가 아니라(그건 이미 driver 재사용으로
+    줄임), 에피소드가 끝난 "직후" run_batch()가 이 함수를 부르는 시점 - n_repeats(기본 3)
+    번의 judge_fn 호출이 완전히 순차(파이썬 리스트 컴프리헨션)로 돌아서, OpenAI API judge처럼
+    호출 하나가 몇 초씩 걸리는 경우 태스크당 3배로 그 시간이 그대로 늘어난다.
+    max_workers>1이면 ThreadPoolExecutor로 n_repeats번 호출을 동시에 쏴서 벽시계 시간을
+    거의 1회분으로 줄인다 - OpenAI 호출은 서로 완전히 독립된 새 HTTP 요청이라 병렬화해도
+    안전하다. 기본값은 max_workers=1(순차, 기존과 100% 동일 동작)로 둔 이유: 로컬 Qwen
+    judge(같은 모델 인스턴스를 재사용)는 GPU 모델 하나를 여러 스레드에서 동시에 generate()
+    호출하는 게 안전하다는 보장이 없어서(경쟁 상태/VRAM 문제 위험) - "이 judge_fn이 병렬
+    호출을 견딜 수 있는가"는 호출부가 알고 명시적으로 올려야 한다(__main__에서
+    --judge_backend openai일 때만 자동으로 올림).
+
     Returns: {"success": bool, "votes": [bool, ...], "agreement": float, "runs": [judge_fn 결과, ...]}
     """
-    runs = [judge_fn(instruction, screenshots, final_answer) for _ in range(n_repeats)]
+    if max_workers <= 1:
+        runs = [judge_fn(instruction, screenshots, final_answer) for _ in range(n_repeats)]
+    else:
+        from concurrent.futures import ThreadPoolExecutor
+
+        with ThreadPoolExecutor(max_workers=max_workers) as ex:
+            futures = [ex.submit(judge_fn, instruction, screenshots, final_answer) for _ in range(n_repeats)]
+            runs = [f.result() for f in futures]
     votes = [r["success"] for r in runs]
     success = Counter(votes).most_common(1)[0][0]
     agreement = sum(1 for v in votes if v == success) / len(votes)
@@ -920,16 +977,73 @@ def run_judge_with_repeats(judge_fn, instruction, screenshots, final_answer, n_r
 
 
 # ---------------------------------------------------------------------------
-# 배치 실행 (eval_regionfocus.py와 유사한 구조 - --resume은 아직 미구현)
+# 배치 실행 (eval_regionfocus.py와 유사한 구조 - --resume 지원, 2026-08-11 추가)
 # ---------------------------------------------------------------------------
+def _task_key(task) -> str:
+    """
+    (2026-08-11 추가 - --resume) 태스크를 고유하게 식별하는 키. WebVoyager jsonl 레코드는
+    보통 "id"(예: "Amazon--16")를 갖고 있어서 있으면 그걸 그대로 쓴다 - 이미 끝난 태스크인지
+    판단하는 기준이라, 실행할 때마다 안정적으로 같은 값이 나와야 한다(instruction 텍스트만
+    쓰면 같은 문구의 태스크가 우연히 여러 개일 때 잘못 스킵될 수 있어서 id를 우선함). "id"가
+    없는 구버전 jsonl이나 (url, instruction) 튜플 태스크는 url+instruction 조합으로 폴백.
+    """
+    if isinstance(task, dict):
+        tid = task.get("id")
+        if tid:
+            return str(tid)
+        url = task.get("web") or task.get("url") or ""
+        instruction = task.get("ques") or task.get("instruction") or ""
+        return f"{url}|{instruction}"
+    if isinstance(task, (list, tuple)) and len(task) == 2:
+        return f"{task[0]}|{task[1]}"
+    return str(task)
+
+
 def run_batch(tasks, env, agent_step_fn, judge_fn, max_steps=DEFAULT_MAX_STEPS,
               judge_repeats=DEFAULT_JUDGE_REPEATS, out_path=None,
               stuck_repeat_threshold=DEFAULT_STUCK_REPEAT_THRESHOLD,
-              stuck_repeat_window=None):
+              stuck_repeat_window=None, resume=False, judge_max_workers=1):
+    """
+    (2026-08-11 추가 - resume 파라미터) resume=True면 out_path에 이미 있는 결과(이전
+    실행이 중간에 죽었거나 사용자가 일부러 끊은 경우)를 읽어서, task_id가 이미 있는 태스크는
+    건너뛰고 파일에 이어서(append) 쓴다. rows(최종 요약에 쓰이는 리스트)에는 이전 실행
+    결과도 합쳐 넣어서, 성공률 등 요약이 "이번 실행분만"이 아니라 "전체 누적"을 반영하게
+    한다. resume=False(기본)면 예전과 동일하게 매번 out_path를 덮어쓰고 처음부터 전부
+    돈다 - 하위 호환.
+    """
     rows = []
-    out_f = open(out_path, "w", encoding="utf-8") if out_path else None
+    done_keys = set()
+    file_exists = bool(out_path and os.path.exists(out_path))
+    if resume and file_exists:
+        with open(out_path, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    prev_row = json.loads(line)
+                except json.JSONDecodeError:
+                    # (2026-08-11) 직전 실행이 write 도중(예: flush 전 프로세스 강제 종료)
+                    # 죽었으면 마지막 줄이 반쯤 쓰였을 수 있다 - 그런 손상된 줄은 무시하고
+                    # 계속 진행(그 태스크는 done_keys에 안 들어가므로 이번 실행에서 다시 돈다 -
+                    # 데이터 손실보다 중복 재실행 쪽이 안전한 폴백).
+                    continue
+                rows.append(prev_row)
+                key = prev_row.get("task_id")
+                if key:
+                    done_keys.add(key)
+        print(
+            f"[run_batch] --resume: {out_path}에서 기존 결과 {len(rows)}개 발견 "
+            f"(이미 끝난 태스크 {len(done_keys)}개는 건너뜀)"
+        )
+
+    out_mode = "a" if (resume and file_exists) else "w"
+    out_f = open(out_path, out_mode, encoding="utf-8") if out_path else None
     try:
         for i, task in enumerate(tasks):
+            task_id = _task_key(task)
+            if resume and task_id in done_keys:
+                continue
             t0 = time.time()
             traj = run_episode(
                 env, task, agent_step_fn, max_steps=max_steps, stuck_repeat_threshold=stuck_repeat_threshold,
@@ -947,10 +1061,11 @@ def run_batch(tasks, env, agent_step_fn, judge_fn, max_steps=DEFAULT_MAX_STEPS,
             else:
                 judge_result = run_judge_with_repeats(
                     judge_fn, traj["instruction"], traj["screenshots"], traj["final_answer"],
-                    n_repeats=judge_repeats,
+                    n_repeats=judge_repeats, max_workers=judge_max_workers,
                 )
             row = {
                 "idx": i,
+                "task_id": task_id,
                 "instruction": traj["instruction"],
                 "url": traj["url"],
                 "n_steps": traj["n_steps"],
@@ -1095,6 +1210,28 @@ def _run_mock_selftest():
     check("스텝 중 bot-check -> reason에 근거가 담김", "recaptcha" in traj_blocked_mid["blocked_reason"])
     check("스텝 중 bot-check -> 2스텝만에 조기 종료(더 안 돎)", traj_blocked_mid["n_steps"] == 2)
 
+    # --- (2026-08-11 추가 - 수동 CAPTCHA 통과) run_episode: wait_for_manual_captcha()가
+    # True를 반환하면(사람이 직접 풀었다는 뜻) blocked 처리 없이 계속 진행돼야 함 ---
+    fake_env_manual_resolved = MagicMock()
+    fake_env_manual_resolved.reset.return_value = (fake_img, {"instruction": "do W", "url": "http://w"})
+    fake_env_manual_resolved.execute_action.return_value = (fake_img, None, False, False, {"instruction": "do W", "url": "http://w"})
+    # 1번째 스텝에서 bot-check 뜨지만 wait_for_manual_captcha()가 True -> 안 막히고 계속 진행.
+    # detect_bot_check는 그 뒤로도 계속 뭔가 감지된 것처럼 두되(True 처리 자체는
+    # wait_for_manual_captcha 쪽 책임이라 run_episode는 그 반환값만 믿음), stuck 임계값에
+    # 걸리지 않도록 매 스텝 다른 액션을 내는 alternating_agent를 재사용.
+    fake_env_manual_resolved.detect_bot_check.return_value = {"reason": "title contains 'captcha'"}
+    fake_env_manual_resolved.wait_for_manual_captcha.return_value = True
+
+    traj_manual_resolved = run_episode(
+        fake_env_manual_resolved, {"web": "http://w", "ques": "do W"}, alternating_agent, max_steps=3,
+    )
+    check("wait_for_manual_captcha=True -> blocked 안 됨(사람이 풀었으므로 계속 진행)", traj_manual_resolved["blocked"] is False)
+    check("wait_for_manual_captcha=True -> max_steps까지 정상 진행", traj_manual_resolved["n_steps"] == 3)
+    check(
+        "wait_for_manual_captcha -> bot-check 감지될 때마다 호출됨",
+        fake_env_manual_resolved.wait_for_manual_captcha.call_count == 3,
+    )
+
     # --- (2026-08-11 추가) run_episode: 같은 액션이 연속 반복되면(bot-check 신호 없이도) stuck으로 조기 종료 ---
     fake_env_stuck = MagicMock()
     fake_env_stuck.reset.return_value = (fake_img, {"instruction": "do U", "url": "http://u"})
@@ -1189,6 +1326,71 @@ def _run_mock_selftest():
     check("agreement = 2/3", abs(result["agreement"] - 2 / 3) < 1e-6)
     check("votes 개수=3", len(result["votes"]) == 3)
 
+    # --- (2026-08-11 추가 - 태스크 간 지연 단축) run_judge_with_repeats: max_workers 병렬 실행 ---
+    import threading
+
+    concurrent_calls = {"active": 0, "max_seen": 0, "total": 0}
+    lock = threading.Lock()
+
+    def _slow_judge(instruction, screenshots, final_answer):
+        with lock:
+            concurrent_calls["active"] += 1
+            concurrent_calls["max_seen"] = max(concurrent_calls["max_seen"], concurrent_calls["active"])
+            concurrent_calls["total"] += 1
+        time.sleep(0.05)  # 실제 네트워크 호출을 흉내(짧게) - 이게 있어야 동시 실행이 겹치는 걸 관측 가능
+        with lock:
+            concurrent_calls["active"] -= 1
+        return {"success": True, "raw_response": "ok"}
+
+    result_parallel = run_judge_with_repeats(_slow_judge, "do X", [fake_img], None, n_repeats=3, max_workers=3)
+    check("max_workers=3 -> 호출은 여전히 3번", concurrent_calls["total"] == 3)
+    check("max_workers=3 -> 실제로 동시에 여러 개가 겹쳐서 실행됨(순차였다면 1)", concurrent_calls["max_seen"] > 1)
+    check("max_workers=3 -> 결과 개수/다수결도 정상", len(result_parallel["votes"]) == 3 and result_parallel["success"] is True)
+
+    # max_workers=1(기본)이면 예전처럼 완전히 순차 - 동시에 겹치는 일이 없어야 함
+    concurrent_calls2 = {"active": 0, "max_seen": 0, "total": 0}
+
+    def _slow_judge2(instruction, screenshots, final_answer):
+        concurrent_calls2["active"] += 1
+        concurrent_calls2["max_seen"] = max(concurrent_calls2["max_seen"], concurrent_calls2["active"])
+        concurrent_calls2["total"] += 1
+        concurrent_calls2["active"] -= 1
+        return {"success": True, "raw_response": "ok"}
+
+    run_judge_with_repeats(_slow_judge2, "do X", [fake_img], None, n_repeats=3, max_workers=1)
+    check("max_workers=1(기본) -> 순차 실행(하위 호환, 겹치는 호출 없음)", concurrent_calls2["max_seen"] == 1)
+
+    # --- (2026-08-11 추가) make_openai_judge -> 429 rate limit 자동 재시도(api_planner._call_with_retry 재사용) ---
+    import sys as _sys_for_judge_retry
+    import types as _types_for_judge_retry
+
+    fake_judge_response = MagicMock()
+    fake_judge_response.choices = [MagicMock(message=MagicMock(content='{"reason": "looks done", "success": true}'))]
+    fake_judge_client = MagicMock()
+    fake_judge_client.chat.completions.create.side_effect = [
+        Exception("Error code: 429 - rate_limit_exceeded"),
+        fake_judge_response,
+    ]
+    fake_openai_module_judge = _types_for_judge_retry.ModuleType("openai")
+    fake_openai_module_judge.OpenAI = MagicMock(return_value=fake_judge_client)
+    _sys_for_judge_retry.modules["openai"] = fake_openai_module_judge
+    orig_sleep_judge = time.sleep
+    time.sleep = lambda *a, **k: None
+    try:
+        judge_fn_retry = make_openai_judge(model="gpt-4o-test", retry_base_delay=0.01)
+        judge_result_retry = judge_fn_retry("do X", [fake_img], None)
+        check(
+            "make_openai_judge -> 429 한 번은 자동 재시도로 흡수하고 정상 판정 반환",
+            judge_result_retry["success"] is True,
+        )
+        check(
+            "make_openai_judge -> create()가 재시도 포함 2번 호출됨",
+            fake_judge_client.chat.completions.create.call_count == 2,
+        )
+    finally:
+        time.sleep = orig_sleep_judge
+        del _sys_for_judge_retry.modules["openai"]
+
     # --- _parse_success_verdict ---
     ok, reason = _parse_success_verdict('{"reason": "did it", "success": true}')
     check("JSON success=true 파싱", ok is True and reason == "did it")
@@ -1244,6 +1446,68 @@ def _run_mock_selftest():
         check("run_batch -> blocked 태스크의 blocked=True + blocked_reason 존재", all(r["blocked"] is True and r["blocked_reason"] for r in rows_blocked))
         check("run_batch -> blocked 태스크는 judge_votes가 빈 리스트(판단 자체를 안 했다는 표시)", all(r["judge_votes"] == [] for r in rows_blocked))
         check("run_batch -> 전체 success_rate=0.0", rate_blocked == 0.0)
+
+    # --- (2026-08-11 추가) _task_key ---
+    check("_task_key -> id 필드가 있으면 그걸 그대로 씀", _task_key({"id": "Amazon--16", "web": "http://a", "ques": "q"}) == "Amazon--16")
+    check(
+        "_task_key -> id 없으면 url+instruction 조합으로 폴백",
+        _task_key({"web": "http://a", "ques": "q"}) == "http://a|q",
+    )
+    check("_task_key -> 튜플 태스크도 지원", _task_key(("http://b", "do B")) == "http://b|do B")
+
+    # --- (2026-08-11 추가) run_batch: --resume - 이미 끝난 task_id는 건너뛰고 이어서 씀 ---
+    fake_env_resume = MagicMock()
+    fake_env_resume.reset.return_value = (fake_img, {"instruction": "resumed", "url": "http://r"})
+    fake_env_resume.detect_bot_check.return_value = None
+    resume_agent_calls = {"n": 0}
+
+    def _counting_agent(screenshot, task_info, history):
+        resume_agent_calls["n"] += 1
+        return {"action": "terminate", "status": "success"}
+
+    with tempfile.TemporaryDirectory() as d:
+        out_path3 = os.path.join(d, "out3.jsonl")
+        # 직전 실행이 T1/T2까지 끝내고 죽었다고 가정 - 결과 파일을 직접 만들어둠.
+        with open(out_path3, "w", encoding="utf-8") as f:
+            f.write(json.dumps({"task_id": "T1", "success": True, "blocked": False}) + "\n")
+            f.write(json.dumps({"task_id": "T2", "success": False, "blocked": False}) + "\n")
+
+        tasks_resume = [
+            {"id": "T1", "web": "http://r", "ques": "task 1"},
+            {"id": "T2", "web": "http://r", "ques": "task 2"},
+            {"id": "T3", "web": "http://r", "ques": "task 3"},
+        ]
+        rows_resume, rate_resume = run_batch(
+            tasks_resume, fake_env_resume, _counting_agent, always_success_judge,
+            judge_repeats=1, out_path=out_path3, resume=True,
+        )
+        check("--resume -> 이미 끝난 T1/T2는 다시 안 돎(agent_step_fn 1번만 호출)", resume_agent_calls["n"] == 1)
+        check("--resume -> rows에 이전 2개 + 새로 돈 1개 = 3개", len(rows_resume) == 3)
+        check(
+            "--resume -> 새로 돈 태스크는 T3(안 끝난 것만)",
+            any(r.get("task_id") == "T3" for r in rows_resume),
+        )
+        with open(out_path3, encoding="utf-8") as f:
+            saved_resume = [json.loads(line) for line in f]
+        check("--resume -> 파일에도 기존 2줄 + 새 1줄 = 3줄로 append됨(덮어쓰기 아님)", len(saved_resume) == 3)
+        check(
+            "--resume -> 전체 success_rate가 이전 결과까지 합쳐서 계산됨(1승1패 + 새로 1승 = 2/3)",
+            abs(rate_resume - 2 / 3) < 1e-6,
+        )
+
+    # resume=False(기본)면 기존 파일이 있어도 그냥 덮어쓰고 처음부터 다 돎 - 하위 호환 확인
+    resume_agent_calls["n"] = 0
+    with tempfile.TemporaryDirectory() as d:
+        out_path4 = os.path.join(d, "out4.jsonl")
+        with open(out_path4, "w", encoding="utf-8") as f:
+            f.write(json.dumps({"task_id": "T1", "success": True, "blocked": False}) + "\n")
+        rows_no_resume, _ = run_batch(
+            [{"id": "T1", "web": "http://r", "ques": "task 1"}],
+            fake_env_resume, _counting_agent, always_success_judge,
+            judge_repeats=1, out_path=out_path4, resume=False,
+        )
+        check("resume=False(기본) -> 이미 있던 결과 무시하고 다시 돎(하위 호환)", resume_agent_calls["n"] == 1)
+        check("resume=False -> rows도 이번에 새로 돈 1개뿐(파일 덮어씀)", len(rows_no_resume) == 1)
 
     # --- _convert_planner_action_to_env / build_planner_grounding_agent_step ---
     import sys
@@ -1309,6 +1573,10 @@ def _run_mock_selftest():
         check(
             "wait -> 기본 1.0초",
             _convert_planner_action_to_env({"action": "wait"}, None, wide_img, {}) == {"action": "wait", "time": 1.0},
+        )
+        check(
+            "back 패스스루(2026-08-11 추가 - 뒤로가기)",
+            _convert_planner_action_to_env({"action": "back"}, None, wide_img, {}) == {"action": "back"},
         )
 
         # 알 수 없는 action -> 안전하게 terminate/failure
@@ -1775,12 +2043,26 @@ if __name__ == "__main__":
     # 그대로("qwen"/"openai"), 이름만 바꿈.
     ap.add_argument("--judge_backend", choices=["qwen", "openai"], default="qwen")
     ap.add_argument("--judge_api_model", default="gpt-4o", help="--judge_backend openai일 때 쓸 모델 이름")
+    # (2026-08-11 추가 - 태스크 간 지연 단축) judge_repeats(기본 3)번의 judge 호출을 병렬로
+    # 쏠지. 기본(None)이면 --judge_backend openai일 때만 자동으로 judge_repeats만큼 병렬화
+    # 하고(서로 독립된 API 호출이라 안전), qwen judge는 자동으로 켜지 않는다(같은 로컬 모델
+    # 인스턴스를 여러 스레드에서 동시에 generate() 호출하는 게 안전하다는 보장이 없어서).
+    # 명시적으로 값을 주면 그 값을 그대로 씀(로컬 judge에서 강제로 켜고 싶은 경우 등).
+    ap.add_argument("--judge_max_workers", type=int, default=None,
+                     help="judge_repeats번 호출을 몇 개까지 동시에 실행할지. 미지정시 "
+                          "--judge_backend openai면 judge_repeats(완전 병렬), qwen이면 1(순차).")
     ap.add_argument("--adapter_dir", default=None,
                      help="Qwen judge용 LoRA 어댑터 (선택). --reuse_agent_model_for_judge를 켜면 무시됨.")
     ap.add_argument("--max_steps", type=int, default=DEFAULT_MAX_STEPS)
     ap.add_argument("--judge_repeats", type=int, default=DEFAULT_JUDGE_REPEATS)
     ap.add_argument("--limit", type=int, default=None)
     ap.add_argument("--out", default=None)
+    # (2026-08-11 추가 - API 비용 보호) --out 파일에 이미 있는 task_id는 건너뛰고 이어서
+    # 돌린다. 장시간 무중단 실행(개인 PC로 수백 개 태스크) 중 죽었을 때 이미 낸 GPT-4o
+    # planner/judge API 비용이 낭비되지 않도록 하는 게 목적 - run_batch()/_task_key() 참고.
+    ap.add_argument("--resume", action="store_true",
+                     help="--out에 이미 있는 결과(task_id 기준)는 건너뛰고 이어서 실행. "
+                          "--out 미지정이면 의미 없음(재개할 파일이 없으므로).")
     # (2026-08-11 추가) 태스크별 폴더에 스텝별 프롬프트/응답 원문을 txt로 저장. --log_file(콘솔
     # 전체 흐름)과는 별개로, "그 스텝에서 모델에 정확히 뭐가 들어갔는지"를 태스크/스텝 단위로
     # 찾아보기 쉽게 구조화한 것 - build_planner_grounding_agent_step()의 _PromptRecorder 참고.
@@ -1796,6 +2078,17 @@ if __name__ == "__main__":
     ap.add_argument("--captcha_reset_retries", type=int, default=1,
                      help="reset() 직후 bot-check가 감지되면 새 브라우저 세션으로 몇 번 더 재시도할지 "
                           "(기본 1회 = 최초 시도 포함 총 2회). env_webvoyager.WebVoyagerEnv 생성자로 전달됨.")
+    # (2026-08-11 추가 - 수동 CAPTCHA 통과) "직접 눌러주면 될 것 같다"는 요청 대응. 자동
+    # 재시도를 다 쓰고도 bot-check가 안 풀리면, 자동으로 포기하는 대신 잠깐 멈춰서 콘솔에서
+    # Enter를 누를 때까지 기다린다 - 그 사이에 headless=False로 띄운 실제 브라우저 창에서
+    # 직접 CAPTCHA를 풀면 된다. --headless(기본 켜짐)인 채로 이 옵션만 켜면 사람이 볼 화면
+    # 자체가 없어서 의미가 없다 - 반드시 --no_headless와 같이 쓸 것.
+    ap.add_argument("--manual_captcha", action="store_true",
+                     help="bot-check가 자동 재시도로도 안 풀리면 멈춰서 사람이 직접 풀 때까지 기다린다. "
+                          "--no_headless와 같이 써야 실제로 풀 수 있는 화면이 보인다.")
+    ap.add_argument("--no_headless", dest="headless", action="store_false", default=True,
+                     help="브라우저 창을 실제로 띄운다(headless 끔). --manual_captcha와 같이 쓰면 "
+                          "CAPTCHA를 직접 풀 수 있음. 기본은 headless(창 안 띄움).")
     # (2026-08-11 추가 - 태스크 간 지연 단축) 기본은 브라우저 재사용(빠름). 태스크 간 격리를
     # 더 강하게 보장하고 싶으면(드라이버가 불안정해지는 게 의심될 때 등) 끌 것 - 예전처럼
     # 매 태스크마다 Chrome을 통째로 재기동한다(느림).
@@ -1898,7 +2191,10 @@ if __name__ == "__main__":
         if not tasks:
             raise SystemExit(f"{args.tasks_jsonl}에서 태스크를 하나도 못 찾음 (파일이 비었거나 경로 확인 필요)")
 
-        env = WebVoyagerEnv(captcha_reset_retries=args.captcha_reset_retries, reuse_driver=args.reuse_driver)
+        env = WebVoyagerEnv(
+            captcha_reset_retries=args.captcha_reset_retries, reuse_driver=args.reuse_driver,
+            headless=args.headless, manual_captcha_wait=args.manual_captcha,
+        )
 
         if args.planner_backend == "openai" and args.agent_planner_adapter_dir:
             raise SystemExit(
@@ -2000,12 +2296,18 @@ if __name__ == "__main__":
         else:
             judge_fn = make_openai_judge(model=args.judge_api_model, api_key=args.api_key)
 
+        judge_max_workers = args.judge_max_workers
+        if judge_max_workers is None:
+            judge_max_workers = args.judge_repeats if args.judge_backend == "openai" else 1
+
         try:
             run_batch(
                 tasks, env, agent_step_fn, judge_fn,
                 max_steps=args.max_steps, judge_repeats=args.judge_repeats, out_path=args.out,
                 stuck_repeat_threshold=args.stuck_repeat_threshold,
                 stuck_repeat_window=args.stuck_repeat_window,
+                resume=args.resume,
+                judge_max_workers=judge_max_workers,
             )
         finally:
             env.close()

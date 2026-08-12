@@ -222,11 +222,12 @@ class WebVoyagerEnv:
         {"action": "key", "text": "Enter"}                     # Selenium Keys 이름 or 단일 문자
         {"action": "scroll", "coordinate": [x, y], "text": "down", "amount": 300}
         {"action": "wait", "time": 1.0}
+        {"action": "back"}                                      # (2026-08-11 추가) 브라우저 뒤로가기
     terminate는 execute_action으로 보내지 말 것 - agent_loop가 처리(driver에 안 보냄).
     """
 
     def __init__(self, window_size=DEFAULT_WINDOW_SIZE, headless=True, page_load_timeout=20, user_agent=None,
-                 captcha_reset_retries=0, reuse_driver=True):
+                 captcha_reset_retries=0, reuse_driver=True, manual_captcha_wait=False, wait_fn=None):
         """
         captcha_reset_retries: (2026-08-11 추가) reset() 직후 detect_bot_check()에
             걸리면 driver.get(url)을 다시 시도하는 횟수. CAPTCHA는 자동화로 못 풀지만,
@@ -246,6 +247,19 @@ class WebVoyagerEnv:
             유지된다(재적용 불필요). False로 주면 예전처럼 매 태스크마다 완전히 새
             브라우저를 띄운다 - 태스크 간 격리를 더 강하게 보장하고 싶을 때(예: 드라이버가
             불안정해지는 게 의심될 때) 쓸 것.
+
+        manual_captcha_wait: (2026-08-11 추가 - 실측 요청) captcha_reset_retries를 다 써도
+            여전히 bot-check가 감지되면, 자동으로 포기하는 대신 잠깐 멈춰서 사람이 직접
+            (headless=False로 띄운 실제 브라우저 창에서) CAPTCHA를 풀 시간을 준다 - "내가
+            직접 눌러주면 될 것 같다"는 요청 대응. wait_fn()이 반환하면(기본은 콘솔에서
+            Enter 입력 대기) bot-check를 한 번 더 확인해서, 실제로 풀렸으면 정상 진행하고
+            여전히 감지되면 그때는 진짜 포기(_bot_check_at_reset)한다. headless=True(기본)
+            상태에서 이 옵션을 켜봤자 사람이 볼 화면이 없으니 반드시 headless=False와 같이
+            써야 의미가 있다 - 이 클래스가 그 조합을 강제하진 않는다(휴리스틱으로 막으면
+            테스트/CI 환경에서 오히려 방해될 수 있어서, 판단은 호출부에 맡김).
+        wait_fn: manual_captcha_wait=True일 때 "사람이 다 풀 때까지 기다리는" 방법을 주입.
+            기본값 None이면 builtins.input()을 써서 콘솔에서 Enter 누를 때까지 블로킹한다.
+            테스트에서는 실제로 멈추면 안 되므로 즉시 반환하는 가짜 함수를 넣어서 검증한다.
         """
         self.window_size = window_size
         self.headless = headless
@@ -253,6 +267,8 @@ class WebVoyagerEnv:
         self.user_agent = user_agent
         self.captcha_reset_retries = captcha_reset_retries
         self.reuse_driver = reuse_driver
+        self.manual_captcha_wait = manual_captcha_wait
+        self.wait_fn = wait_fn or (lambda msg: input(msg))
         self.driver = None
         self.task_info = None
 
@@ -305,6 +321,24 @@ class WebVoyagerEnv:
                 print(f"[env_webvoyager.py] 재시도 중 driver.get({url!r}) 예외(무시하고 진행): {e}")
             time.sleep(1.5)
             bot_check = self.detect_bot_check()
+
+        # (2026-08-11 추가 - 수동 CAPTCHA 통과) 자동 재시도를 다 쓰고도 여전히 막혀 있으면,
+        # manual_captcha_wait가 켜져 있는 경우에 한해 사람이 직접 풀 시간을 준다.
+        if bot_check and self.manual_captcha_wait:
+            print(
+                f"[env_webvoyager.py] bot-check 감지됨({bot_check['reason']}) - 자동 재시도 소진. "
+                "headless=False로 띄운 브라우저 창에서 직접 CAPTCHA를 풀고 나서 Enter를 눌러주세요."
+            )
+            self.wait_fn(
+                "CAPTCHA를 다 풀었으면 Enter를 누르세요 (풀지 못했으면 그냥 Enter를 눌러도 "
+                "이 태스크는 blocked로 기록됩니다): "
+            )
+            bot_check = self.detect_bot_check()
+            if not bot_check:
+                print("[env_webvoyager.py] 수동 CAPTCHA 해결 확인됨 - 정상 진행")
+            else:
+                print("[env_webvoyager.py] 여전히 bot-check 감지됨 - 이 태스크는 blocked로 기록")
+
         if bot_check:
             self.task_info["_bot_check_at_reset"] = bot_check
 
@@ -337,6 +371,41 @@ class WebVoyagerEnv:
             if kw in url:
                 return {"reason": f"url contains {kw!r}"}
         return None
+
+    # ------------------------------------------------------------------
+    def wait_for_manual_captcha(self) -> bool:
+        """
+        (2026-08-11 추가 - 수동 CAPTCHA 통과) reset() 시점의 재시도 로직과 별개로, 에피소드가
+        이미 진행 중인 상태(스텝 실행 후)에서 bot-check가 뜬 경우를 위한 버전.
+        eval_webvoyager_v2.run_episode()가 매 스텝 후 detect_bot_check()로 뭔가 감지하면
+        이 메서드를 호출한다(duck-typing - 이 메서드가 없는 구버전 env/mock이면 그냥
+        건너뛰고 기존처럼 즉시 blocked 처리됨).
+
+        manual_captcha_wait=False(기본)면 아무것도 안 하고 바로 False를 반환한다 - 호출부는
+        이걸 "사람이 개입 안 했다"는 뜻으로 받아서 기존처럼 즉시 blocked 처리하면 된다.
+
+        Returns: bool - 사람이 직접 풀어서 실제로 통과됐으면 True(호출부는 blocked 처리하지
+            않고 계속 진행), 옵션이 꺼져 있거나 풀리지 않았으면 False(기존과 동일하게 blocked).
+        """
+        if not self.manual_captcha_wait:
+            return False
+        bot_check = self.detect_bot_check()
+        if not bot_check:
+            return True
+        print(
+            f"[env_webvoyager.py] 스텝 진행 중 bot-check 감지됨({bot_check['reason']}) - "
+            "headless=False 브라우저 창에서 직접 풀고 나서 Enter를 눌러주세요."
+        )
+        self.wait_fn(
+            "CAPTCHA를 다 풀었으면 Enter를 누르세요 (풀지 못했으면 그냥 Enter를 눌러도 "
+            "이 태스크는 blocked로 기록됩니다): "
+        )
+        still_blocked = self.detect_bot_check()
+        if still_blocked:
+            print("[env_webvoyager.py] 여전히 bot-check 감지됨 - 이 태스크는 blocked로 기록")
+            return False
+        print("[env_webvoyager.py] 수동 CAPTCHA 해결 확인됨 - 정상 진행")
+        return True
 
     # ------------------------------------------------------------------
     def _force_site_locale(self, url):
@@ -411,6 +480,7 @@ class WebVoyagerEnv:
             "type": self._type,
             "key": self._key,
             "wait": self._wait,
+            "back": self._back,
         }
         fn = dispatch.get(act_type)
         if fn is None:
@@ -509,6 +579,16 @@ class WebVoyagerEnv:
 
     def _wait(self, action):
         time.sleep(float(action.get("time", 1.0)))
+
+    def _back(self, action):
+        # (2026-08-11 추가) 브라우저 히스토리 뒤로가기. 지금까지 액션 스키마에 없어서, 잘못된
+        # 페이지로 들어갔을 때 화면 안에서 뒤로가기 버튼/로고를 못 찾으면 그 자리에서 뺑뺑이
+        # 돌 수밖에 없었다(뺑뺑이 조기종료/경고 로직은 이걸 감지는 하지만 대안을 주진 못했다).
+        # driver.back()은 CDP가 아니라 Selenium의 표준 WebDriver 히스토리 내비게이션 - 브라우저
+        # 크롬(주소창) 레벨 동작이라 CDP Input 이벤트로는 못 흉내내던 것.
+        self.driver.back()
+        time.sleep(0.5)  # 페이지 전환 렌더 여유(다른 액션들과 달리 즉시 스크린샷을 찍으면
+        # 이전 페이지가 찍힐 수 있어서 짧게 대기)
 
     # ------------------------------------------------------------------
     def close(self):
@@ -628,6 +708,15 @@ def _run_mock_selftest():
         check("left_click_drag -> NotImplementedError", False)
     except NotImplementedError:
         check("left_click_drag -> NotImplementedError", True)
+
+    # (2026-08-11 추가) back -> driver.back() 호출됨(CDP 아닌 Selenium 표준 히스토리 내비게이션)
+    orig_sleep_back = time.sleep
+    time.sleep = lambda *a, **k: None
+    try:
+        env.execute_action({"action": "back"})
+        check("back -> driver.back() 호출됨", env.driver.back.called)
+    finally:
+        time.sleep = orig_sleep_back
 
     # terminate는 execute_action에서 거부
     try:
@@ -849,6 +938,77 @@ def _run_mock_selftest():
             "driver=None인 최초 reset -> delete_all_cookies는 호출 안 함(재사용할 기존 드라이버가 없음)",
             not fresh_driver.delete_all_cookies.called,
         )
+
+        # --- (2026-08-11 추가 - 수동 CAPTCHA 통과) reset()의 manual_captcha_wait ---
+        def _make_captcha_env(manual_captcha_wait, detect_responses, wait_fn):
+            env_c = WebVoyagerEnv.__new__(WebVoyagerEnv)
+            env_c.window_size = (1280, 800)
+            env_c.headless = True
+            env_c.page_load_timeout = 20
+            env_c.user_agent = None
+            env_c.captcha_reset_retries = 0  # 재시도 없이 바로 manual 분기로 가도록
+            env_c.reuse_driver = True
+            env_c.manual_captcha_wait = manual_captcha_wait
+            env_c.wait_fn = wait_fn
+            d = MagicMock()
+            d.title = "Example Domain"
+            d.current_url = "http://example.com/"
+            d.get_screenshot_as_png.return_value = _fake_png_bytes()
+            env_c.driver = d
+            env_c.task_info = None
+            responses = list(detect_responses)
+            env_c.detect_bot_check = lambda: (responses.pop(0) if responses else None)
+            return env_c
+
+        # (a) manual_captcha_wait=True, wait 이후 실제로 풀림 -> _bot_check_at_reset 안 남음
+        wait_calls_a = []
+        env_a = _make_captcha_env(
+            True, [{"reason": "title contains 'captcha'"}, None], lambda msg: wait_calls_a.append(msg)
+        )
+        _, task_info_a = env_a.reset({"web": "http://example.com/x", "ques": "do X"})
+        check("manual_captcha_wait -> 사람이 풀면 wait_fn이 호출됨", len(wait_calls_a) == 1)
+        check("manual_captcha_wait -> 풀린 경우 _bot_check_at_reset 안 남음", "_bot_check_at_reset" not in task_info_a)
+
+        # (b) manual_captcha_wait=True인데 wait 이후에도 여전히 감지됨 -> 결국 blocked 마킹
+        wait_calls_b = []
+        env_b = _make_captcha_env(
+            True,
+            [{"reason": "title contains 'captcha'"}, {"reason": "title contains 'captcha'"}],
+            lambda msg: wait_calls_b.append(msg),
+        )
+        _, task_info_b = env_b.reset({"web": "http://example.com/y", "ques": "do Y"})
+        check("manual_captcha_wait -> 여전히 안 풀리면 wait_fn은 호출됐지만", len(wait_calls_b) == 1)
+        check("manual_captcha_wait -> 여전히 안 풀리면 결국 _bot_check_at_reset 남음", "_bot_check_at_reset" in task_info_b)
+
+        # (c) manual_captcha_wait=False(기본) -> wait_fn 호출 안 되고 예전처럼 즉시 blocked
+        wait_calls_c = []
+        env_c = _make_captcha_env(
+            False, [{"reason": "title contains 'captcha'"}], lambda msg: wait_calls_c.append(msg)
+        )
+        _, task_info_c = env_c.reset({"web": "http://example.com/z", "ques": "do Z"})
+        check("manual_captcha_wait=False -> wait_fn 호출 안 됨(하위 호환)", len(wait_calls_c) == 0)
+        check("manual_captcha_wait=False -> 예전과 동일하게 즉시 _bot_check_at_reset 남음", "_bot_check_at_reset" in task_info_c)
+
+        # --- wait_for_manual_captcha() 단독 테스트 (스텝 진행 중 감지 케이스) ---
+        wait_calls_d = []
+        env_d = _make_captcha_env(True, [{"reason": "url contains 'recaptcha'"}, None], lambda msg: wait_calls_d.append(msg))
+        resolved = env_d.wait_for_manual_captcha()
+        check("wait_for_manual_captcha -> 풀리면 True 반환", resolved is True)
+        check("wait_for_manual_captcha -> wait_fn 호출됨", len(wait_calls_d) == 1)
+
+        wait_calls_e = []
+        env_e = _make_captcha_env(
+            True, [{"reason": "url contains 'recaptcha'"}, {"reason": "url contains 'recaptcha'"}],
+            lambda msg: wait_calls_e.append(msg),
+        )
+        resolved_e = env_e.wait_for_manual_captcha()
+        check("wait_for_manual_captcha -> 안 풀리면 False 반환", resolved_e is False)
+
+        env_f = _make_captcha_env(False, [{"reason": "url contains 'recaptcha'"}], lambda msg: None)
+        check("wait_for_manual_captcha -> manual_captcha_wait=False면 즉시 False(감지 확인조차 안 함)", env_f.wait_for_manual_captcha() is False)
+
+        env_g = _make_captcha_env(True, [None], lambda msg: None)
+        check("wait_for_manual_captcha -> 애초에 bot-check가 없으면 바로 True", env_g.wait_for_manual_captcha() is True)
     finally:
         time.sleep = orig_sleep
 

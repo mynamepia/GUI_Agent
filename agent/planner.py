@@ -38,7 +38,7 @@ Distillation처럼 별도 planner LoRA를 소규모 trajectory로 파인튜닝�
   "reasoning": "<왜 이 액션을 골랐는지 - action보다 먼저 쓰게 강제해서, 결론부터 내리고
                 사후정당화하는 대신 근거를 먼저 풀게 유도함. region_focus.judge_inference()의
                 reason-then-ans 트릭과 동일한 원칙>",
-  "action": "left_click" | "double_click" | "right_click" | "drag" | "type" | "key" | "scroll" | "wait" | "terminate",
+  "action": "left_click" | "double_click" | "right_click" | "drag" | "type" | "key" | "scroll" | "wait" | "back" | "terminate",
   "target_description": "<click/drag류일 때만 - click은 뭘 클릭할지, drag는 어디서 드래그를
                           시작할지에 대한 자연어 설명. 좌표 아님!>",
   "text": "<type/key/scroll/drag일 때만 - 입력할 텍스트 / 키 이름 / 스크롤 방향("up"|"down") /
@@ -137,7 +137,7 @@ if TYPE_CHECKING:
     # 실행하는 걸 전제)를 쓰고 있어서, 여기도 그 스타일로 통일한다.
     from qwen import QwenVLModel
 
-_ACTIONS = ("left_click", "double_click", "right_click", "drag", "type", "key", "scroll", "wait", "terminate")
+_ACTIONS = ("left_click", "double_click", "right_click", "drag", "type", "key", "scroll", "wait", "back", "terminate")
 
 _FEWSHOT = """
 Example:
@@ -164,6 +164,9 @@ Available actions: {", ".join(_ACTIONS)}
 - key: needs "text" (a key name, e.g. "Enter", "Tab", "Escape").
 - scroll: needs "text" ("up" or "down").
 - wait: no extra fields needed (use sparingly, only if the page seems to be loading).
+- back: no extra fields needed. Goes back to the previous page in browser history. Use this when
+  you navigated to the wrong page, opened something unintended, or need to undo a navigation -
+  prefer this over repeatedly clicking around trying to find a way back.
 - terminate: use this when the task is complete or you are stuck. Needs "status" ("success" or
   "failure") and, if the task asked a question, "answer" with your final answer text.
 
@@ -273,6 +276,8 @@ def _describe_action(a: dict) -> str:
         return f'scroll {a.get("text", "down")}'
     if act == "wait":
         return "wait"
+    if act == "back":
+        return "go back to the previous page"
     return str(act)
 
 
@@ -300,6 +305,8 @@ def _is_similar_action(a: dict, b: dict) -> bool:
     if act == "scroll":
         return (a.get("text") or "down").strip().lower() == (b.get("text") or "down").strip().lower()
     if act == "wait":
+        return True
+    if act == "back":
         return True
     return False
 
@@ -457,6 +464,8 @@ def _action_schema_valid(obj: dict) -> bool:
     if action == "scroll":
         return obj.get("text") in ("up", "down")
     if action == "wait":
+        return True
+    if action == "back":
         return True
     if action == "terminate":
         return obj.get("status") in ("success", "failure")
@@ -766,6 +775,15 @@ def _run_mock_selftest():
 
     ok_wait = _parse_planner_action('{"action": "wait"}')
     check("wait는 추가 필드 없어도 통과", ok_wait["action"] == "wait" and not ok_wait.get("_parse_failed"))
+
+    # (2026-08-11 추가) back - 브라우저 히스토리 뒤로가기, wait처럼 추가 필드 없어도 통과해야 함
+    ok_back = _parse_planner_action('{"reasoning": "wrong page", "action": "back"}')
+    check("back는 추가 필드 없어도 통과", ok_back["action"] == "back" and not ok_back.get("_parse_failed"))
+    check("_describe_action -> back 설명 문구", _describe_action({"action": "back"}) == "go back to the previous page")
+    check("_is_similar_action -> back끼리는 항상 동일 취급", _is_similar_action({"action": "back"}, {"action": "back"}))
+    check("_is_similar_action -> back과 wait는 다름", not _is_similar_action({"action": "back"}, {"action": "wait"}))
+    back_hist = _format_history([{"action": "back"}])
+    check("back 히스토리 포맷에 설명 문구 포함", "go back to the previous page" in back_hist)
 
     # (2026-08-07 추가) drag 액션 - AgentNet 학습 데이터에서 3.9%가 moveTo+dragTo 조합으로
     # 나왔는데 원래 스키마에 없어서 스킵되던 것을 추가함.
