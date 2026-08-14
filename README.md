@@ -37,7 +37,7 @@ Converts a `target_description` into pixel coordinates: initial grounding → se
 
 Wraps `microsoft/GUI-Actor-3B-Qwen2.5-VL`, a pretrained coordinate-free pointer model that attends over image patches and returns click points directly (no text coordinates). `gui_actor_region_focus.py` reimplements the same RegionFocus pipeline as Track A on top of GUI-Actor's output.
 
-### `eval_webvoyager_v3.py`
+### `gui_actor_eval_webvoyager.py`
 
 `build_planner_grounding_agent_step()` wires planner + grounding + env into one policy function. `--grounding_backend {lora, gui_actor}` and `--planner_backend {local, openai}` select which track's components are used. Also implements `drag` (start/end description each grounded separately, executed as a `left_click_drag` env action) and final-answer extraction for `terminate` actions missing an `answer` field (routed through the planner model, not the grounding model).
 
@@ -50,9 +50,9 @@ Selenium-based wrapper for live WebVoyager sites, shared by both tracks. `reset(
 - Per-site locale forcing (cookies for Amazon/Apple, URL params for Google/Booking) so non-US IPs don't get served the wrong language/currency.
 - New-tab handling (site opens content in a new tab → focus follows it) and a page-load wait before each screenshot.
 
-## Evaluation (`eval_webvoyager.py` / `eval_webvoyager_v3.py`)
+## Evaluation (`eval_webvoyager.py` / `gui_actor_eval_webvoyager.py`)
 
-`run_episode` / `run_batch`: each task runs up to `max_steps` (default 17), then the last few screenshots go to an LLM judge (local Qwen or GPT-4o) for a success verdict, optionally by majority vote over multiple judge calls. A windowed repeat-action detector ends an episode early if it's clearly stuck (excluding `scroll`).
+`run_episode` / `run_batch`: each task runs up to `max_steps` (default 17), then the last few screenshots go to an LLM judge (local Qwen or GPT-4o) for a success verdict, optionally by majority vote over multiple judge calls. A windowed repeat-action detector ends an episode early if it's clearly stuck (excluding `scroll`). `eval_webvoyager.py` (Track A) also supports `--resume` (skip already-completed task IDs from a prior `--out` file) for long unattended runs.
 
 ## Testing strategy
 

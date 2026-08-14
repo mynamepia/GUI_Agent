@@ -1,5 +1,5 @@
 """
-eval_webvoyager.py
+gui_actor_eval_webvoyager.py
 
 WebVoyager 스타일 태스크에 대해 에이전트 trajectory를 수집하고, "성공했는가"를 judge에게
 물어서 채점하는 배치 평가 하네스. eval_regionfocus.py(정답 bbox가 있는 grounding 배치
@@ -22,7 +22,7 @@ judge_fn 시그니처:
                                      openai 미설치 환경에서도 import/selftest 가능.
 둘 다 이번 세션에서는 실제 모델/API 호출까지 검증하지 못했음(무거운 모델 로드/API 키가
 필요해서). trajectory 수집 및 다수결 집계 로직은 mock으로 단위 테스트해뒀다
-(`python eval_webvoyager.py --selftest`).
+(`python gui_actor_eval_webvoyager.py --selftest`).
 
 [planner/agent_loop가 아직 없음]
 run_episode()는 "다음에 뭘 할지" 정하는 agent_step_fn을 파라미터로 받는다 - 이 파일은
@@ -53,29 +53,38 @@ import io
 import json
 import os
 import re
+import sys as _sys
 import time
 from collections import Counter
 
 from PIL import Image
 
+# (v3 이동 - agent-actor3b/ 폴더로 옮기면서 위치 변경) 이 파일은 이제 vlm_agent/agent/가 아니라
+# vlm_agent/agent-actor3b/에 있다. env_webvoyager.py/planner.py/agent_loop.py/api_planner.py는
+# 여전히 vlm_agent/agent/에 그대로 있고(옮기지 않음 - --grounding_backend lora 경로가 그대로
+# 참조), qwen.py/gui_grounding.py/region_focus.py/coord_utils.py는 vlm_agent/ 루트에,
+# gui_actor_grounding.py/gui_actor_region_focus.py는 이 파일과 같은 폴더에 있다.
+#
+# 아래에서 vlm_agent/(qwen.py 등)와 vlm_agent/agent/(env_webvoyager.py 등)를 sys.path에
+# 명시적으로 추가하는 걸 바로 다음 줄의 `from env_webvoyager import ...`(top-level import라
+# 부트스트랩이 그 전에 실행돼야 함)보다 먼저 해야 한다 - 원래 이 파일이 vlm_agent/agent/ 안에
+# 있었을 때는 파이썬이 스크립트 자기 자신의 디렉토리를 자동으로 sys.path에 넣어줘서 이 import가
+# 별도 부트스트랩 없이도 됐는데, 폴더를 옮기면서 그 암묵적 동작을 잃었다.
+_HERE = os.path.dirname(os.path.abspath(__file__))
+_VLM_AGENT_DIR = os.path.abspath(os.path.join(_HERE, ".."))   # vlm_agent/ (qwen.py 등)
+_LEGACY_AGENT_DIR = os.path.join(_VLM_AGENT_DIR, "agent")     # vlm_agent/agent/ (env_webvoyager.py 등)
+for _candidate in (_VLM_AGENT_DIR, _LEGACY_AGENT_DIR):
+    if os.path.isdir(_candidate) and _candidate not in _sys.path:
+        _sys.path.insert(0, _candidate)
+
 from env_webvoyager import WebVoyagerEnv, load_webvoyager_tasks
 
-# (2026-08-09 추가) vlm_agent(qwen.py/gui_grounding.py가 있는 폴더)를 sys.path에 넣는다 -
-# planner.py/agent_loop.py와 동일한 패턴. 이 파일은 gui_grounding.ground()와 qwen.QwenVLModel을
-# 함수 안에서 lazy import하는데(build_planner_grounding_agent_step/CLI), agent_loop보다 먼저
-# import될 수도 있으니 여기서도 직접 부트스트랩해서 실행 cwd/순서에 의존하지 않게 한다.
-import sys as _sys
-
-_HERE = os.path.dirname(os.path.abspath(__file__))
-for _candidate in (os.path.join(_HERE, ".."), os.path.join(_HERE, "..", "vlm_agent")):
-    _candidate = os.path.abspath(_candidate)
-    if os.path.isfile(os.path.join(_candidate, "qwen.py")):
-        if _candidate not in _sys.path:
-            _sys.path.insert(0, _candidate)
-        break
-
 MAX_JUDGE_SCREENSHOTS = 15
-DEFAULT_MAX_STEPS = 15
+# (2026-08-14 수정) 15 -> 17. 실측(Booking--0): destination/날짜/검색까지 정상 진행하고도
+# 필터/정렬 등 마무리 조작 몇 스텝이 모자라서 15스텝 한도에 걸려 중간에 끊기는 게 확인됨
+# (로케일 재적용 레이스 컨디션/새 탭 처리 버그 수정 이후로는 스텝이 헛돌지 않고 실제
+# 진행에 쓰이므로, 조금 늘려도 낭비가 아니라 실제로 필요한 여유일 가능성이 높음).
+DEFAULT_MAX_STEPS = 17
 DEFAULT_JUDGE_REPEATS = 3
 
 
@@ -111,6 +120,7 @@ def dummy_agent_step(screenshot, task_info, history):
 # (2026-08-11 추가 - region focus 재연결) click grounding 백엔드 선택
 # ---------------------------------------------------------------------------
 def _build_click_ground_fn(
+    grounding_backend: str = "lora",
     use_regionfocus: bool = False,
     regionfocus_debug_image: bool = False,
     regionfocus_debug_text: bool = False,
@@ -119,7 +129,7 @@ def _build_click_ground_fn(
 ):
     """
     click 계열 액션(left_click/double_click/right_click)의 grounding을 무엇으로 할지 정하는
-    factory. 이 파일은 원래(v1) 시절 _convert_planner_action_to_env()가
+    factory. eval_webvoyager.py(Track A, v2)는 원래 _convert_planner_action_to_env()가
     gui_grounding.ground()(초기 grounding 1회)만 직접 import해서 썼는데, 이 프로젝트가 실제로
     검증/적용한 RegionFocus 재탐색 파이프라인(region_focus.py의 ground_with_regionfocus() -
     초기 grounding -> judge 판단 -> 오답이면 재탐색 -> crop/zoom 4비율 정밀화 -> 후보 종합,
@@ -132,7 +142,46 @@ def _build_click_ground_fn(
     서로 못 알아듣는 kwargs(gui_grounding.ground()는 task_id 개념이 없고, ground_with_regionfocus()는
     max_new_tokens를 안 받음 - 내부 각 단계가 자체 max_new_tokens를 하드코딩해서 씀)는 여기서
     조용히 걸러낸다.
+
+    [v3 추가] grounding_backend="gui_actor"면 LoRA 대신 GUI-Actor(microsoft/GUI-Actor-3B-
+    Qwen2.5-VL, coordinate-free pointer 방식)를 쓴다. use_regionfocus는 이 경우에도 그대로
+    존중된다 - True면 gui_actor_region_focus.ground_with_regionfocus_gui_actor()(judge/재탐색/
+    crop-zoom/aggregation을 GUI-Actor 위에서 재현한 버전), False면 gui_actor_grounding.ground()
+    (초기 grounding 1회)로 간다. LoRA 전용 region_focus.ground_with_regionfocus()는 여기서
+    안 탄다 - 그쪽 judge/재탐색 파이프라인이 LoRA의 학습 포맷(coord_utils.PROMPT_TEMPLATE)에
+    강하게 결합돼 있어 GUI-Actor에는 그대로 못 얹기 때문에, gui_actor_region_focus.py로 따로
+    재구현했다(모듈 docstring 참고). 두 gui_actor 경로 모두 min_pixels/max_pixels/max_new_tokens
+    등 낯선 kwargs를 알아서 무시하므로(**_ignored) 여기서 따로 걸러낼 필요가 없다.
     """
+    if grounding_backend == "gui_actor":
+        # [v3 수정 - RF 결합] 처음엔 gui_actor 백엔드에서 RegionFocus를 아예 안 쓰고
+        # 초기 grounding 1회(gui_actor_grounding.ground())만 쓰도록 고정했었는데,
+        # gui_actor_region_focus.py로 RegionFocus 알고리즘(judge/재탐색/crop-zoom/aggregation)을
+        # GUI-Actor 위에서 재현했으므로 이제 use_regionfocus를 그대로 존중한다 - LoRA 경로와
+        # 동일하게 켜져 있으면 RegionFocus, 꺼져 있으면(--no_regionfocus) 초기 grounding 1회.
+        if use_regionfocus:
+            from gui_actor_region_focus import ground_with_regionfocus_gui_actor
+
+            def _ground_fn(model, instruction, screenshot, **kwargs):
+                task_id = kwargs.pop("task_id", None)
+                kwargs.pop("max_new_tokens", None)
+                return ground_with_regionfocus_gui_actor(
+                    model, instruction, screenshot,
+                    debug_image=regionfocus_debug_image,
+                    debug_text=regionfocus_debug_text,
+                    task_id=task_id,
+                    **kwargs,  # min_pixels/max_pixels가 남아있어도 **_ignored로 조용히 무시됨
+                )
+
+            return _ground_fn
+
+        from gui_actor_grounding import ground as _gui_actor_ground
+
+        def _ground_fn(model, instruction, screenshot, **kwargs):
+            return _gui_actor_ground(model, instruction, screenshot, **kwargs)
+
+        return _ground_fn
+
     if not use_regionfocus:
         from gui_grounding import ground
 
@@ -214,15 +263,56 @@ def _convert_planner_action_to_env(
         return {"action": act, "coordinate": [x, y]}
 
     if act == "drag":
-        # env_webvoyager.py의 _drag()는 아직 NotImplementedError(스키마에 시작점이 없어서) -
-        # planner LoRA는 drag를 낼 수 있지만 실행부가 못 받으니, 에피소드를 죽이는 대신
-        # no-op으로 다운그레이드하고 로그만 남긴다. drag 실제 실행은 다음 작업 범위.
-        print("[agent_step] drag 액션은 env_webvoyager.py에 아직 미구현 -> no-op으로 스킵")
-        return {
-            "action": "wait",
-            "time": 0.0,
-            "_downgrade_reason": "drag is not implemented in env_webvoyager.py yet",
-        }
+        # (2026-08 추가 - 구현) env_webvoyager.py의 _drag()가 이제 start_coordinate/coordinate
+        # 두 좌표를 받아 실제로 실행한다(모듈 docstring 참고). planner.py의 drag 스키마는
+        # target_description=시작점 설명, text=끝점 설명이라(기존 필드 재사용, 새 필드 없음),
+        # 여기서 두 지점을 각각 ground_fn으로 grounding해서 픽셀 좌표로 변환한다 - click류와
+        # 똑같은 로직을 두 번 반복하는 셈. 둘 중 하나라도 설명이 비어있거나 grounding이
+        # 실패하면(원인 불문) 에피소드를 죽이는 대신 no-op으로 다운그레이드한다(click 실패
+        # 처리와 동일한 원칙 - _downgrade_reason 마커로 history 보정도 동일하게 적용됨).
+        start_target = plan.get("target_description") or ""
+        end_target = plan.get("text") or ""
+        if not start_target or not end_target:
+            print(
+                f"[agent_step] drag 액션에 시작점/끝점 설명이 부족함"
+                f"(target_description={start_target!r}, text={end_target!r}) -> no-op으로 스킵"
+            )
+            return {
+                "action": "wait",
+                "time": 0.5,
+                "_downgrade_reason": (
+                    f"drag missing target_description or text "
+                    f"(target_description={start_target!r}, text={end_target!r})"
+                ),
+            }
+
+        g_start = ground_fn(grounding_model, start_target, screenshot, task_id=task_id, **ground_kwargs)
+        if g_start["result"] != "positive":
+            print(f"[agent_step] drag 시작점 grounding 실패(target={start_target!r}) -> no-op으로 스킵")
+            return {
+                "action": "wait",
+                "time": 0.5,
+                "_downgrade_reason": (
+                    f"grounding failed for drag start target_description={start_target!r} "
+                    f"(result={g_start.get('result')!r})"
+                ),
+            }
+
+        g_end = ground_fn(grounding_model, end_target, screenshot, task_id=task_id, **ground_kwargs)
+        if g_end["result"] != "positive":
+            print(f"[agent_step] drag 끝점 grounding 실패(target={end_target!r}) -> no-op으로 스킵")
+            return {
+                "action": "wait",
+                "time": 0.5,
+                "_downgrade_reason": (
+                    f"grounding failed for drag end text={end_target!r} (result={g_end.get('result')!r})"
+                ),
+            }
+
+        w, h = screenshot.size
+        x1, y1 = g_start["point"][0] * w, g_start["point"][1] * h
+        x2, y2 = g_end["point"][0] * w, g_end["point"][1] * h
+        return {"action": "left_click_drag", "start_coordinate": [x1, y1], "coordinate": [x2, y2]}
 
     if act == "type":
         return {"action": "type", "text": plan.get("text", "")}
@@ -255,7 +345,14 @@ _ANSWER_EXTRACTION_PROMPT_TEMPLATE = (
 )
 
 
-def _extract_final_answer(grounding_model, instruction: str, screenshot, max_new_tokens: int = 100):
+# (2026-08-15 추가 - _extract_final_answer가 헛소리를 걸러내기 위한 안전장치) 일부 모델(특히
+# GUI-Actor처럼 자유형 QA를 학습에서 못 본 모델)이 답변 뒤에 챗 템플릿/액션 포맷 토큰을 이어서
+# 계속 생성해버리는 게 실측으로 확인됨(예: "unknown.\nassistantos\npyautogui.click([1] )") -
+# 이런 패턴이 나오면 진짜 답변이 아니라 생성 이탈이므로, 이 마커가 나오는 지점 이후는 잘라낸다.
+_ANSWER_LEAKAGE_CUT_MARKERS = ("\nassistant", "\nuser:", "\n<|")
+
+
+def _extract_final_answer(qa_model, instruction: str, screenshot, max_new_tokens: int = 100):
     """
     (2026-08-10 추가) planner LoRA가 terminate 시점에 "answer"를 채우지 못하는 문제(실측:
     질문형 태스크 3개 중 3개 전부 final_answer=null)의 원인을 찾아보니, 학습 데이터
@@ -265,10 +362,26 @@ def _extract_final_answer(grounding_model, instruction: str, screenshot, max_new
     answer가 비어 있을 때만 이 함수로 별도 QA 호출을 한 번 더 한다(WebVoyager 등 여러
     에이전트 시스템이 실제로 쓰는 분리 방식).
 
-    grounding_model.model이 peft.PeftModel이면(어댑터가 얹혀 있으면) disable_adapter()로
-    순수 base 상태에서 물어본다 - planner/grounding LoRA 둘 다 이 자유형 QA 포맷을 학습에서
-    본 적이 없어서, 얹은 채로 물으면 오히려 이상한 포맷으로 답할 위험이 있다(이 세션 내내
-    반복된 원칙: LoRA는 자기가 학습받은 입력 구조로만 물어야 함).
+    qa_model.model이 peft.PeftModel이면(어댑터가 얹혀 있으면) disable_adapter()로 순수 base
+    상태에서 물어본다 - LoRA가 이 자유형 QA 포맷을 학습에서 본 적이 없어서, 얹은 채로 물으면
+    오히려 이상한 포맷으로 답할 위험이 있다(이 세션 내내 반복된 원칙: LoRA는 자기가 학습받은
+    입력 구조로만 물어야 함).
+
+    [2026-08-15 수정 - 호출부가 grounding_model 대신 planner 모델을 넘기도록 변경] 원래
+    build_planner_grounding_agent_step()이 이 함수에 grounding_model(그라운딩 전용 모델)을
+    넘겼는데, grounding_backend가 GUI-Actor(좌표 찍기 전문, 자유형 질의응답 학습 안 됨)로
+    바뀐 뒤로 실측에서 "unknown.\nassistantos\npyautogui.click([1] )" 같은 생성 이탈이
+    확인됨 - GUI-Actor한테 범용 화면 판독 질문을 던지는 게 애초에 안 맞는 조합이었다. 이제는
+    이미 사용 중인 planner 모델(대부분 GPT-4o 등 OpenAI API - 비전 QA를 훨씬 잘함)을 이
+    함수에 넘기도록 호출부를 바꿨다 - 새 API 호출이 추가되는 게 아니라 자리만 바뀐 것.
+    로컬 planner LoRA를 쓰는 경우에도 위 disable_adapter() 로직이 그대로 적용되므로 이전과
+    동일하게 안전하다(오히려 grounding LoRA보다 planner 쪽이 애초에 이 함수가 상정한
+    "LoRA를 끈 순수 base"에 더 가까운 자리였음).
+
+    [2026-08-15 추가 - 헛소리 감지 강화] "unknown" 감지가 정확히 일치할 때만 걸러졌는데,
+    실제로는 "unknown." 처럼 구두점이 붙거나 뒤에 챗 템플릿 이탈 텍스트가 더 붙는 경우가
+    있어서 못 걸렀다(위 실측 사례) - 마침표/느낌표를 떼고 비교하고, 알려진 이탈 마커
+    이후는 아예 잘라내는 전처리를 추가했다.
     """
     prompt = _ANSWER_EXTRACTION_PROMPT_TEMPLATE.format(instruction=instruction)
     messages = [
@@ -276,15 +389,23 @@ def _extract_final_answer(grounding_model, instruction: str, screenshot, max_new
     ]
 
     def _generate():
-        return grounding_model.generate(messages, max_new_tokens=max_new_tokens, temperature=0.0).strip()
+        return qa_model.generate(messages, max_new_tokens=max_new_tokens, temperature=0.0).strip()
 
-    if hasattr(grounding_model.model, "disable_adapter"):
-        with grounding_model.model.disable_adapter():
+    if hasattr(qa_model.model, "disable_adapter"):
+        with qa_model.model.disable_adapter():
             response = _generate()
     else:
         response = _generate()
 
-    if not response or response.strip().lower() == "unknown":
+    if not response:
+        return None
+
+    for marker in _ANSWER_LEAKAGE_CUT_MARKERS:
+        idx = response.lower().find(marker)
+        if idx != -1:
+            response = response[:idx].strip()
+
+    if not response or response.strip().lower().rstrip(".!") == "unknown":
         return None
     return response
 
@@ -394,7 +515,7 @@ class _PromptRecorder:
                     img.save(os.path.join(self.task_dir, img_fname))
                     image_filenames[id(part)] = img_fname
                 except Exception as e:  # noqa: BLE001 - 이미지 저장 실패로 로그 전체를 죽이지 않음
-                    print(f"[eval_webvoyager.py] 디버그 이미지 저장 실패(무시하고 진행): {e}")
+                    print(f"[gui_actor_eval_webvoyager.py] 디버그 이미지 저장 실패(무시하고 진행): {e}")
                 img_idx += 1
         return image_filenames
 
@@ -465,6 +586,14 @@ def build_planner_grounding_agent_step(
     regionfocus_debug_text: bool = False,
     regionfocus_step1_format: str = "point_text",
     regionfocus_step4_format: str = "point_text",
+    grounding_backend: str = "lora",
+    # [v3 추가] "gui_actor"면 click grounding이 _build_click_ground_fn(grounding_backend="gui_actor")를
+    # 타서, use_regionfocus 값에 따라 gui_actor_region_focus.ground_with_regionfocus_gui_actor()
+    # (True) 또는 gui_actor_grounding.ground()(False, 초기 grounding 1회)로 간다 - 둘 다 이제
+    # gui_actor 백엔드에서 지원된다(gui_actor_region_focus.py 모듈 docstring 참고). reflection은
+    # __main__ CLI 쪽에서 gui_actor 백엔드일 때 기본으로 꺼둔다(GUI-Actor가 학습에서 못 본
+    # 구조화된 비평 포맷이라 출력 품질 미검증 - 이 함수를 CLI 밖에서 직접 호출할 거면 호출부가
+    # 그 판단을 대신 해야 한다).
 ):
     """
     agent_loop.load_shared_model()이 반환한 (model, planning_view)로 실제 정책 함수를
@@ -502,6 +631,7 @@ def build_planner_grounding_agent_step(
     from planner import plan_next_action, plan_with_reflection
 
     click_ground_fn = _build_click_ground_fn(
+        grounding_backend=grounding_backend,
         use_regionfocus=use_regionfocus,
         regionfocus_debug_image=regionfocus_debug_image,
         regionfocus_debug_text=regionfocus_debug_text,
@@ -531,12 +661,16 @@ def build_planner_grounding_agent_step(
             _DebugModelView(reflection_view, recorder, "reflection") if reflection_view is not None else None
         )
         debug_grounding_click_view = _DebugModelView(grounding_model, recorder, "grounding")
-        debug_grounding_answer_view = _DebugModelView(grounding_model, recorder, "answer_extraction")
+        # (2026-08-15 수정) grounding_model 대신 planning_view를 answer 추출에 씀 -
+        # _extract_final_answer() docstring의 "2026-08-15 수정" 항목 참고. debug_planning_view를
+        # 그대로 재사용하면 "planner" 라벨로 기록되어 버려서(진짜 planning 콜과 구분이 안 됨),
+        # 같은 planning_view를 별도 라벨("answer_extraction")로 한 번 더 감싼다.
+        debug_answer_extraction_view = _DebugModelView(planning_view, recorder, "answer_extraction")
     else:
         debug_planning_view = planning_view
         debug_reflection_view = reflection_view
         debug_grounding_click_view = grounding_model
-        debug_grounding_answer_view = grounding_model
+        debug_answer_extraction_view = planning_view
 
     ground_kwargs = {"max_new_tokens": ground_max_new_tokens}
     if ground_min_pixels is not None:
@@ -623,13 +757,17 @@ def build_planner_grounding_agent_step(
 
         planner_history.append(plan)
 
-        # (2026-08-10 추가) terminate인데 answer가 비어 있으면 별도 QA 호출로 채운다.
-        # _extract_final_answer() docstring 참고 - planner LoRA가 애초에 이 필드를 학습에서
-        # 못 본 문제라 재시도/reflection으로는 안 고쳐짐. reflection이 반려한 terminate는 위에서
-        # 이미 걸러졌으니, 여기 도달하는 terminate는 (reflection이 껐거나) 승인된 것만 남는다.
+        # (2026-08-10 추가, 2026-08-15 수정) terminate인데 answer가 비어 있으면 별도 QA 호출로
+        # 채운다. _extract_final_answer() docstring 참고 - planner가 애초에 이 필드를 못 채우는
+        # 문제라 재시도/reflection으로는 안 고쳐짐. reflection이 반려한 terminate는 위에서 이미
+        # 걸러졌으니, 여기 도달하는 terminate는 (reflection이 껐거나) 승인된 것만 남는다.
+        # [2026-08-15 수정] grounding_model(GUI-Actor 등 좌표 전문 모델) 대신 planning_view를
+        # 넘기도록 바꿈 - GUI-Actor한테 자유형 QA를 물었더니 "unknown.\nassistantos\n
+        # pyautogui.click([1] )" 같은 생성 이탈이 실측으로 확인됨(_extract_final_answer 함수
+        # docstring의 "2026-08-15 수정" 항목 참고).
         if plan.get("action") == "terminate" and not plan.get("answer"):
             try:
-                extracted = _extract_final_answer(debug_grounding_answer_view, instruction, screenshot)
+                extracted = _extract_final_answer(debug_answer_extraction_view, instruction, screenshot)
             except Exception as e:  # noqa: BLE001 - 최종 답변 추출 실패로 에피소드 전체를 죽이지 않음
                 print(f"[agent_step] answer 추출 실패(무시하고 진행): {e}")
                 extracted = None
@@ -806,17 +944,26 @@ def run_episode(
                     hit_max_steps = False
                     break
 
-            fp = _action_fingerprint(action)
-            fingerprint_history.append(fp)
-            window = fingerprint_history[-stuck_repeat_window:]
-            fp_count = window.count(fp)
-            if fp_count >= stuck_repeat_threshold:
-                blocked = True
-                blocked_reason = (
-                    f"최근 {len(window)}개 액션 중 같은 액션이 {fp_count}회 반복 등장(뺑뺑이/정체로 판단): {fp}"
-                )
-                hit_max_steps = False
-                break
+            # (2026-08-15 수정 - 사용자 요청) scroll은 뺑뺑이/정체 판단에서 아예 뺀다. planner.py
+            # 쪽 REPETITION WARNING도 같은 이유로 scroll을 뺐음(_is_similar_action 참고) -
+            # scroll은 매번 화면의 새로운 부분을 보여주는 정상 탐색이라 반복 자체가 "제자리걸음"
+            # 신호가 아니고, "개수가 명시된 태스크는 목표를 채울 때까지 계속 스크롤하라"는 최근
+            # 프롬프트 지침과 하드 조기종료가 서로 충돌하면 안 되므로(정상적으로 스크롤하며
+            # 목록을 훑던 에피소드가 스크롤 반복만으로 blocked 처리되는 걸 방지) fingerprint
+            # 히스토리에 아예 안 쌓는다 - 진짜로 스크롤만 하며 끝까지 진전이 없는 경우는 max_steps로
+            # 자연스럽게 막힌다.
+            if action.get("action") != "scroll":
+                fp = _action_fingerprint(action)
+                fingerprint_history.append(fp)
+                window = fingerprint_history[-stuck_repeat_window:]
+                fp_count = window.count(fp)
+                if fp_count >= stuck_repeat_threshold:
+                    blocked = True
+                    blocked_reason = (
+                        f"최근 {len(window)}개 액션 중 같은 액션이 {fp_count}회 반복 등장(뺑뺑이/정체로 판단): {fp}"
+                    )
+                    hit_max_steps = False
+                    break
 
             if terminated or truncated:
                 hit_max_steps = False
@@ -922,7 +1069,7 @@ def make_openai_judge(model="gpt-4o", api_key=None, max_tokens=300, max_retries=
             content.append({"type": "image_url", "image_url": {"url": f"data:image/png;base64,{b64}"}})
 
         def _on_retry(attempt, delay, exc):
-            print(f"[eval_webvoyager.py] judge rate limit(429) 감지 - {delay:.1f}초 대기 후 재시도 ({attempt}/{max_retries}): {exc}")
+            print(f"[gui_actor_eval_webvoyager.py] judge rate limit(429) 감지 - {delay:.1f}초 대기 후 재시도 ({attempt}/{max_retries}): {exc}")
 
         resp = _call_with_retry(
             lambda: client.chat.completions.create(
@@ -1110,7 +1257,7 @@ def run_batch(tasks, env, agent_step_fn, judge_fn, max_steps=DEFAULT_MAX_STEPS,
 # ---------------------------------------------------------------------------
 def _run_mock_selftest():
     """
-    `python eval_webvoyager.py --selftest`
+    `python gui_actor_eval_webvoyager.py --selftest`
     (1) run_episode의 종료 조건(즉시 terminate / max_steps 도달)
     (2) run_judge_with_repeats의 다수결 로직
     (3) _parse_success_verdict의 JSON/폴백 파싱
@@ -1299,6 +1446,42 @@ def _run_mock_selftest():
     check(
         "stuck_repeat_window을 좁히면 뺑뺑이를 못 잡음(윈도우가 threshold보다 작아서)",
         traj_osc_narrow_window["blocked"] is False,
+    )
+
+    # --- (2026-08-15 추가 - 사용자 요청) scroll은 stuck-repeat(뺑뺑이) 조기종료 판단에서 아예
+    # 빠져야 함. "개수가 명시된 태스크는 목표를 채울 때까지 계속 스크롤/탐색하라"는 최근 프롬프트
+    # 지침과, 반복된 스크롤을 뺑뺑이로 보고 하드 조기종료시키는 이 안전장치가 서로 충돌하던
+    # 문제(Booking 배치 실측: 정상적으로 같은 방향 스크롤을 몇 번 했을 뿐인데 조기종료 위험에
+    # 노출) 재발 방지. ---
+    fake_env_scroll_only = MagicMock()
+    fake_env_scroll_only.reset.return_value = (fake_img, {"instruction": "do S", "url": "http://s"})
+    fake_env_scroll_only.execute_action.return_value = (fake_img, None, False, False, {"instruction": "do S", "url": "http://s"})
+    fake_env_scroll_only.detect_bot_check.return_value = None
+
+    def scroll_only_agent(screenshot, task_info, history):
+        return {"action": "scroll", "text": "down"}  # 매번 완전히 똑같은 스크롤 액션만 반복
+
+    traj_scroll_only = run_episode(
+        fake_env_scroll_only, {"web": "http://s", "ques": "do S"}, scroll_only_agent,
+        max_steps=10, stuck_repeat_threshold=3,
+    )
+    check(
+        "같은 방향 scroll만 계속 반복해도 stuck으로 안 잡힘(max_steps까지 정상 진행)",
+        traj_scroll_only["blocked"] is False and traj_scroll_only["n_steps"] == 10,
+    )
+
+    # scroll이 다른 액션과 함께 나올 땐, scroll 자체는 안 세도 그 "다른 액션"의 반복은 여전히 잡혀야 함
+    def scroll_plus_repeating_click(screenshot, task_info, history):
+        n = len(history["actions"])
+        return {"action": "scroll", "text": "down"} if n % 2 == 0 else {"action": "left_click", "coordinate": [50, 50]}
+
+    traj_scroll_plus_click = run_episode(
+        fake_env_scroll_only, {"web": "http://s", "ques": "do S"}, scroll_plus_repeating_click,
+        max_steps=10, stuck_repeat_threshold=3,
+    )
+    check(
+        "scroll을 껴서 반복해도, 사이사이의 같은 click 반복은 여전히 stuck으로 잡힘",
+        traj_scroll_plus_click["blocked"] is True,
     )
 
     # --- env가 detect_bot_check()를 아예 제공하지 않는 경우(구버전 env) -> 에러 없이 정상 동작 ---
@@ -1517,8 +1700,14 @@ def _run_mock_selftest():
 
     def _fake_ground(model, instruction, screenshot, **kwargs):
         fake_ground_calls.append((instruction, kwargs))
-        if instruction == "fail me":
+        if instruction in ("fail me", "fail start", "fail end"):
             return {"result": "wrong_format", "point": None, "raw_response": "??"}
+        # drag 시작/끝점이 서로 다른 좌표로 grounding되는지 구분해서 검증하기 위해
+        # instruction별로 다른 point를 반환한다.
+        if instruction == "drag start":
+            return {"result": "positive", "point": [0.1, 0.2], "raw_response": "(100,200)"}
+        if instruction == "drag end":
+            return {"result": "positive", "point": [0.6, 0.8], "raw_response": "(600,800)"}
         return {"result": "positive", "point": [0.25, 0.75], "raw_response": "(250,750)"}
 
     fake_gui_grounding_module = types.ModuleType("gui_grounding")
@@ -1548,11 +1737,49 @@ def _run_mock_selftest():
         )
         check("grounding 실패 -> wait no-op", env_act3["action"] == "wait")
 
-        # drag -> 아직 env 미구현이라 wait no-op으로 다운그레이드
+        # drag -> 시작/끝점 각각 grounding해서 left_click_drag의 start_coordinate/coordinate로 변환
         env_act4 = _convert_planner_action_to_env(
-            {"action": "drag", "target_description": "a", "text": "b"}, None, wide_img, {}
+            {"action": "drag", "target_description": "drag start", "text": "drag end"}, None, wide_img, {}
         )
-        check("drag -> env 미구현이라 wait no-op", env_act4["action"] == "wait")
+        check(
+            "drag -> left_click_drag 액션으로 변환됨",
+            env_act4["action"] == "left_click_drag",
+        )
+        check(
+            "drag -> 시작점이 target_description grounding 결과(0.1,0.2)*[w,h]로 변환됨",
+            env_act4.get("start_coordinate") == [20.0, 20.0],
+        )
+        check(
+            "drag -> 끝점이 text grounding 결과(0.6,0.8)*[w,h]로 변환됨",
+            env_act4.get("coordinate") == [120.0, 80.0],
+        )
+        check(
+            "drag -> ground_fn이 시작점/끝점 각각 한 번씩, 총 2번 호출됨",
+            sum(1 for instr, _ in fake_ground_calls if instr in ("drag start", "drag end")) == 2,
+        )
+
+        # drag: target_description/text 중 하나라도 비어있으면 no-op
+        env_act4b = _convert_planner_action_to_env(
+            {"action": "drag", "target_description": "drag start", "text": ""}, None, wide_img, {}
+        )
+        check("drag -> 끝점 설명 없으면 wait no-op", env_act4b["action"] == "wait")
+
+        # drag: 시작점 grounding 실패 -> wait no-op(끝점은 아예 호출 안 됨)
+        fake_ground_calls.clear()
+        env_act4c = _convert_planner_action_to_env(
+            {"action": "drag", "target_description": "fail start", "text": "drag end"}, None, wide_img, {}
+        )
+        check("drag -> 시작점 grounding 실패 -> wait no-op", env_act4c["action"] == "wait")
+        check(
+            "drag -> 시작점 실패 시 끝점은 grounding 호출조차 안 함(불필요한 호출 방지)",
+            all(instr != "drag end" for instr, _ in fake_ground_calls),
+        )
+
+        # drag: 끝점 grounding 실패 -> wait no-op
+        env_act4d = _convert_planner_action_to_env(
+            {"action": "drag", "target_description": "drag start", "text": "fail end"}, None, wide_img, {}
+        )
+        check("drag -> 끝점 grounding 실패 -> wait no-op", env_act4d["action"] == "wait")
 
         # type/key/scroll/wait 패스스루
         check(
@@ -1609,6 +1836,30 @@ def _run_mock_selftest():
         check(
             "_extract_final_answer -> 어댑터 없는 모델도 그냥 generate() 직접 호출로 동작",
             _extract_final_answer(fake_gm_no_adapter, "q", wide_img) == "some answer",
+        )
+
+        # (2026-08-15 추가 - 실측 버그 재현) GUI-Actor가 "unknown."이라고 답하고 나서 챗 템플릿/
+        # 액션 포맷 토큰을 이어붙여 헛소리를 계속 생성하는 게 실측으로 확인됨(ArXiv--4 태스크
+        # final_answer에 그대로 남음) - 정확 일치("unknown")만 걸러내던 예전 로직은 이 변형을
+        # 못 잡았다. 마커 이후를 잘라내고 구두점 뗀 뒤 비교하는 강화된 로직이 이걸 잡아내는지 확인.
+        fake_gm_leaked = _make_fake_grounding_model("unknown.\nassistantos\npyautogui.click([1] )")
+        check(
+            "_extract_final_answer -> 'unknown.' + 챗템플릿 이탈 텍스트도 None으로 걸러짐(실측 버그 재현)",
+            _extract_final_answer(fake_gm_leaked, "how many papers?", wide_img) is None,
+        )
+
+        # 이탈 마커가 있어도 마커 앞부분이 진짜 답변이면(단순 "unknown"이 아니면) 그 앞부분은 살림
+        fake_gm_leaked_real_answer = _make_fake_grounding_model("42 papers\nassistantos\npyautogui.click([1] )")
+        check(
+            "_extract_final_answer -> 이탈 마커 앞의 진짜 답변은 마커 이후만 잘라내고 살림",
+            _extract_final_answer(fake_gm_leaked_real_answer, "how many papers?", wide_img) == "42 papers",
+        )
+
+        # 구두점만 붙은 변형("unknown!" 등)도 정확 일치가 아니라서 예전엔 못 걸렀음
+        fake_gm_unknown_punct = _make_fake_grounding_model("Unknown!")
+        check(
+            "_extract_final_answer -> 'Unknown!'처럼 대소문자/구두점만 다른 변형도 None으로 걸러짐",
+            _extract_final_answer(fake_gm_unknown_punct, "q", wide_img) is None,
         )
 
         # --- build_planner_grounding_agent_step: planner/gui_grounding을 fake로 갈아끼우고 연동 확인 ---
@@ -1675,11 +1926,16 @@ def _run_mock_selftest():
             check("--no_reflect -> plan_next_action(reflection 없는 쪽) 사용", len(plan_calls) == 1)
 
             # terminate인데 answer가 없으면 agent_step_fn이 answer 추출을 자동으로 태우는지
+            # (2026-08-15 수정) _extract_final_answer가 이제 grounding_model이 아니라
+            # planning_view를 받으므로, 여기서도 fake_planning_view.generate를 채워서 확인한다 -
+            # grounding_model(fake_model_for_answer)은 정말로 호출 안 되는지 확인하는 용도로 남김.
             def _fake_plan_terminate_no_answer(planning_view, instruction, screenshot, history_actions=None, **kw):
                 return {"reasoning": "r", "action": "terminate", "status": "success"}
 
             fake_planner_module.plan_with_reflection = _fake_plan_terminate_no_answer
-            fake_model_for_answer = _make_fake_grounding_model("42")
+            fake_model_for_answer = _make_fake_grounding_model("SHOULD NOT BE USED FOR ANSWER")
+            fake_planning_view.generate.reset_mock()
+            fake_planning_view.generate.return_value = "42"
             agent_step_fn2 = build_planner_grounding_agent_step(
                 fake_model_for_answer, fake_planning_view, use_reflection=True, verbose=False, use_regionfocus=False,
             )
@@ -1688,21 +1944,25 @@ def _run_mock_selftest():
                 "terminate + answer 없음 -> _extract_final_answer로 채워서 env action의 text에 들어감",
                 term_action == {"action": "terminate", "status": "success", "text": "42"},
             )
+            check(
+                "terminate + answer 없음 -> answer 추출은 planning_view로 감(grounding_model 아님)",
+                fake_planning_view.generate.called and not fake_model_for_answer.generate.called,
+            )
 
             # terminate인데 answer가 이미 있으면 추출 호출 자체를 안 해야 함(중복 호출 낭비 방지)
             def _fake_plan_terminate_with_answer(planning_view, instruction, screenshot, history_actions=None, **kw):
                 return {"reasoning": "r", "action": "terminate", "status": "success", "answer": "already have it"}
 
             fake_planner_module.plan_with_reflection = _fake_plan_terminate_with_answer
-            fake_model_should_not_be_called = _make_fake_grounding_model("SHOULD NOT APPEAR")
+            fake_planning_view.generate.reset_mock()
             agent_step_fn3 = build_planner_grounding_agent_step(
-                fake_model_should_not_be_called, fake_planning_view, use_reflection=True, verbose=False, use_regionfocus=False,
+                fake_model_for_answer, fake_planning_view, use_reflection=True, verbose=False, use_regionfocus=False,
             )
             term_action2 = agent_step_fn3(wide_img, {"instruction": "x"}, {"actions": [], "screenshots": []})
             check(
                 "terminate + answer 이미 있음 -> 추출 재호출 안 하고 기존 answer 그대로 사용",
                 term_action2 == {"action": "terminate", "status": "success", "text": "already have it"}
-                and not fake_model_should_not_be_called.generate.called,
+                and not fake_planning_view.generate.called,
             )
 
             # (2026-08-10 추가) reflection이 끝까지 반려(_reflection_approved=False)한 액션은
@@ -2106,7 +2366,27 @@ if __name__ == "__main__":
     # 기존처럼 dummy_agent_step(즉시 실패)로 동작 - 파이프라인 배선만 확인하고 싶을 때는 그대로 둘 것.
     ap.add_argument("--agent_grounding_adapter_dir", default=None,
                      help="grounding LoRA 체크포인트(예: checkpoints/qwen2.5vl-3b-gui-lora-stage2/"
-                          "checkpoint-4130). 지정해야 dummy_agent_step 대신 실제 정책(planner+grounding)이 돈다.")
+                          "checkpoint-4130). 지정해야 dummy_agent_step 대신 실제 정책(planner+grounding)이 돈다. "
+                          "--grounding_backend gui_actor일 때는 무시됨(LoRA 체크포인트 대신 GUI-Actor 사전학습 "
+                          "가중치를 씀).")
+    # [v3 추가] click grounding 백엔드를 통째로 GUI-Actor로 바꿔서 실험. gui_actor_grounding.py
+    # 참고 - microsoft/GUI-Actor-3B-Qwen2.5-VL을 gui_grounding.ground()와 동일한 반환 스키마로
+    # 감싼 어댑터를 쓴다. --planner_backend openai와만 같이 쓸 수 있다(GUI-Actor 모델은 우리
+    # planner LoRA를 얹을 수 있는 멀티 어댑터 PeftModel이 아니라서, 로컬 planner LoRA 공유 구조와
+    # 호환되지 않음). RegionFocus(judge/재탐색)와 reflection(비평 루프)은 둘 다 우리 LoRA 전용
+    # 텍스트 포맷/파이프라인에 결합돼 있어 GUI-Actor에는 못 얹는다 - 아래에서 --use_regionfocus/
+    # --use_reflection이 켜져 있으면 경고를 찍고 자동으로 끈다.
+    ap.add_argument("--grounding_backend", choices=["lora", "gui_actor"], default="lora",
+                     help="lora(기본): --agent_grounding_adapter_dir의 우리 LoRA로 grounding. "
+                          "gui_actor: microsoft/GUI-Actor-3B-Qwen2.5-VL로 grounding(사전학습 가중치, "
+                          "재학습 없이 그대로 씀). --planner_backend openai 필수, RegionFocus/reflection "
+                          "자동으로 꺼짐.")
+    ap.add_argument("--gui_actor_model_id", default="microsoft/GUI-Actor-3B-Qwen2.5-VL",
+                     help="--grounding_backend gui_actor일 때 로드할 HF 모델 id.")
+    ap.add_argument("--gui_actor_attn_implementation", choices=["sdpa", "eager", "flash_attention_2"],
+                     default="sdpa",
+                     help="--grounding_backend gui_actor일 때 attention 구현체. flash-attn을 설치했으면 "
+                          "flash_attention_2로 VRAM을 더 아낄 수 있음, 안 깔았으면 기본(sdpa) 권장.")
     ap.add_argument("--agent_planner_adapter_dir", default=None,
                      help="planner LoRA 체크포인트(예: checkpoints/qwen2.5vl-3b-planner-lora). 지정 안 하면 "
                           "planning은 base 모델(disable_adapter)로 돈다 - agent_loop.py의 load_shared_model 참고. "
@@ -2202,8 +2482,94 @@ if __name__ == "__main__":
                 "API로 도니 로컬 planner LoRA를 로드할 이유가 없음."
             )
 
+        # [v3 추가] --grounding_backend gui_actor는 로컬 planner LoRA를 얹을 수 있는 멀티 어댑터
+        # PeftModel 구조 밖에 있는 별도 모델(microsoft/GUI-Actor-3B-Qwen2.5-VL)이라, planner도
+        # 로컬 LoRA가 아니라 API(OpenAI)로 돌아야만 한다 - load_shared_model() 경로(agent_loop.py)와
+        # 애초에 호환되지 않는다.
+        if args.grounding_backend == "gui_actor" and args.planner_backend != "openai":
+            raise SystemExit(
+                "--grounding_backend gui_actor는 --planner_backend openai와만 같이 쓸 수 있음 - "
+                "GUI-Actor는 우리 planner LoRA를 얹을 수 있는 멀티 어댑터 PeftModel이 아님."
+            )
+        if args.grounding_backend == "gui_actor" and args.reuse_agent_model_for_judge:
+            raise SystemExit(
+                "--grounding_backend gui_actor와 --reuse_agent_model_for_judge는 같이 못 씀 - "
+                "GUI-Actor 모델은 judge가 기대하는 자유형 텍스트 생성(.generate())을 지원하지 않음. "
+                "--judge_backend openai를 쓰거나, --reuse_agent_model_for_judge 없이 --judge_backend "
+                "qwen(별도 로컬 judge 모델을 새로 로드)을 쓸 것."
+            )
+
         agent_model = None
-        if args.agent_grounding_adapter_dir:
+        if args.grounding_backend == "gui_actor":
+            # (v3 수정 - RF 결합) 처음엔 RegionFocus가 우리 LoRA 학습 포맷 전용이라 GUI-Actor와는
+            # 무조건 호환 안 된다고 보고 여기서 자동으로 껐었다. gui_actor_region_focus.py로
+            # RegionFocus 알고리즘(judge/재탐색/crop-zoom/aggregation)을 GUI-Actor 위에서 재현했으므로
+            # (judge/aggregation은 GUIActorModel.generate()로 하는 일반 텍스트 QA라 그대로 재사용 가능,
+            # 재탐색은 GUI-Actor가 한 번의 forward pass에서 주는 topk 후보를 재사용해서 추가 호출 없이
+            # 대체) 이제 --use_regionfocus를 그대로 존중한다 - 더 이상 여기서 강제로 끄지 않는다.
+            #
+            # reflection(비평 루프)은 여전히 기본 꺼둔다 - GUIActorModel.generate()가 기술적으로는
+            # 되지만(위와 같은 근거), reflection이 요구하는 구조화된 JSON 비평 포맷은 GUI-Actor가
+            # 학습에서 한 번도 못 본 형태라 출력 품질이 검증되지 않았다. planner LoRA에 tool-call
+            # 포맷을 줬을 때 grounding이 깨졌던 것과 같은 종류의 리스크라, 여기서는 보수적으로
+            # 자동으로 끈다 - 직접 --no_reflect 없이 켜보고 싶으면 이 if 블록을 지우면 된다.
+            if args.use_reflection:
+                print(
+                    "[gui_actor_eval_webvoyager.py] 주의: --grounding_backend gui_actor는 reflection을 기본적으로 "
+                    "끕니다(--no_reflect와 동일 효과) - GUIActorModel.generate()로 기술적으로는 가능하지만, "
+                    "reflection의 구조화된 JSON 비평 포맷은 GUI-Actor가 학습에서 본 적 없어 출력 품질이 "
+                    "검증되지 않았음."
+                )
+                args.use_reflection = False
+
+            from gui_actor_grounding import GUIActorModel
+            from api_planner import OpenAIPlannerModel
+
+            agent_model = GUIActorModel(
+                model_id=args.gui_actor_model_id,
+                attn_implementation=args.gui_actor_attn_implementation,
+                # (v3 수정 - 버그) 처음엔 여기서 min_pixels/max_pixels를 안 넘겨서, 기존 LoRA
+                # 경로가 쓰는 --min_pixels/--max_pixels가 GUI-Actor 경로에서는 조용히 무시되고
+                # GUI-Actor 자체 프로세서 기본 해상도로만 돌고 있었다. gui_actor_grounding.
+                # GUIActorModel이 이제 이 값을 프로세서 로드 시점에 받아서 실제로 해상도를
+                # 통제한다(gui_actor_grounding.py의 GUIActorModel.__init__ 주석 참고).
+                min_pixels=args.min_pixels,
+                max_pixels=args.max_pixels,
+            )
+            planning_view = OpenAIPlannerModel(
+                model=args.planner_api_model,
+                api_key=args.api_key,
+                base_url=args.planner_api_base_url,
+            )
+            print(
+                f"[gui_actor_eval_webvoyager.py] grounding backend = GUI-Actor ({args.gui_actor_model_id!r}), "
+                f"planner backend = OpenAI API (model={args.planner_api_model!r})"
+            )
+
+            agent_step_fn = build_planner_grounding_agent_step(
+                agent_model, planning_view,
+                use_reflection=args.use_reflection, max_iterations=args.max_iterations,
+                ground_min_pixels=args.min_pixels, ground_max_pixels=args.max_pixels,
+                debug_dir=None if args.no_debug_dump else args.debug_dir,
+                debug_save_images=not args.no_debug_images,
+                use_regionfocus=args.use_regionfocus,
+                regionfocus_debug_image=args.regionfocus_debug_image,
+                regionfocus_debug_text=args.regionfocus_debug_text,
+                regionfocus_step1_format=args.regionfocus_step1_format,
+                regionfocus_step4_format=args.regionfocus_step4_format,
+                grounding_backend="gui_actor",
+            )
+            if not args.no_debug_dump:
+                print(f"[gui_actor_eval_webvoyager.py] 태스크별 프롬프트/응답 덤프 경로: {os.path.abspath(args.debug_dir)}")
+            print(
+                "[gui_actor_eval_webvoyager.py] click grounding = GUI-Actor(coordinate-free pointer) + "
+                + (
+                    "RegionFocus(gui_actor_region_focus.py 재현판: judge/재탐색/crop-zoom/aggregation)"
+                    if args.use_regionfocus
+                    else "초기 grounding 1회만(--no_regionfocus)"
+                )
+            )
+        elif args.agent_grounding_adapter_dir:
             model_kwargs = {}
             if args.min_pixels is not None:
                 model_kwargs["min_pixels"] = args.min_pixels
@@ -2224,7 +2590,7 @@ if __name__ == "__main__":
                     base_url=args.planner_api_base_url,
                 )
                 print(
-                    f"[eval_webvoyager.py] planner backend = OpenAI API (model={args.planner_api_model!r}) "
+                    f"[gui_actor_eval_webvoyager.py] planner backend = OpenAI API (model={args.planner_api_model!r}) "
                     "- grounding은 그대로 로컬 LoRA(--agent_grounding_adapter_dir). reflection은 "
                     "기존과 동일하게 로컬 base 모델(disable_adapter)로 돈다(build_planner_grounding_"
                     "agent_step이 grounding_model 기준으로 reflection_view를 만들기 때문에 이 분기와 "
@@ -2250,19 +2616,21 @@ if __name__ == "__main__":
                 regionfocus_debug_text=args.regionfocus_debug_text,
                 regionfocus_step1_format=args.regionfocus_step1_format,
                 regionfocus_step4_format=args.regionfocus_step4_format,
+                grounding_backend="lora",
             )
             if not args.no_debug_dump:
-                print(f"[eval_webvoyager.py] 태스크별 프롬프트/응답 덤프 경로: {os.path.abspath(args.debug_dir)}")
+                print(f"[gui_actor_eval_webvoyager.py] 태스크별 프롬프트/응답 덤프 경로: {os.path.abspath(args.debug_dir)}")
             print(
-                f"[eval_webvoyager.py] click grounding = "
+                f"[gui_actor_eval_webvoyager.py] click grounding = "
                 f"{'RegionFocus(재탐색+crop/zoom 정밀화)' if args.use_regionfocus else 'plain gui_grounding.ground()(초기 grounding 1회)'}"
                 + (" - 꺼져 있음(--no_regionfocus)" if not args.use_regionfocus else "")
             )
         else:
             print(
-                "[eval_webvoyager.py] 주의: --agent_grounding_adapter_dir 미지정 -> agent_step_fn이 "
-                "dummy_agent_step()(항상 즉시 종료)임. 실제 정책을 돌리려면 --agent_grounding_adapter_dir"
-                "(+ 선택적으로 --agent_planner_adapter_dir)를 지정할 것."
+                "[gui_actor_eval_webvoyager.py] 주의: --agent_grounding_adapter_dir 미지정, --grounding_backend gui_actor도 "
+                "아님 -> agent_step_fn이 dummy_agent_step()(항상 즉시 종료)임. 실제 정책을 돌리려면 "
+                "--agent_grounding_adapter_dir(+ 선택적으로 --agent_planner_adapter_dir) 또는 "
+                "--grounding_backend gui_actor를 지정할 것."
             )
             agent_step_fn = dummy_agent_step
 
@@ -2281,7 +2649,7 @@ if __name__ == "__main__":
                 # --adapter_dir를 따로 지정하지 않았으면(=judge에 특정 LoRA가 필요한 게 아니면)
                 # 그냥 agent 모델을 base로 재사용하도록 자동으로 권장 경로를 태움.
                 print(
-                    "[eval_webvoyager.py] agent 모델이 이미 로드돼 있어서 judge용 별도 모델 로드를 "
+                    "[gui_actor_eval_webvoyager.py] agent 모델이 이미 로드돼 있어서 judge용 별도 모델 로드를 "
                     "건너뛰고 agent 모델을 base로 재사용함(VRAM 절약). 원치 않으면 --adapter_dir를 "
                     "명시하거나 코드에서 이 자동 재사용 분기를 끌 것."
                 )
