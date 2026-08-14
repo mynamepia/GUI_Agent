@@ -47,6 +47,7 @@ generate() 기반 click accuracy(+ Wave-UI/ScreenSpot-v2 breakdown)를 한 번 �
 import argparse
 import json
 import os
+import sys
 
 import torch
 from peft import LoraConfig, PeftModel, get_peft_model
@@ -54,6 +55,13 @@ from PIL import Image
 from qwen_vl_utils import process_vision_info
 from torch.utils.data import Dataset
 from transformers import Trainer, TrainingArguments
+
+# (grounding/ 폴더로 이동) coord_utils.py/qwen.py는 여전히 vlm_agent/ 루트에 있으므로
+# agent/eval_webvoyager.py와 동일한 패턴으로 부모 디렉토리를 sys.path에 넣어 부트스트랩한다.
+_HERE = os.path.dirname(os.path.abspath(__file__))
+_PARENT = os.path.abspath(os.path.join(_HERE, ".."))
+if os.path.isfile(os.path.join(_PARENT, "qwen.py")) and _PARENT not in sys.path:
+    sys.path.insert(0, _PARENT)
 
 from coord_utils import PROMPT_TEMPLATE, build_target_text, load_jsonl
 from evaluation import format_report, run_generation_eval

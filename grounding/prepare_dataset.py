@@ -20,8 +20,8 @@ unified schema:
 }
 
 사용법:
-  python data/prepare_dataset.py --train_samples 4000 --val_samples 500 --out_dir ./data/processed
-  python data/prepare_dataset.py --train_samples 10000 --val_samples 500 \
+  python grounding/prepare_dataset.py --train_samples 4000 --val_samples 500 --out_dir ./data/processed
+  python grounding/prepare_dataset.py --train_samples 10000 --val_samples 500 \
       --platform_quota "web=0.4,mobile=0.3,desktop=0.3"
 """
 
@@ -232,45 +232,6 @@ def main():
     test_records = prepare_screenspot_v2(out_root, args.test_samples)
     write_jsonl(test_records, out_root / "test.jsonl")
 
-import json
-from collections import defaultdict
-from statistics import mean, median
-
-# 데이터 분포 출력
-def stats(path):
-    platform_ratios = defaultdict(list)
-    with open(path, "r", encoding="utf-8") as f:
-        for line in f:
-            rec = json.loads(line)
-
-            bbox = rec["bbox"]
-            width_img, height_img = rec["resolution"]
-            platform = rec.get("platform", "unknown")
-
-            x1, y1, x2, y2 = bbox
-
-            bbox_w = max(0, x2 - x1)
-            bbox_h = max(0, y2 - y1)
-
-            bbox_area = bbox_w * bbox_h
-            image_area = width_img * height_img
-
-            ratio = bbox_area / image_area
-
-            platform_ratios[platform].append(ratio)
-            
-    for platform, ratios in sorted(platform_ratios.items()):
-        ratios_pct = [r * 100 for r in ratios]
-
-        print(f"\n[{platform}]")
-        print(f"n                : {len(ratios)}")
-        print(f"avg bbox ratio   : {mean(ratios_pct):.4f}%")
-        print(f"median bbox ratio: {median(ratios_pct):.4f}%")
-        print(f"min              : {min(ratios_pct):.4f}%")
-        print(f"max              : {max(ratios_pct):.4f}%")
-
 
 if __name__ == "__main__":
-    # main()
-    stats("data/processed/train.jsonl")
-    stats("data/processed/val.jsonl")
+    main()
