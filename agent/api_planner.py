@@ -40,8 +40,51 @@ openai 미설치 환경에서도 이 파일 import/선택은 문제없음, eval_
 
 import base64
 import io
+import time
 
 DEFAULT_OPENAI_PLANNER_MODEL = "gpt-4o"
+
+
+def _is_rate_limit_error(e: Exception) -> bool:
+    """
+    (2026-08-11 추가 - 실측 크래시 대응) 실제 실행에서 TPM(분당 토큰) rate limit(HTTP 429)에
+    걸려서 배치 전체가 죽는 걸 확인했다 - 재시도 없이 그대로 RuntimeError를 올리던 게 원인.
+    openai 패키지가 있으면 RateLimitError 타입으로 정확히 판별하고, 없거나(예: 테스트에서
+    openai를 mock 모듈로 대체한 경우) 다른 예외 타입으로 감싸져 온 경우엔 메시지 문자열로
+    폴백 판별한다.
+    """
+    try:
+        from openai import RateLimitError
+
+        if isinstance(e, RateLimitError):
+            return True
+    except ImportError:
+        pass
+    msg = str(e).lower()
+    return "429" in msg or "rate_limit" in msg or "rate limit" in msg
+
+
+def _call_with_retry(fn, max_retries=5, base_delay=1.0, max_delay=60.0, on_retry=None):
+    """
+    (2026-08-11 추가) fn()을 호출하고, rate limit(429) 에러면 지수 백오프(1s -> 2s -> 4s ->
+    ... -> max_delay 상한)로 최대 max_retries번까지 재시도한다. rate limit이 아닌 다른
+    에러는 즉시 그대로 재발생(네트워크 끊김/인증 실패 등을 무한정 재시도하면 안 되므로).
+    max_retries를 다 쓰고도 여전히 rate limit이면 마지막 에러를 그대로 올린다.
+    on_retry(attempt, delay, exc): 재시도할 때마다 호출되는 선택적 콜백(로깅/테스트용).
+    """
+    delay = base_delay
+    attempt = 0
+    while True:
+        try:
+            return fn()
+        except Exception as e:  # noqa: BLE001
+            if not _is_rate_limit_error(e) or attempt >= max_retries:
+                raise
+            if on_retry:
+                on_retry(attempt + 1, delay, e)
+            time.sleep(delay)
+            delay = min(delay * 2, max_delay)
+            attempt += 1
 
 
 def _pil_to_data_url(image) -> str:
@@ -102,11 +145,15 @@ class OpenAIPlannerModel:
         api_key: str | None = None,
         base_url: str | None = None,
         request_timeout: float = 60.0,
+        max_retries: int = 5,
+        retry_base_delay: float = 1.0,
     ):
         self.model = model
         self._api_key = api_key
         self._base_url = base_url
         self._request_timeout = request_timeout
+        self._max_retries = max_retries
+        self._retry_base_delay = retry_base_delay
         self._client = None  # lazy - 실제 generate() 호출 시점에만 openai 패키지/클라이언트 생성
 
     def _get_client(self):
@@ -141,14 +188,25 @@ class OpenAIPlannerModel:
         else:
             kwargs["temperature"] = 0
 
+        def _on_retry(attempt, delay, exc):
+            print(
+                f"[api_planner.py] rate limit(429) 감지 - {delay:.1f}초 대기 후 재시도 "
+                f"({attempt}/{self._max_retries}): {exc}"
+            )
+
         try:
-            resp = client.chat.completions.create(**kwargs)
+            resp = _call_with_retry(
+                lambda: client.chat.completions.create(**kwargs),
+                max_retries=self._max_retries, base_delay=self._retry_base_delay, on_retry=_on_retry,
+            )
         except Exception as e:  # noqa: BLE001
             # 로컬 QwenVLModel.generate()는 실패하면 예외를 그대로 던지는 게 기본 동작이라
             # (별도 폴백 없음), 인터페이스 일관성을 맞추려고 여기서도 삼키지 않고 그대로
             # 올린다 - planner.py._parse_planner_action()이 이미 "generate()가 이상한/빈
             # 문자열을 반환하는 경우"에 대한 폴백을 갖고 있지만, "API 호출 자체가 실패"하는
             # 경우까지 조용히 흡수해서 빈 문자열을 돌려주면 원인 파악이 더 어려워진다.
+            # (2026-08-11 추가) rate limit(429)만 위 _call_with_retry가 자동 재시도하고,
+            # 그래도 다 소진되거나 다른 종류의 에러면 여기로 내려와서 RuntimeError로 올라간다.
             raise RuntimeError(f"[api_planner.py] OpenAI API 호출 실패: {e}") from e
 
         return resp.choices[0].message.content or ""
@@ -231,13 +289,99 @@ def _run_mock_selftest():
         check("temperature>0 -> temperature/top_p 그대로 전달됨", call_kwargs2["temperature"] == 0.7 and call_kwargs2["top_p"] == 0.9)
 
         # API 호출 자체가 실패하면 삼키지 않고 RuntimeError로 재발생
+        fake_client.chat.completions.create.reset_mock()
         fake_client.chat.completions.create.side_effect = ConnectionError("network down")
         try:
             planner_model.generate(qwen_messages)
             check("API 호출 실패 -> RuntimeError로 재발생", False)
         except RuntimeError as e:
             check("API 호출 실패 -> RuntimeError로 재발생", "OpenAI API 호출 실패" in str(e))
+
+        # (2026-08-11 추가) rate limit(429)이 아닌 에러는 재시도 없이 즉시 실패해야 함
+        # (네트워크 끊김/인증 실패를 무한정 재시도하면 안 되므로) - 위 ConnectionError 테스트에서
+        # create()가 정확히 1번만 호출됐는지로 확인.
+        check("rate limit이 아닌 에러 -> 재시도 없이 1번만 호출됨", fake_client.chat.completions.create.call_count == 1)
     finally:
+        del sys.modules["openai"]
+
+    # --- (2026-08-11 추가) _is_rate_limit_error / _call_with_retry ---
+    check("_is_rate_limit_error -> '429' 포함되면 True", _is_rate_limit_error(Exception("Error code: 429 - rate_limit_exceeded")))
+    check("_is_rate_limit_error -> 'rate_limit' 포함되면 True", _is_rate_limit_error(Exception("rate_limit exceeded")))
+    check("_is_rate_limit_error -> 무관한 에러는 False", not _is_rate_limit_error(ConnectionError("network down")))
+
+    orig_sleep = time.sleep
+    time.sleep = lambda *a, **k: None  # 재시도 백오프 대기 때문에 테스트가 느려지는 것 방지
+    try:
+        # 2번 실패(rate limit) 후 3번째에 성공 -> 재시도로 결국 성공해야 함
+        call_log = []
+
+        def _flaky():
+            call_log.append(1)
+            if len(call_log) < 3:
+                raise Exception("Error code: 429 - rate_limit_exceeded")
+            return "ok"
+
+        retry_log = []
+        result_ok = _call_with_retry(
+            _flaky, max_retries=5, base_delay=0.01,
+            on_retry=lambda attempt, delay, exc: retry_log.append(attempt),
+        )
+        check("_call_with_retry -> 2번 실패 후 3번째에 성공", result_ok == "ok" and len(call_log) == 3)
+        check("_call_with_retry -> on_retry가 실패 횟수만큼 호출됨", retry_log == [1, 2])
+
+        # rate limit이 계속되면 max_retries만큼만 재시도하고 결국 그 에러를 그대로 올림
+        always_fail_calls = {"n": 0}
+
+        def _always_fail():
+            always_fail_calls["n"] += 1
+            raise Exception("Error code: 429 - rate_limit_exceeded")
+
+        try:
+            _call_with_retry(_always_fail, max_retries=3, base_delay=0.01)
+            check("_call_with_retry -> max_retries 소진 후에도 계속 실패하면 예외 재발생", False)
+        except Exception as e:
+            check("_call_with_retry -> max_retries 소진 후에도 계속 실패하면 예외 재발생", "429" in str(e))
+        check("_call_with_retry -> 최초 시도 + max_retries(3) = 총 4번 호출", always_fail_calls["n"] == 4)
+
+        # rate limit이 아닌 에러는 즉시(재시도 없이) 재발생
+        non_rate_limit_calls = {"n": 0}
+
+        def _fail_other():
+            non_rate_limit_calls["n"] += 1
+            raise ConnectionError("network down")
+
+        try:
+            _call_with_retry(_fail_other, max_retries=5, base_delay=0.01)
+            check("_call_with_retry -> rate limit 아니면 재시도 없이 즉시 실패", False)
+        except ConnectionError:
+            check("_call_with_retry -> rate limit 아니면 재시도 없이 즉시 실패", True)
+        check("_call_with_retry -> rate limit 아니면 1번만 호출됨(재시도 안 함)", non_rate_limit_calls["n"] == 1)
+    finally:
+        time.sleep = orig_sleep
+
+    # --- (2026-08-11 추가) OpenAIPlannerModel.generate()가 429를 자동 재시도로 흡수하는지 통합 확인 ---
+    fake_response_retry = MagicMock()
+    fake_response_retry.choices = [MagicMock(message=MagicMock(content='{"reasoning":"r","action":"wait"}'))]
+    fake_client_retry = MagicMock()
+    fake_client_retry.chat.completions.create.side_effect = [
+        Exception("Error code: 429 - rate_limit_exceeded"),
+        fake_response_retry,
+    ]
+    fake_openai_module_retry = types.ModuleType("openai")
+    fake_openai_module_retry.OpenAI = MagicMock(return_value=fake_client_retry)
+    sys.modules["openai"] = fake_openai_module_retry
+    orig_sleep2 = time.sleep
+    time.sleep = lambda *a, **k: None
+    try:
+        planner_model_retry = OpenAIPlannerModel(model="gpt-4o-test", retry_base_delay=0.01)
+        result_retry = planner_model_retry.generate(qwen_messages)
+        check(
+            "generate() -> 429 한 번은 자동 재시도로 흡수하고 결국 정상 응답 반환",
+            result_retry == '{"reasoning":"r","action":"wait"}',
+        )
+        check("generate() -> create()가 재시도 포함 2번 호출됨", fake_client_retry.chat.completions.create.call_count == 2)
+    finally:
+        time.sleep = orig_sleep2
         del sys.modules["openai"]
 
     # --- planner.py와의 실제 연동 확인 (duck-typing 인터페이스 검증) ---
