@@ -1,71 +1,59 @@
 # agent-project
 
+- Goal: build a GUI agent that can browse and operate real websites (WebVoyager benchmark), under a 16GB VRAM budget (RTX 5070ti + 16GB system shared memory as an OOM buffer).
+- The project supports **two interchangeable pipelines**, selectable per run:
+  - **Track A — local LoRA** (`agent/`): a single QwenVL-3B instance with separate qLoRA adapters for planning and grounding.
+  - **Track B — GUI-Actor + API planner** (`agent-actor3b/`): grounding via the pretrained `microsoft/GUI-Actor-3B-Qwen2.5-VL` (coordinate-free pointer model), planning via an OpenAI vision model (GPT-4o).
+- Both tracks share the same execution/evaluation layer (`env_webvoyager.py`, `planner.py`).
 
-- QwenVL-3B model. Goal: build a GUI agent under a constrained environment (16GB RAM).
-- The QwenVL-3B model has separate qLoRA fine-tunes for planning and grounding.
-- To compensate for weak grounding, the system from the RegionFocus paper is used.
-
-## Architecture
+## Track A — local LoRA pipeline (`agent/`)
 
 ### 1. Model — single instance, LoRA adapter switching (`agent_loop.py`)
 
-Running separate model instances for planning and grounding would exceed the 16GB RAM budget (CPU-only, no CUDA), so the project loads **one QwenVL-3B instance** with two named LoRA adapters attached at once (`default` = grounding, `planner`), and switches between them at runtime via `peft`'s `set_adapter()` / `disable_adapter()`.
+Loads **one QwenVL-3B instance** with two named LoRA adapters attached at once (`default` = grounding, `planner`), switching between them at runtime via `peft`'s `set_adapter()` / `disable_adapter()` instead of running two separate model instances.
 
-- `_AdapterSwitchView`: switches to the `planner` adapter only for the duration of a planning call, then restores `default` (grounding) afterward — restoration is guaranteed via `finally` even if generation raises.
-- `_BaseModelView`: for setups without a planner LoRA, planning instead runs under `disable_adapter()` (pure base model behavior).
-- Both LoRAs only train `target_modules=["q_proj","k_proj","v_proj","o_proj"]`, so the vision encoder is identical regardless of which adapter is active — "how well the model sees the screen" never changes; only the output format (coordinates vs. JSON action) does.
+- `_AdapterSwitchView`: switches to the `planner` adapter for a planning call, restores `default` afterward.
+- `_BaseModelView`: runs a call with adapters disabled (pure base model) — used for reflection/critic calls and final-answer QA, since those output formats were never seen during LoRA training.
 
 ### 2. Planner (`planner.py`)
 
-Prompts the base/planner-LoRA model in a ReAct style to decide **a single next action** as JSON. It never outputs coordinates — click-type actions only produce a natural-language `target_description`, deferring the actual coordinate lookup to grounding.
+Prompts the model (local LoRA, or an OpenAI vision model via `api_planner.py`) in a ReAct style to decide **a single next action** as JSON. Click-type actions produce a natural-language `target_description` only, not coordinates — grounding resolves that separately.
 
 ```json
 {"reasoning": "...", "action": "left_click|...|terminate",
  "target_description": "...", "text": "...", "status": "...", "answer": "..."}
 ```
 
-**Pre-execution review loop (`plan_with_reflection`)**: a separate critic call reviews the candidate action before it is ever executed.
-- The reflector always re-observes the screenshot independently first, rather than taking the proposer's stated reasoning at face value.
-- If rejected, the critique is fed back into the planner for a revised attempt (default `max_iterations=2`).
-- If still rejected after all iterations, the action is not executed — but the rejection itself is recorded in history via `_rejected` / `_rejection_reason`, so the next step's planner knows the previous attempt failed and doesn't just repeat it.
+- `plan_with_reflection`: a critic call reviews each candidate action before execution and can reject it with feedback for a revised attempt.
+- History formatting includes repetition detection (`REPETITION WARNING`) so the planner is nudged away from actions that aren't making progress. `scroll` is excluded from this check.
 
 ### 3. Grounding — RegionFocus (`region_focus.py`)
 
-Converts a `target_description` into pixel coordinates using a local reproduction of the RegionFocus paper's pipeline:
+Converts a `target_description` into pixel coordinates: initial grounding → self-judge (YES/NO) → retry at higher temperature if rejected → crop/zoom re-inference → aggregation if multiple candidates remain. Coordinates are queried in the LoRA's fine-tuned text format (0–1000 normalized `(x,y)`).
 
-1. Initial grounding (one coordinate inference pass)
-2. Judge — the model itself decides YES/NO on whether the predicted point is correct
-3. If wrong, `region_focus()` retries at increasing temperatures to find a new candidate
-4. Crop + upsample around the candidate at 4 different zoom ratios and re-infer more precisely (Step 4)
-5. If multiple candidates remain, have the model pick the best one (aggregation)
+## Track B — GUI-Actor pipeline (`agent-actor3b/`)
 
-Coordinates are queried using the exact format the grounding LoRA was fine-tuned on (0–1000 normalized text, `(x,y)`) — using a tool-call schema instead measurably hurt accuracy, since the LoRA never saw that format during training.
+### `gui_actor_grounding.py` / `gui_actor_region_focus.py`
 
-### 4. Execution environment (`env_webvoyager.py`)
+Wraps `microsoft/GUI-Actor-3B-Qwen2.5-VL`, a pretrained coordinate-free pointer model that attends over image patches and returns click points directly (no text coordinates). `gui_actor_region_focus.py` reimplements the same RegionFocus pipeline as Track A on top of GUI-Actor's output.
 
-A Selenium-based wrapper targeting the WebVoyager benchmark (live websites). It only handles `reset(task) → screenshot` and `execute_action(action) → screenshot` — it does not compute reward or success (that's the evaluation layer's job, via an LLM judge).
+### `eval_webvoyager_v3.py`
 
-- Coordinate clicks/scrolls use **CDP (`Input.dispatchMouseEvent`, etc.)** directly instead of Selenium ActionChains, to guarantee the same coordinate space as the screenshot.
-- Includes headless-automation-detection workarounds (spoofed user agent, removing `navigator.webdriver`, etc.).
+`build_planner_grounding_agent_step()` wires planner + grounding + env into one policy function. `--grounding_backend {lora, gui_actor}` and `--planner_backend {local, openai}` select which track's components are used. Also implements `drag` (start/end description each grounded separately, executed as a `left_click_drag` env action) and final-answer extraction for `terminate` actions missing an `answer` field (routed through the planner model, not the grounding model).
 
-### 5. Wiring the policy together — Planner + Grounding + Env (`eval_webvoyager.py`)
+## Execution environment (`env_webvoyager.py`)
 
-`build_planner_grounding_agent_step()` combines the pieces above into a single policy function:
+Selenium-based wrapper for live WebVoyager sites, shared by both tracks. `reset(task) → screenshot` / `execute_action(action) → screenshot` only — no reward/success logic (that's the evaluation layer's job).
 
-```
-screenshot → plan_with_reflection() [planner LoRA, retried/rejected until approved]
-           → target_description resolved to coordinates via ground_with_regionfocus() [grounding LoRA]
-           → env.execute_action(coordinate-based action)
-```
+- Clicks/scrolls/drags dispatched via CDP (`Input.dispatchMouseEvent`) instead of Selenium ActionChains.
+- Automation-detection workarounds (spoofed user agent, `navigator.webdriver` removal) and CAPTCHA/bot-check detection with optional manual-solve support.
+- Per-site locale forcing (cookies for Amazon/Apple, URL params for Google/Booking) so non-US IPs don't get served the wrong language/currency.
+- New-tab handling (site opens content in a new tab → focus follows it) and a page-load wait before each screenshot.
 
-- The reflection/critic call always runs with the planner LoRA disabled (base model), since the planner LoRA has never seen the critic's expected output format.
-- If a `terminate` action has no final answer filled in, a separate QA call extracts one (the planner LoRA's training data never populated this field, so it can't be fixed by retraining alone).
-- When an action gets silently downgraded to a no-op (grounding failure, unimplemented drag, etc.), that fact is explicitly recorded in history too — so the next planning step knows the previous attempt didn't actually happen and doesn't just retry blindly.
+## Evaluation (`eval_webvoyager.py` / `eval_webvoyager_v3.py`)
 
-### 6. Evaluation (`eval_webvoyager.py` — `run_episode` / `run_batch`)
+`run_episode` / `run_batch`: each task runs up to `max_steps` (default 17), then the last few screenshots go to an LLM judge (local Qwen or GPT-4o) for a success verdict, optionally by majority vote over multiple judge calls. A windowed repeat-action detector ends an episode early if it's clearly stuck (excluding `scroll`).
 
-Each task runs for up to `max_steps` (default 15). The last 15 screenshots are shown to an LLM judge (local Qwen or OpenAI GPT-4o, selectable) to determine success. The judge isn't trusted on a single call — it runs 3 times by default and the final verdict is decided by majority vote.
+## Testing strategy
 
-### 7. Testing strategy
-
-Every module (except `region_focus.py`) has a mock-based `--selftest` that verifies logic without needing a real model or browser. Model calls are replaced with `MagicMock`, so prompt assembly, parsing, and state handling (e.g. how a rejected action gets recorded in history) can be checked quickly — actual accuracy is still verified separately in an environment with a real GPU/browser.
+Every module has a mock-based `--selftest` (no real model/browser needed) covering prompt assembly, parsing, and state handling. Actual accuracy is verified separately with a real GPU/browser.
