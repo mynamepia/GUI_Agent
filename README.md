@@ -6,6 +6,12 @@
   - **Track B — GUI-Actor + API planner** (`agent-actor3b/`): grounding via the pretrained `microsoft/GUI-Actor-3B-Qwen2.5-VL` (coordinate-free pointer model), planning via an OpenAI vision model (GPT-4o).
 - Both tracks share the same execution/evaluation layer (`env_webvoyager.py`, `planner.py`).
 
+## Repository layout
+
+- **root** (`qwen.py`, `gui_grounding.py`, `region_focus.py`, `coord_utils.py`): shared inference-time modules — model loader, the RegionFocus grounding pipeline, and coordinate/text parsing — used at runtime by both Track A and Track B.
+- **`planner/`**: training the **planner LoRA** (predicts the ReAct JSON action, not coordinates). Includes curating/fetching the AgentNet dataset (`curate_agentnet.py`, `fetch_agentnet_images.py`, plus `remote_zip.py`/`zip_multivol.py` to pull only the needed images out of AgentNet's ~184GB split-zip archive via HTTP range requests instead of downloading it whole), converting that into SFT format (`prepare_planner_dataset.py`), and training (`train_planner.py`).
+- **`grounding/`**: training/evaluating the **grounding LoRA** (predicts click coordinates as normalized `(x,y)` text). Dataset prep from Wave-UI/ScreenSpot-v2 (`prepare_dataset.py`, `prepare_dataset_stage2.py`), training (`train.py`), and evaluation (`test.py`, `evaluation.py`, `eval_regionfocus.py` for click-accuracy against a test/val set).
+
 ## Track A — local LoRA pipeline (`agent/`)
 
 ### 1. Model — single instance, LoRA adapter switching (`agent_loop.py`)
