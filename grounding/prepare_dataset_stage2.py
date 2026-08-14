@@ -16,7 +16,7 @@ Stage 2용 데이터 준비 스크립트.
   있어서, desktop/mobile을 소량(rehearsal_ratio) 섞어 Stage 1에서 얻은 성능을 보존한다.
 
 사용법:
-  python data/prepare_dataset_stage2.py \
+  python grounding/prepare_dataset_stage2.py \
       --train_jsonl data/processed/train.jsonl \
       --out data/processed/train_stage2.jsonl \
       --rehearsal_ratio 0.2

@@ -57,6 +57,14 @@ import time
 
 from tqdm import tqdm
 
+# (grounding/ 폴더로 이동) coord_utils.py/qwen.py/gui_grounding.py/region_focus.py는 여전히
+# vlm_agent/ 루트에 있으므로 agent/eval_webvoyager.py와 동일한 패턴으로 부모 디렉토리를
+# sys.path에 넣어 부트스트랩한다.
+_HERE = os.path.dirname(os.path.abspath(__file__))
+_PARENT = os.path.abspath(os.path.join(_HERE, ".."))
+if os.path.isfile(os.path.join(_PARENT, "qwen.py")) and _PARENT not in sys.path:
+    sys.path.insert(0, _PARENT)
+
 from coord_utils import load_jsonl
 from evaluation import aggregate_metrics, format_report
 from qwen import QwenVLModel, DEFAULT_MIN_PIXELS, DEFAULT_MAX_PIXELS
