@@ -180,6 +180,13 @@ or reconsidering whether your assumption about the current screen is correct). I
 you are stuck in this way, it will be called out explicitly with a "REPETITION WARNING" - treat that
 as a hard requirement to change strategy, not a suggestion.
 
+If the task asks for a specific number of items (e.g. "find 5 restaurants", "list 3 flights"),
+count how many qualifying items you have already confirmed before terminating. Do not terminate
+until you have that many, unless you are confident no more matching items exist on the site - if
+you have fewer than requested, keep scrolling, searching, or adjusting filters instead of stopping
+early with a partial answer. Tasks that do not mention a specific count (e.g. "find the cheapest
+one") are not affected by this rule.
+
 Reply with ONLY a single JSON object with these fields (omit fields that don't apply to your
 chosen action): {{"reasoning": "...", "action": "...", "target_description": "...", "text": "...",
 "status": "...", "answer": "..."}}
@@ -303,7 +310,16 @@ def _is_similar_action(a: dict, b: dict) -> bool:
     if act in ("type", "key"):
         return (a.get("text") or "").strip().lower() == (b.get("text") or "").strip().lower()
     if act == "scroll":
-        return (a.get("text") or "down").strip().lower() == (b.get("text") or "down").strip().lower()
+        # (2026-08-15 수정) 예전엔 방향(up/down)이 같으면 "같은 시도"로 쳐서 반복 경고를 냈는데,
+        # 이게 "개수가 명시된 태스크는 목표 개수를 채울 때까지 계속 스크롤/탐색하라"는 최근
+        # 프롬프트 지침(_SYSTEM_PROMPT 참고)과 정면으로 충돌하는 게 실측으로 확인됨(Booking 배치:
+        # 같은 방향으로 정상적으로 몇 번 스크롤했을 뿐인데 REPETITION WARNING이 떠서 모델이
+        # 스크롤을 그만두고 다른 전략으로 갈아탐 - 목록을 끝까지 훑어보기 전에 포기하게 만드는
+        # 부작용). 스크롤은 매번 페이지의 새로운 부분을 보여주는 정상적인 탐색 행위라 반복 자체가
+        # "제자리걸음"이라는 신호가 아니므로, 여기서는 항상 "다른 시도"로 취급해서 스크롤이
+        # 반복 경고를 유발하지 못하게 뺀다. 정말로 끝까지 스크롤해도 진전이 없는 경우는
+        # max_steps로 자연스럽게 막힌다.
+        return False
     if act == "wait":
         return True
     if act == "back":
@@ -840,8 +856,9 @@ def _run_mock_selftest():
         not _is_similar_action({"action": "left_click", "target_description": "x"}, {"action": "scroll", "text": "down"}),
     )
     check(
-        "_is_similar_action -> scroll은 방향까지 같아야 동일",
-        _is_similar_action({"action": "scroll", "text": "down"}, {"action": "scroll", "text": "DOWN"})
+        "_is_similar_action -> (2026-08-15 수정) scroll은 방향이 같아도 항상 '다른 시도'로 취급됨"
+        "(반복 경고 대상에서 제외 - 개수 채울 때까지 계속 스크롤하라는 프롬프트 지침과 충돌 방지)",
+        not _is_similar_action({"action": "scroll", "text": "down"}, {"action": "scroll", "text": "DOWN"})
         and not _is_similar_action({"action": "scroll", "text": "down"}, {"action": "scroll", "text": "up"}),
     )
     check(
@@ -855,15 +872,19 @@ def _run_mock_selftest():
     streak0, action0 = _trailing_repeat_streak([])
     check("_trailing_repeat_streak -> 빈 히스토리는 (0, None)", streak0 == 0 and action0 is None)
 
-    same3 = [{"action": "scroll", "text": "down"} for _ in range(3)]
+    # (2026-08-15 수정) 이 아래 일반 메커니즘 테스트들은 원래 scroll을 예시 액션으로 썼는데,
+    # scroll이 이제 항상 "다른 시도"로 취급되면서 이 테스트들의 전제(반복으로 셈)가 깨져서
+    # wait으로 바꿨다(wait은 내용 없이 항상 동일 취급됨 - _is_similar_action 참고). scroll
+    # 전용 제외 동작은 별도로 아래에서 검증한다.
+    same3 = [{"action": "wait"} for _ in range(3)]
     streak3, _ = _trailing_repeat_streak(same3)
     check("_trailing_repeat_streak -> 연속 3회 반복 -> streak=3", streak3 == 3)
 
     interrupted = [
-        {"action": "scroll", "text": "down"},
-        {"action": "scroll", "text": "down"},
+        {"action": "wait"},
+        {"action": "wait"},
         {"action": "left_click", "target_description": "filters"},  # 중간에 다른 액션 -> 스트릭 끊김
-        {"action": "scroll", "text": "down"},
+        {"action": "wait"},
     ]
     streak_interrupted, _ = _trailing_repeat_streak(interrupted)
     check("_trailing_repeat_streak -> 중간에 다른 액션이 끼면 최신 구간만 셈(streak=1)", streak_interrupted == 1)
@@ -909,21 +930,21 @@ def _run_mock_selftest():
 
     # --- (2026-08-11 추가) _format_history의 REPETITION WARNING 삽입 ---
     below_threshold = _format_history(
-        [{"action": "scroll", "text": "down"}, {"action": "scroll", "text": "down"}]
+        [{"action": "wait"}, {"action": "wait"}]
     )
     check("반복 2회(임계값 미만) -> 경고 없음", "REPETITION WARNING" not in below_threshold)
 
     at_threshold = _format_history(
-        [{"action": "scroll", "text": "down"} for _ in range(3)]
+        [{"action": "wait"} for _ in range(3)]
     )
     check("반복 3회(기본 임계값) -> 경고 발생", "REPETITION WARNING" in at_threshold)
     check("경고 문구에 반복 횟수 포함", "3 times" in at_threshold)
-    check("경고 문구에 반복된 행동 설명 포함", "scroll down" in at_threshold)
+    check("경고 문구에 반복된 행동 설명 포함", "wait" in at_threshold)
 
     reset_by_different_action = _format_history(
         [
-            {"action": "scroll", "text": "down"},
-            {"action": "scroll", "text": "down"},
+            {"action": "wait"},
+            {"action": "wait"},
             {"action": "left_click", "target_description": "filters"},
         ]
     )
@@ -935,15 +956,38 @@ def _run_mock_selftest():
     # 뺑뺑이(A-B-A-B-A-B) 케이스 -> 기본 window(=streak*2=6)가 다 찰 때 경고 발생해야 함
     oscillating_hist = _format_history(
         [
-            {"action": "scroll", "text": "down"},
+            {"action": "wait"},
             {"action": "left_click", "target_description": "filters"},
-            {"action": "scroll", "text": "down"},
+            {"action": "wait"},
             {"action": "left_click", "target_description": "filters"},
-            {"action": "scroll", "text": "down"},
+            {"action": "wait"},
             {"action": "left_click", "target_description": "filters"},
         ]
     )
     check("뺑뺑이(A-B 번갈아 6회) -> 경고 발생", "REPETITION WARNING" in oscillating_hist)
+
+    # (2026-08-15 추가 - 사용자 요청) scroll은 아무리 반복돼도(같은 방향이든 번갈아든)
+    # REPETITION WARNING을 유발하지 않아야 함 - "개수 채울 때까지 계속 스크롤/탐색하라"는
+    # 프롬프트 지침과 반복 경고가 서로 반대 방향으로 모델을 잡아당기던 문제(Booking 배치
+    # 실측: 정상적으로 같은 방향 스크롤 3번 했을 뿐인데 경고가 떠서 스크롤을 그만둠) 재발 방지.
+    scroll_many_same_dir = _format_history(
+        [{"action": "scroll", "text": "down"} for _ in range(10)]
+    )
+    check(
+        "scroll을 같은 방향으로 10번 반복해도 REPETITION WARNING 안 뜸",
+        "REPETITION WARNING" not in scroll_many_same_dir,
+    )
+    scroll_oscillating_dir = _format_history(
+        [{"action": "scroll", "text": "down"}, {"action": "scroll", "text": "up"}] * 3
+    )
+    check(
+        "scroll 방향을 번갈아 6번 반복해도 REPETITION WARNING 안 뜸",
+        "REPETITION WARNING" not in scroll_oscillating_dir,
+    )
+    wc_scroll, _ = _windowed_repeat_count(
+        [{"action": "scroll", "text": "down"} for _ in range(6)], 6
+    )
+    check("_windowed_repeat_count -> scroll은 반복 카운트에 안 잡힘(0)", wc_scroll == 0)
 
     custom_threshold = _format_history(
         [{"action": "wait"}, {"action": "wait"}],
