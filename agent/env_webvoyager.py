@@ -397,6 +397,14 @@ class WebVoyagerEnv:
         eval_webvoyager_v2.run_episode()가 reset 직후와 매 스텝 이후 duck-typing으로
         호출한다(구버전 env나 mock처럼 이 메서드가 없어도 호출부는 정상 동작함).
 
+        (2026-08-15 추가 - 구글 검색 실측) 구글의 "Our systems have detected unusual
+        traffic..." 차단 페이지는 title/URL 어디에도 _BOT_CHECK_KEYWORDS 문구가 안 남는다
+        (URL은 google.com/sorry/index... 형태, title은 보통 그대로거나 비어있음) - 실제
+        문구는 페이지 본문(body)에만 있어서 title/URL만 보는 기존 로직은 이걸 통과시켰다.
+        그래서 title/URL이 둘 다 깨끗해도, 마지막으로 body innerText 앞부분(전체를 다 읽으면
+        느려질 수 있는 긴 페이지 대비 8000자로 제한)까지 한 번 더 검사한다. body 텍스트
+        조회 자체가 실패해도(페이지 전환 중 등) title/URL 검사 결과는 그대로 유지한다.
+
         Returns: None(정상으로 보임) 또는 {"reason": str}(감지됨)
         """
         if self.driver is None:
@@ -415,6 +423,19 @@ class WebVoyagerEnv:
         for kw in _BOT_CHECK_KEYWORDS:
             if kw in url:
                 return {"reason": f"url contains {kw!r}"}
+        try:
+            body_text = (
+                self.driver.execute_script(
+                    "return document.body ? document.body.innerText.slice(0, 8000) : ''"
+                )
+                or ""
+            ).lower()
+        except Exception:
+            # body 텍스트 조회 실패해도 title/URL 기준 판단(정상)은 그대로 유효 - 조용히 포기.
+            return None
+        for kw in _BOT_CHECK_KEYWORDS:
+            if kw in body_text:
+                return {"reason": f"body contains {kw!r}"}
         return None
 
     # ------------------------------------------------------------------
@@ -1201,6 +1222,28 @@ def _run_mock_selftest():
     env.driver.current_url = "http://example.com/"
     r3 = env.detect_bot_check()
     check("detect_bot_check -> 정상 페이지는 None", r3 is None)
+
+    # (2026-08-15 추가 - 구글 봇 차단 페이지 실측) title/URL이 둘 다 깨끗해도 본문(body)에
+    # bot-check 문구가 있으면 잡아야 함 - 구글의 "Our systems have detected unusual
+    # traffic..." 페이지가 정확히 이 경우(title/URL엔 아무 흔적 없음).
+    env.driver.title = "Google Search"
+    env.driver.current_url = "http://www.google.com/sorry/index"
+    env.driver.execute_script.return_value = (
+        "Our systems have detected unusual traffic from your computer network."
+    )
+    r_body = env.detect_bot_check()
+    check(
+        "detect_bot_check -> title/URL이 깨끗해도 body 문구로 감지됨(구글 sorry 페이지 대응)",
+        r_body is not None and "body contains" in r_body["reason"] and "unusual traffic" in r_body["reason"],
+    )
+
+    # body 텍스트 조회 자체가 실패해도(페이지 전환 중 등) title/URL 기준 결과(정상)는 유지되고
+    # 예외가 밖으로 새면 안 됨.
+    env.driver.execute_script.side_effect = Exception("컨텍스트 무효화")
+    r_body_fail = env.detect_bot_check()
+    check("detect_bot_check -> body 조회 실패해도 예외 없이 None", r_body_fail is None)
+    env.driver.execute_script.side_effect = None
+    env.driver.execute_script.return_value = "complete"  # 이후 다른 테스트를 위해 원복
 
     env_no_driver = WebVoyagerEnv.__new__(WebVoyagerEnv)
     env_no_driver.driver = None

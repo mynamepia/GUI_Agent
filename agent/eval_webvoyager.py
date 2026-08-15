@@ -1045,10 +1045,41 @@ def run_batch(tasks, env, agent_step_fn, judge_fn, max_steps=DEFAULT_MAX_STEPS,
             if resume and task_id in done_keys:
                 continue
             t0 = time.time()
-            traj = run_episode(
-                env, task, agent_step_fn, max_steps=max_steps, stuck_repeat_threshold=stuck_repeat_threshold,
-                stuck_repeat_window=stuck_repeat_window,
-            )
+            try:
+                traj = run_episode(
+                    env, task, agent_step_fn, max_steps=max_steps, stuck_repeat_threshold=stuck_repeat_threshold,
+                    stuck_repeat_window=stuck_repeat_window,
+                )
+            except Exception as e:  # noqa: BLE001 - (2026-08-15 추가) 렌더러 hang/드라이버 크래시 대응
+                # 실측: Billboard처럼 광고/비디오가 무거운 사이트에서 CDP 명령이 "Timed out
+                # receiving message from renderer" (selenium.TimeoutException)로 죽는 경우가
+                # 확인됨 - env.execute_action()이 예외를 그대로 던지고, run_episode()도 이걸
+                # 안 잡아서 이전엔 배치 전체(run_batch)가 죽었다. 여기서 잡아서 이 태스크만
+                # blocked로 기록하고 다음 태스크로 넘어간다. 죽은 드라이버 세션을 그대로 재사용하면
+                # 다음 태스크의 env.reset()도 같이 죽을 수 있으므로, driver를 강제로 정리하고
+                # None으로 되돌려서 다음 reset()이 _make_driver()로 완전히 새 세션을 만들게 한다
+                # (env_webvoyager.WebVoyagerEnv.reset()의 "driver=None -> 새로 생성" 경로 재사용).
+                print(f"[run_batch] 태스크 {task_id!r} 실행 중 예외 발생(건너뛰고 계속 진행): {e}")
+                try:
+                    if getattr(env, "driver", None) is not None:
+                        env.driver.quit()
+                except Exception as quit_exc:  # noqa: BLE001 - 정리 실패해도 계속 진행
+                    print(f"[run_batch] 죽은 드라이버 정리 중 추가 예외(무시): {quit_exc}")
+                finally:
+                    env.driver = None
+                try:
+                    task_url, task_instr, _ = env._parse_task(task)
+                except Exception:  # noqa: BLE001 - task 포맷이 예상과 달라도 최소한 기록은 남김
+                    task_url, task_instr = None, None
+                traj = {
+                    "instruction": task_instr,
+                    "url": task_url,
+                    "final_answer": None,
+                    "n_steps": 0,
+                    "hit_max_steps": False,
+                    "blocked": True,
+                    "blocked_reason": f"env/driver 예외로 태스크 중단: {e}",
+                }
 
             if traj["blocked"]:
                 # (2026-08-11 추가) CAPTCHA/bot-check로 막혔거나 반복-정체로 조기 종료된
@@ -1446,6 +1477,51 @@ def _run_mock_selftest():
         check("run_batch -> blocked 태스크의 blocked=True + blocked_reason 존재", all(r["blocked"] is True and r["blocked_reason"] for r in rows_blocked))
         check("run_batch -> blocked 태스크는 judge_votes가 빈 리스트(판단 자체를 안 했다는 표시)", all(r["judge_votes"] == [] for r in rows_blocked))
         check("run_batch -> 전체 success_rate=0.0", rate_blocked == 0.0)
+
+    # --- (2026-08-15 추가 - 렌더러 hang/드라이버 크래시 대응) run_batch: run_episode()가 예외를
+    # 던져도 배치 전체가 죽지 않고, 해당 태스크만 blocked로 기록한 뒤 다음 태스크로 계속 진행 ---
+    fake_env_crash = MagicMock()
+    fake_env_crash.detect_bot_check.return_value = None
+    fake_env_crash.reset.side_effect = [
+        (fake_img, {"instruction": "task A", "url": "http://a"}),
+        TimeoutError("Timed out receiving message from renderer: 20.000"),
+        (fake_img, {"instruction": "task C", "url": "http://c"}),
+    ]
+    fake_env_crash._parse_task.side_effect = lambda t: (t["web"], t["ques"], {})
+    orig_crash_driver = fake_env_crash.driver  # env.driver=None으로 리셋되기 전에 미리 참조 저장
+    crash_judge_calls = {"n": 0}
+
+    def _crash_test_judge(instruction, screenshots, final_answer):
+        crash_judge_calls["n"] += 1
+        return {"success": True, "raw_response": "ok"}
+
+    with tempfile.TemporaryDirectory() as d:
+        out_path_crash = os.path.join(d, "out_crash.jsonl")
+        rows_crash, _ = run_batch(
+            [
+                {"id": "T--A", "web": "http://a", "ques": "task A"},
+                {"id": "T--B", "web": "http://b", "ques": "task B"},
+                {"id": "T--C", "web": "http://c", "ques": "task C"},
+            ],
+            fake_env_crash, dummy_agent_step, _crash_test_judge,
+            judge_repeats=1, out_path=out_path_crash,
+        )
+        check("run_batch -> 중간 태스크가 예외로 죽어도 3개 row 전부 기록됨(배치가 안 죽음)", len(rows_crash) == 3)
+        check(
+            "run_batch -> 예외난 태스크만 blocked=True, 나머지는 blocked=False",
+            [r["blocked"] for r in rows_crash] == [False, True, False],
+        )
+        check(
+            "run_batch -> blocked_reason에 원본 예외 메시지가 남음",
+            "Timed out receiving message from renderer" in (rows_crash[1]["blocked_reason"] or ""),
+        )
+        check("run_batch -> 예외난 태스크는 success=False", rows_crash[1]["success"] is False)
+        check(
+            "run_batch -> 정상 태스크 2개는 judge가 호출됨(예외난 태스크는 호출 안 됨)",
+            crash_judge_calls["n"] == 2,
+        )
+        check("run_batch -> 예외 처리 중 죽은 driver.quit()이 호출됨", orig_crash_driver.quit.called)
+        check("run_batch -> 예외 처리 후 driver가 None으로 리셋됨(다음 reset()이 새 세션 만들도록)", fake_env_crash.driver is None)
 
     # --- (2026-08-11 추가) _task_key ---
     check("_task_key -> id 필드가 있으면 그걸 그대로 씀", _task_key({"id": "Amazon--16", "web": "http://a", "ques": "q"}) == "Amazon--16")
@@ -2102,6 +2178,17 @@ if __name__ == "__main__":
                      help="새 탭이 열려도 자동으로 그리로 전환하지 않는다(원래 탭에 그대로 머무름, "
                           "새 탭은 무시). 광고가 새 탭/리다이렉트로 뜨는 사이트(ESPN 등)에서 사용. "
                           "기본은 자동 전환.")
+    # (2026-08-15 추가 - Billboard 등 무거운 사이트 렌더러 hang 대응) 실측: 광고/비디오가
+    # 무거운 페이지에서 CDP 명령이 "Timed out receiving message from renderer: 20.000"
+    # (selenium.TimeoutException)으로 죽는 경우가 있었다 - 이 20.000이 바로 아래 기본값이다.
+    # 늘리면 "느리지만 결국 응답하는" 무거운 페이지를 안 죽이고 넘어갈 수 있다. 다만 이건
+    # 완전한 해결책은 아니다 - 진짜로 렌더러가 죽어버린(무한루프/크래시) 경우는 얼마나 늘려도
+    # 결국 타임아웃되므로, run_batch()의 예외 안전망(태스크 하나만 blocked 처리 후 계속 진행)은
+    # 이 값과 별개로 항상 켜져 있다.
+    ap.add_argument("--page_load_timeout", type=float, default=20.0,
+                     help="페이지 로딩 및 (렌더러가 바쁠 때) CDP 명령 응답을 기다리는 최대 시간(초). "
+                          "광고/비디오가 무거운 사이트(Billboard 등)에서 렌더러 hang으로 태스크가 "
+                          "자꾸 죽으면 늘려볼 것(예: 40). 기본 20초.")
     ap.add_argument("--stuck_repeat_threshold", type=int, default=DEFAULT_STUCK_REPEAT_THRESHOLD,
                      help="최근 --stuck_repeat_window개 액션 안에 같은 액션이 이만큼 등장하면 "
                           "(bot-check 신호 유무와 무관하게) 멈춘 것으로 보고 조기 종료한다(기본 5). "
@@ -2202,6 +2289,7 @@ if __name__ == "__main__":
             captcha_reset_retries=args.captcha_reset_retries, reuse_driver=args.reuse_driver,
             headless=args.headless, manual_captcha_wait=args.manual_captcha,
             auto_switch_new_tab=args.auto_switch_new_tab,
+            page_load_timeout=args.page_load_timeout,
         )
 
         if args.planner_backend == "openai" and args.agent_planner_adapter_dir:
