@@ -262,7 +262,8 @@ class WebVoyagerEnv:
     """
 
     def __init__(self, window_size=DEFAULT_WINDOW_SIZE, headless=True, page_load_timeout=20, user_agent=None,
-                 captcha_reset_retries=0, reuse_driver=True, manual_captcha_wait=False, wait_fn=None):
+                 captcha_reset_retries=0, reuse_driver=True, manual_captcha_wait=False, wait_fn=None,
+                 auto_switch_new_tab=True):
         """
         captcha_reset_retries: (2026-08-11 추가) reset() 직후 detect_bot_check()에
             걸리면 driver.get(url)을 다시 시도하는 횟수. CAPTCHA는 자동화로 못 풀지만,
@@ -295,6 +296,14 @@ class WebVoyagerEnv:
         wait_fn: manual_captcha_wait=True일 때 "사람이 다 풀 때까지 기다리는" 방법을 주입.
             기본값 None이면 builtins.input()을 써서 콘솔에서 Enter 누를 때까지 블로킹한다.
             테스트에서는 실제로 멈추면 안 되므로 즉시 반환하는 가짜 함수를 넣어서 검증한다.
+        auto_switch_new_tab: (2026-08-15 추가 - ESPN 등 광고 리다이렉트 대응) True(기본)면
+            새 탭이 열렸을 때 자동으로 그 탭으로 포커스를 옮기고 이전 탭들은 닫는다
+            (_switch_to_new_tab_if_opened 참고 - Booking처럼 사이트가 target=_blank로 실제
+            콘텐츠를 새 탭에 여는 경우를 위해 추가된 동작). 그런데 ESPN 등 일부 사이트는 광고가
+            새 탭으로 리다이렉트되는 경우가 있어서, 이 정책을 그대로 적용하면 광고 탭으로
+            옮겨가버리는 역효과가 남 - False로 주면 새 탭 감지/전환 로직 자체를 완전히 건너뛰고
+            기존 탭에 포커스를 유지한다(이 기능이 추가되기 전의 동작과 동일 - 새 탭은 열린
+            채로 방치되고 무시됨).
         """
         self.window_size = window_size
         self.headless = headless
@@ -304,6 +313,7 @@ class WebVoyagerEnv:
         self.reuse_driver = reuse_driver
         self.manual_captcha_wait = manual_captcha_wait
         self.wait_fn = wait_fn or (lambda msg: input(msg))
+        self.auto_switch_new_tab = auto_switch_new_tab
         self.driver = None
         self.task_info = None
 
@@ -646,10 +656,11 @@ class WebVoyagerEnv:
         # 계속 예전 탭(내용 그대로인 화면)만 보고 "페이지가 안 뜬다"고 오판하는 문제가
         # 확인됨 - fn(action) 직후, 로케일 재적용보다 먼저 처리해서 이후 스크린샷/URL
         # 비교가 전부 새 탭 기준으로 이뤄지게 한다.
-        try:
-            self._switch_to_new_tab_if_opened(prev_handles)
-        except Exception as e:  # noqa: BLE001 - 탭 전환 실패해도 액션 자체 결과 반환은 막지 않음
-            print(f"[env_webvoyager.py] 새 탭 전환 처리 중 예외(무시하고 진행): {e}")
+        if self.auto_switch_new_tab:
+            try:
+                self._switch_to_new_tab_if_opened(prev_handles)
+            except Exception as e:  # noqa: BLE001 - 탭 전환 실패해도 액션 자체 결과 반환은 막지 않음
+                print(f"[env_webvoyager.py] 새 탭 전환 처리 중 예외(무시하고 진행): {e}")
 
         if prev_url is not None:
             self._reapply_url_locale_params_if_navigated(prev_url)
@@ -891,6 +902,7 @@ def _run_mock_selftest():
     env = WebVoyagerEnv.__new__(WebVoyagerEnv)  # __init__(driver 필요) 안 타고 순수 로직만 테스트
     env.window_size = (1280, 800)
     env.task_info = {"instruction": "test", "url": "http://example.com"}
+    env.auto_switch_new_tab = True
     env.driver = MagicMock()
     env.driver.get_screenshot_as_png.return_value = _fake_png_bytes()
     env.driver.execute_script.return_value = "complete"  # readyState 즉시 통과(대기 없이) - 아래 대량의
@@ -1059,12 +1071,31 @@ def _run_mock_selftest():
     wiring_tab_env.driver.execute_script.return_value = "complete"  # readyState 즉시 통과(대기 없이)
     wiring_tab_env.driver.get_screenshot_as_png.return_value = _fake_png_bytes()
     wiring_tab_env.task_info = {}
+    wiring_tab_env.auto_switch_new_tab = True
     tab_switch_calls = []
     wiring_tab_env._switch_to_new_tab_if_opened = lambda prev_handles: tab_switch_calls.append(list(prev_handles))
     wiring_tab_env.execute_action({"action": "left_click", "coordinate": [1, 1]})
     check(
         "execute_action -> 액션 실행 후 _switch_to_new_tab_if_opened가 액션 전 탭 목록과 함께 호출됨",
         tab_switch_calls == [["h1"]],
+    )
+
+    # (2026-08-15 추가 - ESPN 등 광고 새탭 리다이렉트 대응) auto_switch_new_tab=False면
+    # 새 탭이 열려도 _switch_to_new_tab_if_opened 자체가 호출되지 않아야 함
+    no_switch_env = WebVoyagerEnv.__new__(WebVoyagerEnv)
+    no_switch_env.driver = MagicMock()
+    no_switch_env.driver.current_url = "https://example.com/"
+    no_switch_env.driver.window_handles = ["h1", "h2"]  # 새 탭이 실제로 열린 상태
+    no_switch_env.driver.execute_script.return_value = "complete"
+    no_switch_env.driver.get_screenshot_as_png.return_value = _fake_png_bytes()
+    no_switch_env.task_info = {}
+    no_switch_env.auto_switch_new_tab = False
+    no_switch_calls = []
+    no_switch_env._switch_to_new_tab_if_opened = lambda prev_handles: no_switch_calls.append(list(prev_handles))
+    no_switch_env.execute_action({"action": "left_click", "coordinate": [1, 1]})
+    check(
+        "auto_switch_new_tab=False -> execute_action이 _switch_to_new_tab_if_opened를 아예 호출 안 함",
+        no_switch_calls == [],
     )
 
     # --- (2026-08-15 추가 - 흰 화면 스크린샷 버그 픽스) _wait_for_page_ready() ---
@@ -1129,6 +1160,7 @@ def _run_mock_selftest():
     wiring_ready_env.driver.window_handles = ["h1"]
     wiring_ready_env.driver.get_screenshot_as_png.return_value = _fake_png_bytes()
     wiring_ready_env.task_info = {}
+    wiring_ready_env.auto_switch_new_tab = True
     ready_calls = []
     wiring_ready_env._wait_for_page_ready = lambda: ready_calls.append(True)
     wiring_ready_env.execute_action({"action": "left_click", "coordinate": [1, 1]})
@@ -1446,6 +1478,7 @@ def _run_mock_selftest():
     wiring_env.driver.execute_script.return_value = "complete"  # readyState 즉시 통과(대기 없이)
     wiring_env.driver.get_screenshot_as_png.return_value = _fake_png_bytes()
     wiring_env.task_info = {}
+    wiring_env.auto_switch_new_tab = True
     reapply_calls = []
     wiring_env._reapply_url_locale_params_if_navigated = lambda prev_url: reapply_calls.append(prev_url)
     wiring_env.execute_action({"action": "left_click", "coordinate": [10, 10]})
