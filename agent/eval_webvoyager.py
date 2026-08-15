@@ -2095,6 +2095,13 @@ if __name__ == "__main__":
     ap.add_argument("--no_reuse_driver", dest="reuse_driver", action="store_false", default=True,
                      help="태스크마다 브라우저를 재사용하지 않고 매번 새로 켠다(느려짐, 격리는 더 강함). "
                           "기본은 재사용(쿠키만 초기화).")
+    # (2026-08-15 추가 - ESPN 등 광고 새탭 리다이렉트 대응) 기본은 새 탭이 열리면 자동으로 그리로
+    # 포커스를 옮기는데(Booking처럼 사이트가 실제 콘텐츠를 새 탭에 여는 경우 대응), ESPN 등은
+    # 광고가 새 탭으로 리다이렉트되는 경우가 있어서 이 정책이 오히려 역효과를 낼 수 있다.
+    ap.add_argument("--no_auto_switch_new_tab", dest="auto_switch_new_tab", action="store_false", default=True,
+                     help="새 탭이 열려도 자동으로 그리로 전환하지 않는다(원래 탭에 그대로 머무름, "
+                          "새 탭은 무시). 광고가 새 탭/리다이렉트로 뜨는 사이트(ESPN 등)에서 사용. "
+                          "기본은 자동 전환.")
     ap.add_argument("--stuck_repeat_threshold", type=int, default=DEFAULT_STUCK_REPEAT_THRESHOLD,
                      help="최근 --stuck_repeat_window개 액션 안에 같은 액션이 이만큼 등장하면 "
                           "(bot-check 신호 유무와 무관하게) 멈춘 것으로 보고 조기 종료한다(기본 5). "
@@ -2194,6 +2201,7 @@ if __name__ == "__main__":
         env = WebVoyagerEnv(
             captcha_reset_retries=args.captcha_reset_retries, reuse_driver=args.reuse_driver,
             headless=args.headless, manual_captcha_wait=args.manual_captcha,
+            auto_switch_new_tab=args.auto_switch_new_tab,
         )
 
         if args.planner_backend == "openai" and args.agent_planner_adapter_dir:
