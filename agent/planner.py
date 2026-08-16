@@ -321,7 +321,13 @@ def _is_similar_action(a: dict, b: dict) -> bool:
         # max_steps로 자연스럽게 막힌다.
         return False
     if act == "wait":
-        return True
+        # (2026-08-15 수정 - 사용자 요청) 예전엔 wait끼리 항상 "같은 시도"로 쳐서 반복 경고
+        # 대상이었는데, 이 REPETITION WARNING이 "최근 윈도우 안 빈도"로 세는 방식이라 연속
+        # 반복이 아니라 서로 다른 정상 액션들 사이사이에 한 번씩만 끼어 나와도(예: click→wait→
+        # type→wait→...) 개수가 금방 threshold에 도달해버린다 - wait은 다른 진짜 액션의 부수적
+        # 대기일 뿐 그 자체로 "제자리걸음"의 신호가 아니므로(scroll과 같은 이유,
+        # eval_webvoyager.py의 fingerprint 제외와 일관성 유지) 항상 "다른 시도"로 취급한다.
+        return False
     if act == "back":
         return True
     return False
@@ -354,6 +360,29 @@ def _trailing_repeat_streak(history_actions: list):
         else:
             break
     return streak, last
+
+
+def _trailing_wait_streak(history_actions: list) -> int:
+    """
+    (2026-08-16 추가 - wait 제외의 부작용 보완) _is_similar_action의 wait 분기를 항상
+    "다른 시도"(False)로 바꿔서(2026-08-15) 산발적 wait(다른 정상 액션들 사이사이에 한 번씩만
+    끼는 경우)이 REPETITION WARNING을 오탐하던 문제는 고쳤는데, 그 대가로 "다른 액션 없이
+    wait만 계속" 찍는 순수 연속 스팸마저 못 잡게 되는 실측 회귀가 나왔다(WolframAlpha: 메인
+    페이지에서 못 넘어가고 wait만 반복하다 step budget 소진). _windowed_repeat_count()는
+    "산발적 wait은 무시한다"는 의도를 지키기 위해 그대로 두고, 이 함수는 그와 별개로 "끝에서부터
+    연속으로 wait이 몇 번인가"만 센다 - 중간에 wait이 아닌 액션이 하나라도 끼면 0으로 끊기므로
+    산발적 사용에는 안 걸리고, 진짜 wait 연타에만 걸린다. eval_webvoyager.py/
+    gui_actor_eval_webvoyager.py의 consecutive_wait 카운터와 동일한 목적.
+
+    Returns: 마지막 액션이 wait이 아니면 0, wait이면 끝에서부터 연속된 wait 개수(1 이상).
+    """
+    streak = 0
+    for a in reversed(history_actions):
+        if a.get("action") == "wait":
+            streak += 1
+        else:
+            break
+    return streak
 
 
 def _windowed_repeat_count(history_actions: list, window_size: int):
@@ -448,6 +477,21 @@ def _format_history(
             "change direction/strategy entirely. If after trying different approaches this still seems "
             'impossible, terminate with status "failure" rather than repeating the same action again. ***'
         )
+    else:
+        # (2026-08-16 추가) 위 윈도우 빈도 카운트는 wait을 항상 "다른 시도"로 쳐서 아예 안
+        # 걸리므로, 산발적 wait 오탐은 안 나지만 순수 연속 wait 스팸도 못 잡는다(WolframAlpha
+        # 회귀, _trailing_wait_streak() 참고). 그래서 windowed 카운트가 안 걸렸을 때만 이걸로
+        # 보완한다.
+        wait_streak = _trailing_wait_streak(history_actions)
+        if wait_streak >= repeat_warning_streak:
+            text += (
+                f'\n\n*** REPETITION WARNING: you have proposed "wait" {wait_streak} times in a row '
+                "and it has NOT made progress. Do NOT propose it again. Actively try a genuinely "
+                "different approach instead - for example: look for a different UI element or navigation "
+                "path, reconsider whether your assumption about what's currently on screen is correct, or "
+                "change direction/strategy entirely. If after trying different approaches this still seems "
+                'impossible, terminate with status "failure" rather than waiting again. ***'
+            )
     return text
 
 
@@ -866,25 +910,29 @@ def _run_mock_selftest():
         _is_similar_action({"action": "type", "text": "cats"}, {"action": "type", "text": "cats"})
         and not _is_similar_action({"action": "type", "text": "cats"}, {"action": "type", "text": "dogs"}),
     )
-    check("_is_similar_action -> wait끼리는 항상 동일 취급", _is_similar_action({"action": "wait"}, {"action": "wait"}))
+    check(
+        "_is_similar_action -> (2026-08-15 수정) wait도 scroll과 같은 이유로 항상 '다른 시도'로 취급됨"
+        "(윈도우 빈도 방식이라 서로 다른 정상 액션들 사이사이에 한 번씩만 껴도 오탐되는 문제 방지)",
+        not _is_similar_action({"action": "wait"}, {"action": "wait"}),
+    )
 
     # --- (2026-08-11 추가) _trailing_repeat_streak ---
     streak0, action0 = _trailing_repeat_streak([])
     check("_trailing_repeat_streak -> 빈 히스토리는 (0, None)", streak0 == 0 and action0 is None)
 
-    # (2026-08-15 수정) 이 아래 일반 메커니즘 테스트들은 원래 scroll을 예시 액션으로 썼는데,
-    # scroll이 이제 항상 "다른 시도"로 취급되면서 이 테스트들의 전제(반복으로 셈)가 깨져서
-    # wait으로 바꿨다(wait은 내용 없이 항상 동일 취급됨 - _is_similar_action 참고). scroll
-    # 전용 제외 동작은 별도로 아래에서 검증한다.
-    same3 = [{"action": "wait"} for _ in range(3)]
+    # (2026-08-15 수정) 이 아래 일반 메커니즘 테스트들은 원래 scroll -> wait 순서로 예시 액션을
+    # 바꿔왔는데(scroll이 먼저 반복 경고 대상에서 빠지고, 그다음 wait도 같은 이유로 빠지면서),
+    # 이제 남은 것 중 "항상 동일 취급"되는 유일한 액션인 back으로 바꿨다(_is_similar_action
+    # 참고). scroll/wait 전용 제외 동작은 별도로 아래에서 각각 검증한다.
+    same3 = [{"action": "back"} for _ in range(3)]
     streak3, _ = _trailing_repeat_streak(same3)
     check("_trailing_repeat_streak -> 연속 3회 반복 -> streak=3", streak3 == 3)
 
     interrupted = [
-        {"action": "wait"},
-        {"action": "wait"},
+        {"action": "back"},
+        {"action": "back"},
         {"action": "left_click", "target_description": "filters"},  # 중간에 다른 액션 -> 스트릭 끊김
-        {"action": "wait"},
+        {"action": "back"},
     ]
     streak_interrupted, _ = _trailing_repeat_streak(interrupted)
     check("_trailing_repeat_streak -> 중간에 다른 액션이 끼면 최신 구간만 셈(streak=1)", streak_interrupted == 1)
@@ -930,21 +978,21 @@ def _run_mock_selftest():
 
     # --- (2026-08-11 추가) _format_history의 REPETITION WARNING 삽입 ---
     below_threshold = _format_history(
-        [{"action": "wait"}, {"action": "wait"}]
+        [{"action": "back"}, {"action": "back"}]
     )
     check("반복 2회(임계값 미만) -> 경고 없음", "REPETITION WARNING" not in below_threshold)
 
     at_threshold = _format_history(
-        [{"action": "wait"} for _ in range(3)]
+        [{"action": "back"} for _ in range(3)]
     )
     check("반복 3회(기본 임계값) -> 경고 발생", "REPETITION WARNING" in at_threshold)
     check("경고 문구에 반복 횟수 포함", "3 times" in at_threshold)
-    check("경고 문구에 반복된 행동 설명 포함", "wait" in at_threshold)
+    check("경고 문구에 반복된 행동 설명 포함", "go back" in at_threshold)
 
     reset_by_different_action = _format_history(
         [
-            {"action": "wait"},
-            {"action": "wait"},
+            {"action": "back"},
+            {"action": "back"},
             {"action": "left_click", "target_description": "filters"},
         ]
     )
@@ -956,11 +1004,11 @@ def _run_mock_selftest():
     # 뺑뺑이(A-B-A-B-A-B) 케이스 -> 기본 window(=streak*2=6)가 다 찰 때 경고 발생해야 함
     oscillating_hist = _format_history(
         [
-            {"action": "wait"},
+            {"action": "back"},
             {"action": "left_click", "target_description": "filters"},
-            {"action": "wait"},
+            {"action": "back"},
             {"action": "left_click", "target_description": "filters"},
-            {"action": "wait"},
+            {"action": "back"},
             {"action": "left_click", "target_description": "filters"},
         ]
     )
@@ -989,8 +1037,62 @@ def _run_mock_selftest():
     )
     check("_windowed_repeat_count -> scroll은 반복 카운트에 안 잡힘(0)", wc_scroll == 0)
 
+    # (2026-08-15 추가 - 사용자 요청) wait도 scroll과 같은 이유로 아무리 반복돼도(연속이든
+    # 다른 액션 사이사이에 끼든) REPETITION WARNING을 유발하지 않아야 한다 - "최근 윈도우 안
+    # 빈도"로 세는 방식이라, 연속 반복이 아니라 click→wait→type→wait→...처럼 서로 다른 정상
+    # 액션들 뒤에 매번 한 번씩만 끼어 나와도 개수가 금방 threshold에 도달해서 실제로는 전혀
+    # 안 막혔는데 뺑뺑이로 오판될 수 있었던 문제(실측 지적) 재발 방지.
+    # (2026-08-16 수정 - 회귀 수정) 위 windowed 카운트가 wait을 아예 안 잡는 부작용으로,
+    # 순수 연속 wait 스팸(WolframAlpha 실측 회귀: 메인 페이지에서 wait만 반복)까지 못 잡던
+    # 문제를 _trailing_wait_streak() 보완으로 고쳤다 - 그래서 이제 "10번 연속 wait"은 다시
+    # 경고가 떠야 정상이다(이전엔 "안 뜸"이 기대값이었으나, 그게 바로 이번에 고친 회귀였음).
+    wait_many = _format_history([{"action": "wait"} for _ in range(10)])
+    check("wait을 10번 연속 반복하면 REPETITION WARNING 뜸(연속 스팸은 잡아야 함)", "REPETITION WARNING" in wait_many)
+
+    wait_below_threshold = _format_history([{"action": "wait"} for _ in range(2)])
+    check(
+        "wait이 연속 2번(threshold=3 미만)이면 REPETITION WARNING 안 뜸",
+        "REPETITION WARNING" not in wait_below_threshold,
+    )
+
+    wait_interspersed = _format_history(
+        [
+            {"action": "left_click", "target_description": "search box"},
+            {"action": "wait"},
+            {"action": "type", "text": "hello"},
+            {"action": "wait"},
+            {"action": "key", "text": "Enter"},
+            {"action": "wait"},
+            {"action": "left_click", "target_description": "first result"},
+            {"action": "wait"},
+        ]
+    )
+    check(
+        "다른 정상 액션들 사이사이에 wait이 매번 한 번씩만 껴도 REPETITION WARNING 안 뜸",
+        "REPETITION WARNING" not in wait_interspersed,
+    )
+    wc_wait, _ = _windowed_repeat_count([{"action": "wait"} for _ in range(6)], 6)
+    check("_windowed_repeat_count -> wait은 반복 카운트에 안 잡힘(0)", wc_wait == 0)
+
+    # (2026-08-16 추가) _trailing_wait_streak() 자체 단위 테스트
+    check("_trailing_wait_streak -> 빈 history는 0", _trailing_wait_streak([]) == 0)
+    check(
+        "_trailing_wait_streak -> 마지막 액션이 wait 아니면 0",
+        _trailing_wait_streak([{"action": "wait"}, {"action": "wait"}, {"action": "back"}]) == 0,
+    )
+    check(
+        "_trailing_wait_streak -> 연속 4개 wait은 4",
+        _trailing_wait_streak([{"action": "wait"} for _ in range(4)]) == 4,
+    )
+    check(
+        "_trailing_wait_streak -> 중간에 다른 액션 끼면 그 이후만 셈",
+        _trailing_wait_streak(
+            [{"action": "wait"}, {"action": "wait"}, {"action": "click"}, {"action": "wait"}]
+        ) == 1,
+    )
+
     custom_threshold = _format_history(
-        [{"action": "wait"}, {"action": "wait"}],
+        [{"action": "back"}, {"action": "back"}],
         repeat_warning_streak=2,
     )
     check("repeat_warning_streak 인자로 임계값을 낮추면 2회에도 경고 발생", "REPETITION WARNING" in custom_threshold)

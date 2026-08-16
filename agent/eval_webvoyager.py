@@ -773,6 +773,7 @@ def run_episode(
     if stuck_repeat_window is None:
         stuck_repeat_window = stuck_repeat_threshold * 2
     fingerprint_history: list = []
+    consecutive_wait = 0
     if not blocked:
         for _ in range(max_steps):
             action = agent_step_fn(screenshot, task_info, {"actions": actions, "screenshots": screenshots})
@@ -806,15 +807,43 @@ def run_episode(
                     hit_max_steps = False
                     break
 
-            fp = _action_fingerprint(action)
-            fingerprint_history.append(fp)
-            window = fingerprint_history[-stuck_repeat_window:]
-            fp_count = window.count(fp)
-            if fp_count >= stuck_repeat_threshold:
+            # (2026-08-15 추가) scroll/wait은 뺑뺑이/정체 판단(윈도우 내 빈도 기반)에서 뺀다.
+            # planner.py 쪽 REPETITION WARNING도 같은 이유로 이 둘을 뺐음(_is_similar_action 참고).
+            # scroll: 매번 화면의 새로운 부분을 보여주는 정상 탐색이라 반복 자체가 "제자리걸음"
+            # 신호가 아니고, "개수가 명시된 태스크는 목표를 채울 때까지 계속 스크롤하라"는
+            # 프롬프트 지침과 하드 조기종료가 충돌하면 안 됨.
+            # wait: "최근 윈도우 안 빈도"로 세는 방식이라, 연속 반복이 아니라 서로 다른 정상
+            # 액션들 사이사이에 한 번씩만 끼어 나와도(예: click→wait→type→wait→...) 개수가
+            # 금방 threshold에 도달해서 실제로는 전혀 안 막혔는데 뺑뺑이로 오판될 수 있다(실측
+            # 지적) - wait은 그 자체로 "제자리걸음"의 신호가 아니라 다른 진짜 액션의 부수적
+            # 대기일 뿐이므로 fingerprint 히스토리에 아예 안 쌓는다.
+            if action.get("action") not in ("scroll", "wait"):
+                fp = _action_fingerprint(action)
+                fingerprint_history.append(fp)
+                window = fingerprint_history[-stuck_repeat_window:]
+                fp_count = window.count(fp)
+                if fp_count >= stuck_repeat_threshold:
+                    blocked = True
+                    blocked_reason = (
+                        f"최근 {len(window)}개 액션 중 같은 액션이 {fp_count}회 반복 등장(뺑뺑이/정체로 판단): {fp}"
+                    )
+                    hit_max_steps = False
+                    break
+
+            # (2026-08-16 추가 - wait 제외의 부작용 보완) 위에서 wait을 윈도우 빈도 카운트에서
+            # 뺐더니, 다른 액션과 섞인 산발적 wait은 더 이상 오탐하지 않게 됐지만(의도한 수정),
+            # 그 대가로 "다른 액션 없이 wait만 계속" 찍는 순수 연속 스팸까지 못 잡게 되는 실측
+            # 회귀가 나왔다(WolframAlpha: 메인 페이지에서 못 넘어가고 wait만 반복하다 max_steps
+            # 소진). 이건 윈도우 빈도와는 별개로 "직전부터 연속으로 wait이 몇 번인가"만 추가로
+            # 세서 잡는다 - 중간에 다른 액션이 하나라도 끼면 0으로 리셋되므로 산발적 사용에는
+            # 여전히 안 걸리고, 진짜 wait 연타만 걸린다.
+            if action.get("action") == "wait":
+                consecutive_wait += 1
+            else:
+                consecutive_wait = 0
+            if consecutive_wait >= stuck_repeat_threshold:
                 blocked = True
-                blocked_reason = (
-                    f"최근 {len(window)}개 액션 중 같은 액션이 {fp_count}회 반복 등장(뺑뺑이/정체로 판단): {fp}"
-                )
+                blocked_reason = f"wait이 연속 {consecutive_wait}회 반복 등장(정체로 판단)"
                 hit_max_steps = False
                 break
 
@@ -1002,7 +1031,8 @@ def _task_key(task) -> str:
 def run_batch(tasks, env, agent_step_fn, judge_fn, max_steps=DEFAULT_MAX_STEPS,
               judge_repeats=DEFAULT_JUDGE_REPEATS, out_path=None,
               stuck_repeat_threshold=DEFAULT_STUCK_REPEAT_THRESHOLD,
-              stuck_repeat_window=None, resume=False, judge_max_workers=1):
+              stuck_repeat_window=None, resume=False, judge_max_workers=1,
+              task_indices=None):
     """
     (2026-08-11 추가 - resume 파라미터) resume=True면 out_path에 이미 있는 결과(이전
     실행이 중간에 죽었거나 사용자가 일부러 끊은 경우)를 읽어서, task_id가 이미 있는 태스크는
@@ -1010,10 +1040,31 @@ def run_batch(tasks, env, agent_step_fn, judge_fn, max_steps=DEFAULT_MAX_STEPS,
     결과도 합쳐 넣어서, 성공률 등 요약이 "이번 실행분만"이 아니라 "전체 누적"을 반영하게
     한다. resume=False(기본)면 예전과 동일하게 매번 out_path를 덮어쓰고 처음부터 전부
     돈다 - 하위 호환.
+
+    task_indices: (2026-08-15 추가 - 특정 태스크만 재실행, --idx CLI 옵션용) tasks와 길이가
+        같은 리스트를 주면, 결과 row의 "idx" 필드에 enumerate() 위치 대신 이 값을 쓴다.
+        예: scroll/wait 뺑뺑이 오탐 버그를 고친 뒤, 원래 전체실행에서 그 사유로 blocked됐던
+        태스크 몇 개(예: idx 4, 9, 28)만 골라 다시 돌리고 싶을 때 - tasks 자체는 3개짜리
+        부분집합이라 plain enumerate면 idx가 0,1,2로 재번호 매겨지는데, 그러면 이전 전체실행
+        결과와 대조가 안 된다. 원래 idx를 그대로 넘겨주면 결과 jsonl에도 4, 9, 28로 찍혀서
+        "그 태스크가 이제 정상 처리되는지" 바로 비교 가능. None(기본)이면 예전처럼
+        enumerate(tasks) 위치를 그대로 씀 - 하위호환.
+
+        [2026-08-16 추가 - --idx + --resume 조합 버그 수정] task_indices가 주어졌다는 건
+        "--idx로 이 태스크들은 무조건 다시 돌려라"라는 명시적 요청이다. 그런데 같은 out_path에
+        --resume까지 같이 켜면(예: 기존 전체 결과 jsonl을 유지한 채로 특정 idx만 갱신하고
+        싶은 경우), 아래 일반 resume 로직이 "out_path에 이미 그 task_id가 있다"는 이유만으로
+        건너뛰어버려서 --idx가 아예 먹통이 되는 문제가 실측으로 확인됐다(--idx의 "무조건
+        재실행" 의도와 --resume의 "이미 있으면 건너뛰기" 의도가 충돌하는데 지금까지는
+        --resume이 이겼음). 그래서 task_indices에 해당하는 태스크는 --resume이 켜져 있어도
+        절대 건너뛰지 않고, 그 태스크들의 예전 결과 줄은 파일/rows에서 버려서(교체) 같은
+        task_id가 파일에 중복으로 남지 않게 한다. task_indices가 없는(순수 --resume만 쓰는)
+        기존 흐름은 전혀 안 건드림 - 하위호환.
     """
     rows = []
     done_keys = set()
     file_exists = bool(out_path and os.path.exists(out_path))
+    forced_keys = {_task_key(t) for t in tasks} if task_indices is not None else set()
     if resume and file_exists:
         with open(out_path, "r", encoding="utf-8") as f:
             for line in f:
@@ -1028,19 +1079,37 @@ def run_batch(tasks, env, agent_step_fn, judge_fn, max_steps=DEFAULT_MAX_STEPS,
                     # 계속 진행(그 태스크는 done_keys에 안 들어가므로 이번 실행에서 다시 돈다 -
                     # 데이터 손실보다 중복 재실행 쪽이 안전한 폴백).
                     continue
-                rows.append(prev_row)
                 key = prev_row.get("task_id")
+                if key in forced_keys:
+                    # (2026-08-16 추가) --idx로 강제 재실행이 지정된 태스크의 예전 결과 줄은
+                    # 버린다 - 밑에서 새로 돈 결과로 교체될 것이므로 done_keys에도 안 넣는다
+                    # (건너뛰지 않고 반드시 다시 돌게).
+                    continue
+                rows.append(prev_row)
                 if key:
                     done_keys.add(key)
         print(
             f"[run_batch] --resume: {out_path}에서 기존 결과 {len(rows)}개 발견 "
-            f"(이미 끝난 태스크 {len(done_keys)}개는 건너뜀)"
+            f"(이미 끝난 태스크 {len(done_keys)}개는 건너뜀"
+            + (f", --idx로 강제 재실행 지정된 {len(forced_keys)}개는 예전 결과를 버리고 재실행)" if forced_keys else ")")
         )
 
-    out_mode = "a" if (resume and file_exists) else "w"
+    # (2026-08-16 추가) forced_keys가 있는 재실행(--idx + --resume 조합)이면, 방금 위에서
+    # 예전 파일 중 그 태스크들 줄만 뺀 나머지(rows)를 디스크에도 반영해야 한다 - 그냥
+    # "a"(append)로 열면 디스크엔 예전 줄이 그대로 남은 채로 새 결과가 뒤에 또 붙어서 같은
+    # task_id가 파일에 중복으로 남는다. 그래서 이 경우엔 "w"로 열어서 kept rows를 먼저
+    # 다시 써두고(디스크를 rows와 일치시킴), 이후 새로 도는 태스크 결과는 같은 파일 핸들에
+    # 이어서 쓴다. task_indices가 없거나(순수 --resume) forced_keys가 비어있으면(--idx가
+    # 예전 결과와 안 겹침) 기존 동작(있으면 "a", 없으면 "w") 그대로.
+    out_mode = "a" if (resume and file_exists and not forced_keys) else "w"
     out_f = open(out_path, out_mode, encoding="utf-8") if out_path else None
+    if out_f and resume and file_exists and forced_keys:
+        for r in rows:
+            out_f.write(json.dumps(r, ensure_ascii=False) + "\n")
+        out_f.flush()
     try:
-        for i, task in enumerate(tasks):
+        for pos, task in enumerate(tasks):
+            i = task_indices[pos] if task_indices is not None else pos
             task_id = _task_key(task)
             if resume and task_id in done_keys:
                 continue
@@ -1113,7 +1182,7 @@ def run_batch(tasks, env, agent_step_fn, judge_fn, max_steps=DEFAULT_MAX_STEPS,
             status_tag = "BLOCKED" if row["blocked"] else ("O" if row["success"] else "X")
             agreement_str = f"{row['judge_agreement']:.2f}" if row["judge_agreement"] is not None else "n/a"
             print(
-                f"[{i + 1}/{len(tasks)}] {status_tag} "
+                f"[{pos + 1}/{len(tasks)}] (idx={i}) {status_tag} "
                 f"steps={row['n_steps']} agreement={agreement_str} "
                 f"instr={row['instruction'][:50]!r}"
             )
@@ -1332,6 +1401,69 @@ def _run_mock_selftest():
         traj_osc_narrow_window["blocked"] is False,
     )
 
+    # (2026-08-15 추가 - gui_actor_eval_webvoyager.py와의 일관성 확보) 이 파일(Track A)엔
+    # scroll/wait을 뺑뺑이 판단에서 빼는 로직이 없었다가 이번에 추가됨 - 같은 이유(scroll은
+    # 정상 탐색, wait은 윈도우 빈도 방식이라 다른 액션들 사이사이에 껴도 오탐될 수 있음)로
+    # 둘 다 제외되는지 검증.
+    def scroll_only_agent(screenshot, task_info, history):
+        return {"action": "scroll", "text": "down"}
+
+    traj_scroll_only = run_episode(
+        fake_env_stuck, {"web": "http://u", "ques": "do U"}, scroll_only_agent,
+        max_steps=10, stuck_repeat_threshold=3,
+    )
+    check(
+        "같은 방향 scroll만 계속 반복해도 stuck으로 안 잡힘(max_steps까지 정상 진행)",
+        traj_scroll_only["blocked"] is False and traj_scroll_only["n_steps"] == 10,
+    )
+
+    def wait_only_agent(screenshot, task_info, history):
+        return {"action": "wait"}
+
+    # (2026-08-16 수정 - 회귀 수정) fingerprint 윈도우-빈도 카운트에서 wait을 뺀 것과는 별개로,
+    # consecutive_wait 카운터가 순수 연속 wait 스팸을 잡는다(WolframAlpha 실측 회귀 수정) - 그래서
+    # 이제 "wait만 계속"은 stuck_repeat_threshold(3)에 도달하는 3스텝만에 blocked=True여야 정상.
+    traj_wait_only = run_episode(
+        fake_env_stuck, {"web": "http://u", "ques": "do U"}, wait_only_agent,
+        max_steps=10, stuck_repeat_threshold=3,
+    )
+    check(
+        "wait만 계속 반복하면 연속 스팸으로 잡힘(회귀 수정: 예전엔 못 잡았음)",
+        traj_wait_only["blocked"] is True and traj_wait_only["n_steps"] == 3,
+    )
+    check("wait 연속 스팸 -> reason에 'wait' 언급", "wait" in traj_wait_only["blocked_reason"])
+
+    def wait_plus_repeating_click(screenshot, task_info, history):
+        n = len(history["actions"])
+        return {"action": "wait"} if n % 2 == 0 else {"action": "left_click", "coordinate": [50, 50]}
+
+    traj_wait_plus_click = run_episode(
+        fake_env_stuck, {"web": "http://u", "ques": "do U"}, wait_plus_repeating_click,
+        max_steps=10, stuck_repeat_threshold=3,
+    )
+    check(
+        "wait을 껴서 반복해도, 사이사이의 같은 click 반복은 여전히 stuck으로 잡힘",
+        traj_wait_plus_click["blocked"] is True,
+    )
+
+    def wait_interspersed_agent(screenshot, task_info, history):
+        # click -> wait -> type -> wait -> ... 처럼 서로 다른 실제 액션 사이사이에 wait이
+        # 한 번씩만 낀다 - consecutive_wait은 매번 0으로 리셋되므로 안 걸려야 한다(원래
+        # 이번 세션 wait-제외 수정이 의도했던 케이스: 산발적 wait은 오탐하면 안 됨).
+        n = len(history["actions"])
+        if n % 2 == 0:
+            return {"action": "wait"}
+        return {"action": "left_click", "coordinate": [50 + n * 50, 50]}
+
+    traj_wait_interspersed = run_episode(
+        fake_env_stuck, {"web": "http://u", "ques": "do U"}, wait_interspersed_agent,
+        max_steps=10, stuck_repeat_threshold=3,
+    )
+    check(
+        "서로 다른 click 사이사이에 wait이 한 번씩만 껴도 stuck으로 안 잡힘(산발적 wait은 여전히 제외)",
+        traj_wait_interspersed["blocked"] is False and traj_wait_interspersed["n_steps"] == 10,
+    )
+
     # --- env가 detect_bot_check()를 아예 제공하지 않는 경우(구버전 env) -> 에러 없이 정상 동작 ---
     class _EnvWithoutBotCheck:
         def __init__(self):
@@ -1452,6 +1584,38 @@ def _run_mock_selftest():
         with open(out_path, encoding="utf-8") as f:
             saved = [json.loads(line) for line in f]
         check("run_batch -> jsonl 저장 개수 일치", len(saved) == 3)
+
+    # --- (2026-08-15 추가 - --idx CLI 옵션용) run_batch: task_indices를 주면 결과 row의 "idx"가
+    # enumerate() 위치가 아니라 원래 인덱스로 찍혀야 함 - 원래 전체실행 결과와 대조 가능하게. ---
+    fake_env_idx = MagicMock()
+    fake_env_idx.reset.return_value = (fake_img, {"instruction": "do IDX", "url": "http://idx"})
+    fake_env_idx.detect_bot_check.return_value = None
+    with tempfile.TemporaryDirectory() as d:
+        out_path_idx = os.path.join(d, "out_idx.jsonl")
+        rows_idx, _ = run_batch(
+            [{"web": "http://idx", "ques": "do IDX"}] * 3,  # 원래 idx 4, 9, 28인 태스크 3개를 골라온 상황을 흉내
+            fake_env_idx, dummy_agent_step, always_success_judge,
+            judge_repeats=1, out_path=out_path_idx, task_indices=[4, 9, 28],
+        )
+        check(
+            "run_batch -> task_indices 지정시 row의 idx가 원래 인덱스로 찍힘(재번호 안 매김)",
+            [r["idx"] for r in rows_idx] == [4, 9, 28],
+        )
+        with open(out_path_idx, encoding="utf-8") as f:
+            saved_idx = [json.loads(line) for line in f]
+        check("run_batch -> task_indices -> jsonl에도 원래 idx가 그대로 저장됨", [r["idx"] for r in saved_idx] == [4, 9, 28])
+
+    # task_indices 미지정(기본)이면 예전처럼 enumerate() 위치를 그대로 씀 - 하위호환
+    with tempfile.TemporaryDirectory() as d:
+        rows_default_idx, _ = run_batch(
+            [{"web": "http://idx", "ques": "do IDX"}] * 3,
+            fake_env_idx, dummy_agent_step, always_success_judge,
+            judge_repeats=1, out_path=os.path.join(d, "out.jsonl"),
+        )
+        check(
+            "run_batch -> task_indices 미지정시 예전처럼 0,1,2로 매겨짐(하위호환)",
+            [r["idx"] for r in rows_default_idx] == [0, 1, 2],
+        )
 
     # --- (2026-08-11 추가) run_batch: blocked된 태스크는 judge를 아예 안 부르고 success=False로 기록 ---
     fake_env_blocked_batch = MagicMock()
@@ -1584,6 +1748,48 @@ def _run_mock_selftest():
         )
         check("resume=False(기본) -> 이미 있던 결과 무시하고 다시 돎(하위 호환)", resume_agent_calls["n"] == 1)
         check("resume=False -> rows도 이번에 새로 돈 1개뿐(파일 덮어씀)", len(rows_no_resume) == 1)
+
+    # --- (2026-08-16 추가 - --idx + --resume 조합 버그 수정) task_indices로 지정된 태스크는
+    # --resume이 켜져 있어도 "이미 끝났다"고 건너뛰지 않고 무조건 재실행되어야 하고, 예전
+    # 결과 줄은 새 결과로 교체되어야 함(중복으로 남으면 안 됨).
+    resume_agent_calls["n"] = 0
+    with tempfile.TemporaryDirectory() as d:
+        out_path5 = os.path.join(d, "out5.jsonl")
+        # 직전 "전체 실행"이 T1(실패)/T2(성공) 둘 다 이미 끝낸 상태라고 가정.
+        with open(out_path5, "w", encoding="utf-8") as f:
+            f.write(json.dumps({"idx": 0, "task_id": "T1", "success": False, "blocked": True}) + "\n")
+            f.write(json.dumps({"idx": 1, "task_id": "T2", "success": True, "blocked": False}) + "\n")
+
+        # --idx 0 으로 T1만 재실행하는 상황 재현 - tasks는 T1 하나뿐인 부분집합, task_indices=[0]
+        rows_forced, rate_forced = run_batch(
+            [{"id": "T1", "web": "http://r", "ques": "task 1"}],
+            fake_env_resume, _counting_agent, always_success_judge,
+            judge_repeats=1, out_path=out_path5, resume=True, task_indices=[0],
+        )
+        check(
+            "--idx + --resume -> 이미 out_path에 있어도 task_indices로 지정된 태스크는 건너뛰지 않고 재실행됨",
+            resume_agent_calls["n"] == 1,
+        )
+        check("--idx + --resume -> rows는 T2(유지) + T1(새로 돈 결과) = 2개, 중복 없음", len(rows_forced) == 2)
+        t1_rows = [r for r in rows_forced if r.get("task_id") == "T1"]
+        check("--idx + --resume -> T1은 딱 1개만 있음(예전 결과와 중복 안 됨)", len(t1_rows) == 1)
+        check(
+            "--idx + --resume -> T1은 예전 blocked=True가 아니라 새로 돈 결과(success=True)로 교체됨",
+            t1_rows[0]["success"] is True and t1_rows[0]["blocked"] is False,
+        )
+        t2_rows = [r for r in rows_forced if r.get("task_id") == "T2"]
+        check("--idx + --resume -> T2(강제 대상 아님)는 예전 결과 그대로 유지됨", len(t2_rows) == 1 and t2_rows[0]["success"] is True)
+        check(
+            "--idx + --resume -> success_rate도 중복 없이 T1(새 성공)+T2(기존 성공) 기준으로 계산됨(2/2)",
+            abs(rate_forced - 1.0) < 1e-6,
+        )
+        with open(out_path5, encoding="utf-8") as f:
+            saved_forced = [json.loads(line) for line in f]
+        check("--idx + --resume -> 파일에도 딱 2줄만 남음(디스크에 중복 안 남음)", len(saved_forced) == 2)
+        check(
+            "--idx + --resume -> 파일 안 T1도 새 결과로 교체돼있음(디스크와 rows가 일치)",
+            sum(1 for r in saved_forced if r.get("task_id") == "T1" and r.get("success") is True) == 1,
+        )
 
     # --- _convert_planner_action_to_env / build_planner_grounding_agent_step ---
     import sys
@@ -2132,6 +2338,15 @@ if __name__ == "__main__":
     ap.add_argument("--max_steps", type=int, default=DEFAULT_MAX_STEPS)
     ap.add_argument("--judge_repeats", type=int, default=DEFAULT_JUDGE_REPEATS)
     ap.add_argument("--limit", type=int, default=None)
+    # (2026-08-15 추가 - 사용자 요청) 특정 태스크만 골라서 재실행. scroll/wait 뺑뺑이 오탐
+    # 버그를 고친 뒤, 원래 전체실행 결과 jsonl에서 그 사유로 blocked됐던 태스크들의 "idx"만
+    # 골라 다시 돌려서 고쳐졌는지 확인하는 용도로 만듦(원인이 다른 실패까지 전부 재실행할
+    # 필요 없이 딱 원하는 것만). 결과 jsonl에도 원래 idx가 그대로 찍혀서 이전 실행 결과와
+    # 바로 대조 가능(run_batch()의 task_indices 참고).
+    ap.add_argument("--idx", type=str, default=None,
+                     help="쉼표로 구분한 태스크 인덱스만 골라서 돌린다(예: --idx 4,9,28). 인덱스는 "
+                          "--web_name 필터링 후, --limit 적용 전 순서 기준 - 즉 이전 실행 결과 jsonl의 "
+                          "'idx' 필드와 동일 기준. 지정하면 --limit은 무시된다.")
     ap.add_argument("--out", default=None)
     # (2026-08-11 추가 - API 비용 보호) --out 파일에 이미 있는 task_id는 건너뛰고 이어서
     # 돌린다. 장시간 무중단 실행(개인 PC로 수백 개 태스크) 중 죽었을 때 이미 낸 GPT-4o
@@ -2280,7 +2495,20 @@ if __name__ == "__main__":
                 f"--web_name={args.web_name!r}에 해당하는 태스크가 없음. {args.tasks_jsonl} 안의 실제 "
                 f"web_name 목록: {available}"
             )
-        if args.limit:
+        task_indices = None
+        if args.idx:
+            try:
+                wanted_idx = [int(x.strip()) for x in args.idx.split(",") if x.strip() != ""]
+            except ValueError:
+                raise SystemExit(f"--idx 파싱 실패: {args.idx!r} (쉼표로 구분된 정수 목록이어야 함, 예: 0,5,12)")
+            out_of_range = [i for i in wanted_idx if i < 0 or i >= len(tasks)]
+            if out_of_range:
+                raise SystemExit(
+                    f"--idx에 범위를 벗어난 인덱스가 있음: {out_of_range} (--web_name 필터링 후 총 태스크 수: {len(tasks)})"
+                )
+            task_indices = wanted_idx
+            tasks = [tasks[i] for i in wanted_idx]
+        elif args.limit:
             tasks = tasks[: args.limit]
         if not tasks:
             raise SystemExit(f"{args.tasks_jsonl}에서 태스크를 하나도 못 찾음 (파일이 비었거나 경로 확인 필요)")
@@ -2404,6 +2632,7 @@ if __name__ == "__main__":
                 stuck_repeat_window=args.stuck_repeat_window,
                 resume=args.resume,
                 judge_max_workers=judge_max_workers,
+                task_indices=task_indices,
             )
         finally:
             env.close()
